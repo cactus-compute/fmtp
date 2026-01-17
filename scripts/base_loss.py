@@ -99,10 +99,10 @@ bpb_results = {}
 for split_name in ["train", "val"]:
     loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
     with autocast_ctx:
-        bpb = evaluate_bpb(model, loader, steps, token_bytes)
-    print0(f"{split_name} bpb: {bpb:.4f}")
+        bpb, loss = evaluate_bpb(model, loader, steps, token_bytes)
+    print0(f"{split_name} bpb: {bpb:.4f} | loss: {loss:.4f}")
     bpb_results[split_name] = bpb
-    print0(f"Model: {model_name}, {split_name} bpb: {bpb:.6f}")
+    print0(f"Model: {model_name}, {split_name} bpb: {bpb:.6f} | loss: {loss:.6f}")
 
 # Master process also samples from the model for some basic knowledge-eliciting prompts (only for nanochat models)
 samples = []
