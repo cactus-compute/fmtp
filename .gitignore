@@ -12,3 +12,5 @@ eval_bundle/
 .claude
 CLAUDE.md
 wandb/
+
+vm_exec.sh
