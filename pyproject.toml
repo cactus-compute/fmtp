@@ -5,6 +5,7 @@ description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git",
     "datasets>=4.0.0",
     "liger-kernel>=0.5.0",
     "fastapi>=0.117.1",
