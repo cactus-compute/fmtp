@@ -33,6 +33,12 @@ except Exception as e:
     print("[fused_ce] Falling back to unfused cross-entropy (will use much more memory with large vocabs)")
 
 
+@torch.compiler.disable
+def _liger_ce(loss_fn, weight, hidden_states, targets):
+    """Wrapper to prevent torch.compile from tracing into Liger kernel."""
+    return loss_fn(weight, hidden_states, targets)
+
+
 def fused_linear_cross_entropy(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -65,16 +71,12 @@ def fused_linear_cross_entropy(
 
     if HAS_LIGER:
         # LigerFusedLinearCrossEntropyLoss expects (weight, input, target)
-        # Note: it creates loss_fn with fixed ignore_index/reduction at init time
-        # For simplicity, we use the global one (ignore_index=-1, reduction="mean")
-        # If you need different settings, create a new instance
         global _liger_loss_fn
         if ignore_index != -1 or reduction != "mean":
-            # Create a custom loss fn for non-default settings
             from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
             loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=ignore_index, reduction=reduction)
-            return loss_fn(weight, hidden_states, targets)
-        return _liger_loss_fn(weight, hidden_states, targets)
+            return _liger_ce(loss_fn, weight, hidden_states, targets)
+        return _liger_ce(_liger_loss_fn, weight, hidden_states, targets)
     else:
         # Fallback: standard unfused computation (WARNING: will OOM on large vocab!)
         import warnings
