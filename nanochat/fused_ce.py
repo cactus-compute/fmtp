@@ -17,12 +17,19 @@ Usage:
 import torch
 import torch.nn.functional as F
 
-# Try to import Liger's fused kernel - use the functional API which is more stable
+# Try to import Liger's fused kernel - use the high-level transformers API
+_liger_loss_fn = None
+HAS_LIGER = False
+
 try:
-    from liger_kernel.ops.fused_linear_cross_entropy import liger_fused_linear_cross_entropy
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+    _liger_loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=-1, reduction="mean")
     HAS_LIGER = True
-except ImportError:
-    HAS_LIGER = False
+    print("[fused_ce] Liger kernel loaded successfully")
+except ImportError as e:
+    print(f"[fused_ce] Liger import failed (ImportError): {e}")
+except Exception as e:
+    print(f"[fused_ce] Liger import failed ({type(e).__name__}): {e}")
 
 
 def fused_linear_cross_entropy(
@@ -30,7 +37,7 @@ def fused_linear_cross_entropy(
     weight: torch.Tensor,
     targets: torch.Tensor,
     bias: torch.Tensor = None,
-    ignore_index: int = -100,
+    ignore_index: int = -1,
     softcap: float = None,
     reduction: str = "mean",
 ) -> torch.Tensor:
@@ -50,26 +57,31 @@ def fused_linear_cross_entropy(
         Loss tensor (scalar if reduction is "mean" or "sum")
     """
     # Flatten to 2D for the fused kernel
-    original_shape = hidden_states.shape
     if hidden_states.ndim == 3:
         B, T, D = hidden_states.shape
         hidden_states = hidden_states.view(B * T, D)
         targets = targets.view(B * T)
 
     if HAS_LIGER:
-        # Liger fused kernel - never materializes full logits
-        loss = liger_fused_linear_cross_entropy(
-            hidden_states,
-            weight,
-            targets,
-            bias=bias,
-            ignore_index=ignore_index,
-            softcap=softcap,
-            reduction=reduction,
-        )
-        return loss
+        # LigerFusedLinearCrossEntropyLoss expects (weight, input, target)
+        # Note: it creates loss_fn with fixed ignore_index/reduction at init time
+        # For simplicity, we use the global one (ignore_index=-1, reduction="mean")
+        # If you need different settings, create a new instance
+        global _liger_loss_fn
+        if ignore_index != -1 or reduction != "mean":
+            # Create a custom loss fn for non-default settings
+            from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+            loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=ignore_index, reduction=reduction)
+            return loss_fn(weight, hidden_states, targets)
+        return _liger_loss_fn(weight, hidden_states, targets)
     else:
-        # Fallback: standard unfused computation
+        # Fallback: standard unfused computation (WARNING: will OOM on large vocab!)
+        import warnings
+        warnings.warn(
+            "Using unfused cross-entropy fallback - this will likely OOM! "
+            "Install liger-kernel properly: pip install liger-kernel",
+            RuntimeWarning
+        )
         logits = F.linear(hidden_states, weight, bias)
         if softcap is not None:
             logits = softcap * torch.tanh(logits / softcap)
