@@ -38,11 +38,37 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "L"
+    # Medusa MTP (Multi-Token Prediction) parameters
+    medusa_num_heads: int = 0      # 0 = disabled, >0 = number of speculative heads
+    medusa_num_layers: int = 1     # ResBlock layers per Medusa head
 
 
 def norm(x):
     # Purely functional rmsnorm with no learnable params
     return F.rms_norm(x, (x.size(-1),))
+
+
+class MedusaResBlock(nn.Module):
+    """Residual block for Medusa heads. Zero-init for identity at start."""
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, x):
+        return x + F.silu(self.linear(x))
+
+
+class MedusaHead(nn.Module):
+    """Single Medusa prediction head: ResBlocks + linear projection."""
+    def __init__(self, hidden_size, vocab_size, num_layers):
+        super().__init__()
+        self.blocks = nn.ModuleList([MedusaResBlock(hidden_size) for _ in range(num_layers)])
+        self.proj = nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return self.proj(x)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -169,6 +195,13 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+        # Medusa heads for multi-token prediction (speculative decoding)
+        self.medusa_heads = None
+        if config.medusa_num_heads > 0:
+            self.medusa_heads = nn.ModuleList([
+                MedusaHead(config.n_embd, padded_vocab_size, config.medusa_num_layers)
+                for _ in range(config.medusa_num_heads)
+            ])
 
     def init_weights(self):
         """
@@ -213,6 +246,13 @@ class GPT(nn.Module):
         # Cast token embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
+
+        # Medusa heads: zero-init ResBlocks (identity at start), small init for projections
+        if self.medusa_heads is not None:
+            for head in self.medusa_heads:
+                for block in head.blocks:
+                    torch.nn.init.zeros_(block.linear.weight)
+                torch.nn.init.normal_(head.proj.weight, mean=0.0, std=0.001)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -300,17 +340,26 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         return nparams
 
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, medusa_lr=0.004):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 5 groups (matrix, embedding, lm_head, resid_lambdas, x0_lambdas)
+        # Separate out all parameters into groups (matrix, embedding, lm_head, resid_lambdas, x0_lambdas, medusa)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params)
-        # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
+        # Medusa heads: split into matrix params (ResBlock linears -> Muon) and proj params (-> AdamW like lm_head)
+        medusa_matrix_params = []
+        medusa_proj_params = []
+        if self.medusa_heads is not None:
+            for head in self.medusa_heads:
+                for block in head.blocks:
+                    medusa_matrix_params.append(block.linear.weight)
+                medusa_proj_params.append(head.proj.weight)
+        total_params = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params) + len(medusa_matrix_params) + len(medusa_proj_params)
+        assert len(list(self.parameters())) == total_params
+        # Create the AdamW optimizer for the embedding, lm_head, per-layer scalars, and medusa projections
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -320,13 +369,17 @@ class GPT(nn.Module):
             dict(params=resid_params, lr=scalar_lr * 0.01), # these are a lot more sensitive because they accumulate in the residual stream
             dict(params=x0_params, lr=scalar_lr),
         ]
+        # Add Medusa projection parameters to AdamW (same treatment as lm_head)
+        if medusa_proj_params:
+            adam_groups.append(dict(params=medusa_proj_params, lr=medusa_lr * dmodel_lr_scale))
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
-        # Create the Muon optimizer for the linear layers
+        # Create the Muon optimizer for the linear layers (transformer + medusa resblocks)
+        all_matrix_params = matrix_params + medusa_matrix_params
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
         MuonFactory = DistMuon if ddp else Muon
-        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        muon_optimizer = MuonFactory(all_matrix_params, **muon_kwargs)
         # Combine them the two optimizers into one list
         optimizers = [adamw_optimizer, muon_optimizer]
         for opt in optimizers:
@@ -334,7 +387,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_medusa=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -361,13 +414,29 @@ class GPT(nn.Module):
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
+        # Compute Medusa logits if requested (training mode only, not with KV cache)
+        medusa_logits = None
+        if return_medusa and self.medusa_heads is not None and kv_cache is None:
+            medusa_logits = []
+            for head in self.medusa_heads:
+                head_logits = head(x)  # x is final hidden state after norm
+                head_logits = head_logits[..., :self.config.vocab_size]
+                head_logits = head_logits.float()
+                head_logits = softcap * torch.tanh(head_logits / softcap)
+                medusa_logits.append(head_logits)
+            medusa_logits = torch.stack(medusa_logits, dim=0)  # (num_heads, B, T, vocab)
+
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if medusa_logits is not None:
+                return loss, logits, medusa_logits
             return loss
         else:
             # inference: just return the logits directly
+            if medusa_logits is not None:
+                return logits, medusa_logits
             return logits
 
     @torch.inference_mode()

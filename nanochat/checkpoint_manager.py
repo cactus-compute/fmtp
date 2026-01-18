@@ -26,6 +26,11 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Medusa MTP parameters (disabled by default for backward compatibility)
+    if "medusa_num_heads" not in model_config_kwargs:
+        model_config_kwargs["medusa_num_heads"] = 0
+    if "medusa_num_layers" not in model_config_kwargs:
+        model_config_kwargs["medusa_num_layers"] = 1
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -167,6 +172,7 @@ def load_model(source, *args, **kwargs):
         "mid": "mid_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
+        "mtp": "mtp_checkpoints",
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)

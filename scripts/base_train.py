@@ -19,13 +19,14 @@ from contextlib import nullcontext
 
 import wandb
 import torch
+import torch.nn.functional as F
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_bpb, evaluate_mtp_loss
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_model
@@ -44,6 +45,11 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# MTP (Multi-Token Prediction) - optional
+parser.add_argument("--medusa-num-heads", type=int, default=0, help="number of Medusa heads for MTP (0 = disabled)")
+parser.add_argument("--medusa-num-layers", type=int, default=1, help="ResBlock layers per Medusa head")
+parser.add_argument("--medusa-loss-weight", type=float, default=1.0, help="weight for Medusa head losses (constant or decay base)")
+parser.add_argument("--medusa-loss-scheme", type=str, default="constant", choices=["constant", "decay"], help="weighting scheme: constant (all heads same weight) or decay (weight^k for head k)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -159,7 +165,7 @@ if args.depth != 12:
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern)
+model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, medusa_num_heads=args.medusa_num_heads, medusa_num_layers=args.medusa_num_layers)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)
@@ -265,6 +271,8 @@ if not resuming:
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
+    smooth_train_first_token_loss = 0 # EMA of first token (main head) loss
+    smooth_train_head_losses = [0] * args.medusa_num_heads  # EMA per Medusa head
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
@@ -272,6 +280,8 @@ else:
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
+    smooth_train_first_token_loss = loop_state.get("smooth_train_first_token_loss", 0)
+    smooth_train_head_losses = loop_state.get("smooth_train_head_losses", [0] * args.medusa_num_heads)
     total_training_time = loop_state["total_training_time"]
 
 # -----------------------------------------------------------------------------
@@ -286,17 +296,31 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with autocast_ctx:
-            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f} | loss: {val_loss:.6f}")
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        val_log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-            "val/loss": val_loss,
-        })
+        }
+        # Also compute MTP losses if enabled
+        if args.medusa_num_heads > 0:
+            val_loader = build_val_loader()  # reset loader
+            with autocast_ctx:
+                val_loss, val_first_token_loss, val_head_losses = evaluate_mtp_loss(
+                    model, val_loader, eval_steps,
+                    medusa_loss_weight=args.medusa_loss_weight,
+                    medusa_loss_scheme=args.medusa_loss_scheme
+                )
+            print0(f"Step {step:05d} | Validation loss: {val_loss:.6f} | first_token_loss: {val_first_token_loss:.6f}")
+            val_log_data["val/loss"] = val_loss
+            val_log_data["val/first_token_loss"] = val_first_token_loss
+            for k, head_loss in enumerate(val_head_losses):
+                val_log_data[f"val/head{k}_loss"] = head_loss
+        wandb_run.log(val_log_data)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -354,6 +378,8 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
+                    "smooth_train_first_token_loss": smooth_train_first_token_loss,
+                    "smooth_train_head_losses": smooth_train_head_losses,
                     "total_training_time": total_training_time,
                 },
             },
@@ -371,8 +397,29 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
+            if args.medusa_num_heads > 0:
+                # MTP training: compute combined loss for main head + Medusa heads
+                _, logits, medusa_logits = model(x, y, return_medusa=True)
+                first_token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                loss = first_token_loss
+                train_head_losses = []  # track per-head losses
+                for k in range(medusa_logits.shape[0]):
+                    shift = 2 + k  # Head k predicts token i+2+k
+                    head_logits = medusa_logits[k, :, :-shift].contiguous()
+                    shifted_targets = y[:, shift:].contiguous()
+                    head_loss = F.cross_entropy(head_logits.view(-1, head_logits.size(-1)), shifted_targets.view(-1), ignore_index=-1)
+                    train_head_losses.append(head_loss.detach())
+                    # Apply weighting scheme
+                    if args.medusa_loss_scheme == "decay":
+                        head_weight = args.medusa_loss_weight ** (k + 1)  # weight^1, weight^2, ...
+                    else:  # constant
+                        head_weight = args.medusa_loss_weight
+                    loss = loss + head_weight * head_loss
+                train_first_token_loss = first_token_loss.detach()
+            else:
+                loss = model(x, y)
+                train_first_token_loss = loss.detach()
+        train_loss = loss.detach() # for logging (total MTP loss or standard loss)
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -399,6 +446,16 @@ while True:
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    if args.medusa_num_heads > 0:
+        train_first_token_loss_f = train_first_token_loss.item()
+        smooth_train_first_token_loss = ema_beta * smooth_train_first_token_loss + (1 - ema_beta) * train_first_token_loss_f
+        debiased_smooth_first_token_loss = smooth_train_first_token_loss / (1 - ema_beta**(step + 1))
+        # Per-head loss tracking
+        debiased_smooth_head_losses = []
+        for k, head_loss in enumerate(train_head_losses):
+            head_loss_f = head_loss.item()
+            smooth_train_head_losses[k] = ema_beta * smooth_train_head_losses[k] + (1 - ema_beta) * head_loss_f
+            debiased_smooth_head_losses.append(smooth_train_head_losses[k] / (1 - ema_beta**(step + 1)))
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
@@ -428,6 +485,10 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if args.medusa_num_heads > 0:
+            log_data["train/first_token_loss"] = debiased_smooth_first_token_loss
+            for k, head_loss in enumerate(debiased_smooth_head_losses):
+                log_data[f"train/head{k}_loss"] = head_loss
         wandb_run.log(log_data)
 
     # state update

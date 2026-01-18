@@ -3,6 +3,7 @@ A number of functions that help with evaluating a base model.
 """
 import math
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 
 @torch.no_grad()
@@ -67,3 +68,73 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     bpb = total_nats / (math.log(2) * total_bytes)
     ce = total_nats / total_tokens
     return bpb, ce
+
+
+@torch.no_grad()
+def evaluate_mtp_loss(model, batches, steps, medusa_loss_weight=1.0, medusa_loss_scheme="constant"):
+    """
+    Evaluate total MTP loss, first-token loss, and per-head losses for models with Medusa heads.
+
+    Args:
+        model: The model to evaluate
+        batches: Iterator of (x, y) batches
+        steps: Number of evaluation steps
+        medusa_loss_weight: Weight for Medusa head losses
+        medusa_loss_scheme: "constant" (all heads same weight) or "decay" (weight^k for head k)
+
+    Returns:
+        (total_loss, first_token_loss, head_losses): Average losses across all batches
+        head_losses is a list of per-head losses for each Medusa head
+    """
+    device = model.get_device()
+    total_loss_sum = torch.tensor(0.0, dtype=torch.float32, device=device)
+    first_token_loss_sum = torch.tensor(0.0, dtype=torch.float32, device=device)
+    head_loss_sums = None  # Will be initialized on first batch
+    num_batches = torch.tensor(0, dtype=torch.int64, device=device)
+
+    batch_iter = iter(batches)
+    for _ in range(steps):
+        x, y = next(batch_iter)
+        _, logits, medusa_logits = model(x, y, return_medusa=True)
+
+        # Initialize head_loss_sums on first batch
+        if head_loss_sums is None:
+            head_loss_sums = [torch.tensor(0.0, dtype=torch.float32, device=device) for _ in range(medusa_logits.shape[0])]
+
+        # First token loss (main head only)
+        first_token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+        first_token_loss_sum += first_token_loss
+
+        # Total loss (main head + Medusa heads)
+        loss = first_token_loss
+        for k in range(medusa_logits.shape[0]):
+            shift = 2 + k  # Head k predicts token i+2+k
+            head_logits = medusa_logits[k, :, :-shift].contiguous()
+            shifted_targets = y[:, shift:].contiguous()
+            head_loss = F.cross_entropy(head_logits.view(-1, head_logits.size(-1)), shifted_targets.view(-1), ignore_index=-1)
+            head_loss_sums[k] += head_loss
+            # Apply weighting scheme
+            if medusa_loss_scheme == "decay":
+                head_weight = medusa_loss_weight ** (k + 1)  # weight^1, weight^2, ...
+            else:  # constant
+                head_weight = medusa_loss_weight
+            loss = loss + head_weight * head_loss
+        total_loss_sum += loss
+        num_batches += 1
+
+    # sum reduce across all ranks
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(first_token_loss_sum, op=dist.ReduceOp.SUM)
+        if head_loss_sums is not None:
+            for head_loss_sum in head_loss_sums:
+                dist.all_reduce(head_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(num_batches, op=dist.ReduceOp.SUM)
+
+    num_batches_val = num_batches.item()
+    if num_batches_val == 0:
+        return float('inf'), float('inf'), []
+    total_loss = total_loss_sum.item() / num_batches_val
+    first_token_loss = first_token_loss_sum.item() / num_batches_val
+    head_losses = [h.item() / num_batches_val for h in head_loss_sums] if head_loss_sums is not None else []
+    return total_loss, first_token_loss, head_losses
