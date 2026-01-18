@@ -49,6 +49,7 @@ parser.add_argument("--medusa-num-heads", type=int, default=0, help="number of M
 parser.add_argument("--medusa-num-layers", type=int, default=1, help="ResBlock layers per Medusa head")
 parser.add_argument("--medusa-loss-weight", type=float, default=1.0, help="weight for Medusa head losses (constant or decay base)")
 parser.add_argument("--medusa-loss-scheme", type=str, default="constant", choices=["constant", "decay"], help="weighting scheme: constant (all heads same weight) or decay (weight^k for head k)")
+parser.add_argument("--ignore-mtp-in-data-ratio", action="store_true", help="exclude Medusa head params from data:param ratio calculation (for fair comparison with baseline)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -202,7 +203,12 @@ elif args.target_flops > 0:
     print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
 elif args.target_param_data_ratio > 0:
     # calculate the number of iterations from the target param data ratio (use scaling params per Kaplan et al.)
-    target_tokens = args.target_param_data_ratio * num_scaling_params
+    scaling_params_for_ratio = num_scaling_params
+    if args.ignore_mtp_in_data_ratio and orig_model.medusa_heads is not None:
+        medusa_params = sum(p.numel() for p in orig_model.medusa_heads.parameters())
+        scaling_params_for_ratio = num_scaling_params - medusa_params
+        print0(f"Excluding {medusa_params:,} Medusa params from data:param ratio (using {scaling_params_for_ratio:,} params)")
+    target_tokens = args.target_param_data_ratio * scaling_params_for_ratio
     num_iterations = target_tokens // args.total_batch_size
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
