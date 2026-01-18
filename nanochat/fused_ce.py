@@ -71,13 +71,17 @@ def _liger_ce(loss_fn, weight, hidden_states, targets):
     return loss_fn(weight, hidden_states, targets)
 
 
+@torch.compiler.disable
 def _cce_impl(hidden_states, weight, targets, ignore_index, softcap, reduction):
     """
     Apple Cut Cross-Entropy implementation.
-    Uses torch.compile backend for compatibility with compiled models.
+    Uses CCE's native Triton kernel (not torch_compile impl) since the outer
+    model is already compiled. The @torch.compiler.disable ensures inductor
+    doesn't try to trace through CCE's custom kernels.
     """
     # CCE expects: linear_cross_entropy(embeddings, classifier, labels, ...)
-    # Note: CCE handles softcap differently - it uses "softcapping" parameter
+    # Use impl="cce" (Triton kernel) instead of "torch_compile" - the outer
+    # model compilation handles the backbone, CCE handles the loss efficiently
     loss = cce_linear_cross_entropy(
         hidden_states,
         weight,
@@ -85,7 +89,7 @@ def _cce_impl(hidden_states, weight, targets, ignore_index, softcap, reduction):
         ignore_index=ignore_index,
         softcap=softcap,
         reduction=reduction,
-        impl="torch_compile",  # Use torch.compile-compatible implementation
+        impl="cce",  # Use CCE's Triton kernel, excluded from torch.compile
     )
     return loss
 
