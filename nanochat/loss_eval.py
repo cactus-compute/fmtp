@@ -3,7 +3,6 @@ A number of functions that help with evaluating a base model.
 """
 import math
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 
 @torch.no_grad()
@@ -95,23 +94,18 @@ def evaluate_mtp_loss(model, batches, steps, medusa_loss_weight=1.0, medusa_loss
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
-        _, logits, medusa_logits = model(x, y, return_medusa=True)
+        # Model returns (main_loss, medusa_losses) using fused CE
+        first_token_loss, medusa_losses = model(x, y, return_medusa=True)
 
         # Initialize head_loss_sums on first batch
         if head_loss_sums is None:
-            head_loss_sums = [torch.tensor(0.0, dtype=torch.float32, device=device) for _ in range(medusa_logits.shape[0])]
+            head_loss_sums = [torch.tensor(0.0, dtype=torch.float32, device=device) for _ in range(len(medusa_losses))]
 
-        # First token loss (main head only)
-        first_token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
         first_token_loss_sum += first_token_loss
 
         # Total loss (main head + Medusa heads)
         loss = first_token_loss
-        for k in range(medusa_logits.shape[0]):
-            shift = 2 + k  # Head k predicts token i+2+k
-            head_logits = medusa_logits[k, :, :-shift].contiguous()
-            shifted_targets = y[:, shift:].contiguous()
-            head_loss = F.cross_entropy(head_logits.view(-1, head_logits.size(-1)), shifted_targets.view(-1), ignore_index=-1)
+        for k, head_loss in enumerate(medusa_losses):
             head_loss_sums[k] += head_loss
             # Apply weighting scheme
             if medusa_loss_scheme == "decay":

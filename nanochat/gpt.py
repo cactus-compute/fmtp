@@ -25,6 +25,8 @@ from nanochat.adamw import DistAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
+# Fused linear cross-entropy to avoid materializing huge logits tensors
+from nanochat.fused_ce import fused_linear_cross_entropy
 
 @dataclass
 class GPTConfig:
@@ -407,35 +409,49 @@ class GPT(nn.Module):
             x = block(x, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
-
-        # Compute Medusa logits if requested (training mode only, not with KV cache)
-        medusa_logits = None
-        if return_medusa and self.medusa_heads is not None and kv_cache is None:
-            medusa_logits = []
-            for head in self.medusa_heads:
-                head_logits = head(x)  # x is final hidden state after norm
-                head_logits = head_logits[..., :self.config.vocab_size]
-                head_logits = head_logits.float()
-                head_logits = softcap * torch.tanh(head_logits / softcap)
-                medusa_logits.append(head_logits)
-            medusa_logits = torch.stack(medusa_logits, dim=0)  # (num_heads, B, T, vocab)
+        softcap = 15  # smoothly cap the logits to the range [-softcap, softcap]
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            if medusa_logits is not None:
-                return loss, logits, medusa_logits
+            # Training: use fused linear cross-entropy to avoid materializing huge logits tensor
+            # Only use the non-padded portion of lm_head weights
+            lm_weight = self.lm_head.weight[:self.config.vocab_size]
+            loss = fused_linear_cross_entropy(x, lm_weight, targets, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
+
+            # Compute Medusa head losses if requested
+            if return_medusa and self.medusa_heads is not None:
+                medusa_losses = []
+                for k, head in enumerate(self.medusa_heads):
+                    shift = 2 + k  # head k predicts token at position t+k+2
+                    # Slice hidden states and targets for this head
+                    x_shifted = x[:, :-shift].contiguous()
+                    targets_shifted = targets[:, shift:].contiguous()
+                    # Get the projection weight (non-padded)
+                    head_weight = head.proj.weight[:self.config.vocab_size]
+                    # Apply ResBlocks first, then fused CE with the projection
+                    h = x_shifted
+                    for block in head.blocks:
+                        h = block(h)
+                    head_loss = fused_linear_cross_entropy(h, head_weight, targets_shifted, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
+                    medusa_losses.append(head_loss)
+                return loss, medusa_losses
             return loss
         else:
-            # inference: just return the logits directly
-            if medusa_logits is not None:
+            # Inference: compute logits normally (need actual logits for sampling)
+            logits = self.lm_head(x)
+            logits = logits[..., :self.config.vocab_size]
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
+
+            # Compute Medusa logits if requested (for speculative decoding)
+            if return_medusa and self.medusa_heads is not None and kv_cache is None:
+                medusa_logits = []
+                for head in self.medusa_heads:
+                    head_logits = head(x)
+                    head_logits = head_logits[..., :self.config.vocab_size]
+                    head_logits = head_logits.float()
+                    head_logits = softcap * torch.tanh(head_logits / softcap)
+                    medusa_logits.append(head_logits)
+                medusa_logits = torch.stack(medusa_logits, dim=0)  # (num_heads, B, T, vocab)
                 return logits, medusa_logits
             return logits
 

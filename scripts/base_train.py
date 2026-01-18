@@ -19,7 +19,6 @@ from contextlib import nullcontext
 
 import wandb
 import torch
-import torch.nn.functional as F
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -398,17 +397,11 @@ while True:
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             if args.medusa_num_heads > 0:
-                # MTP training: compute combined loss for main head + Medusa heads
-                _, logits, medusa_logits = model(x, y, return_medusa=True)
-                first_token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                # MTP training: model returns (main_loss, medusa_losses) using fused CE
+                first_token_loss, medusa_losses = model(x, y, return_medusa=True)
                 loss = first_token_loss
-                train_head_losses = []  # track per-head losses
-                for k in range(medusa_logits.shape[0]):
-                    shift = 2 + k  # Head k predicts token i+2+k
-                    head_logits = medusa_logits[k, :, :-shift].contiguous()
-                    shifted_targets = y[:, shift:].contiguous()
-                    head_loss = F.cross_entropy(head_logits.view(-1, head_logits.size(-1)), shifted_targets.view(-1), ignore_index=-1)
-                    train_head_losses.append(head_loss.detach())
+                train_head_losses = [hl.detach() for hl in medusa_losses]
+                for k, head_loss in enumerate(medusa_losses):
                     # Apply weighting scheme
                     if args.medusa_loss_scheme == "decay":
                         head_weight = args.medusa_loss_weight ** (k + 1)  # weight^1, weight^2, ...
