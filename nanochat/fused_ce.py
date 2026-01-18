@@ -25,11 +25,12 @@ try:
     from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
     _liger_loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=-1, reduction="mean")
     HAS_LIGER = True
-    print("[fused_ce] Liger kernel loaded successfully")
 except ImportError as e:
     print(f"[fused_ce] Liger import failed (ImportError): {e}")
+    print("[fused_ce] Falling back to unfused cross-entropy (will use much more memory with large vocabs)")
 except Exception as e:
     print(f"[fused_ce] Liger import failed ({type(e).__name__}): {e}")
+    print("[fused_ce] Falling back to unfused cross-entropy (will use much more memory with large vocabs)")
 
 
 def fused_linear_cross_entropy(
