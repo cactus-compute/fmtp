@@ -33,12 +33,14 @@ except Exception as e:
     print("[fused_ce] Falling back to unfused cross-entropy (will use much more memory with large vocabs)")
 
 
-@torch.compiler.disable
 def _liger_ce(loss_fn, weight, hidden_states, targets):
-    """Wrapper to prevent torch.compile from tracing into Liger kernel."""
+    """Call Liger kernel."""
     return loss_fn(weight, hidden_states, targets)
 
 
+# Disable torch.compile for this function to avoid recompilation on every
+# different sequence length (dynamo treats each shape as a new graph)
+@torch.compiler.disable
 def fused_linear_cross_entropy(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
