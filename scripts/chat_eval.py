@@ -18,6 +18,7 @@ import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
+from nanochat.medusa_engine import MedusaEngine
 
 from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
@@ -195,6 +196,7 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+    parser.add_argument('--use-medusa', action='store_true', help='Use MedusaEngine for speculative decoding (requires model with Medusa heads)')
     args = parser.parse_args()
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
@@ -203,7 +205,18 @@ if __name__ == "__main__":
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
-    engine = Engine(model, tokenizer)
+
+    # Use MedusaEngine for speculative decoding if requested and model has Medusa heads
+    if args.use_medusa:
+        num_medusa_heads = getattr(model.config, 'medusa_num_heads', 0)
+        if num_medusa_heads > 0:
+            engine = MedusaEngine(model, tokenizer)
+            print0(f"Using MedusaEngine with {num_medusa_heads} Medusa heads for speculative decoding")
+        else:
+            print0("Warning: --use-medusa specified but model has no Medusa heads, falling back to standard Engine")
+            engine = Engine(model, tokenizer)
+    else:
+        engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
     all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
