@@ -46,7 +46,8 @@ class GPTConfig:
     medusa_num_layers: int = 1     # ResBlock layers per Medusa head
     medusa_lora_rank: int = 0      # 0 = full projection, >0 = low-rank dimension (for both LoRA and independent)
     medusa_lora_alpha: int = None  # LoRA alpha scaling (default: same as rank, so scaling=1)
-    medusa_independent: bool = False  # Use independent low-rank heads (faster than LoRA, no weight merge)
+    medusa_independent: bool = False  # DEPRECATED: Use medusa_delta instead
+    medusa_delta: bool = False     # Use hidden-space delta heads (fast, reuses lm_head with fused CE)
 
 
 def norm(x):
@@ -105,19 +106,25 @@ class MedusaLoRAHead(nn.Module):
 
 class IndependentMedusaHead(nn.Module):
     """
+    DEPRECATED: Use MedusaDeltaHead instead for better performance.
+
     Low-rank Medusa head that adds a delta to lm_head output.
+    This implementation is 6-7x slower than baseline due to chunked cross-entropy.
 
     Architecture: output = lm_head(h) + W_b(W_a(ResBlocks(h)))
     - ResBlocks contain the SiLU nonlinearity
     - W_a: down-projection (hidden -> rank)
     - W_b: up-projection (rank -> vocab)
-
-    Unlike LoRA heads, this avoids the expensive weight merge (addmm) by using
-    chunked cross-entropy during training that computes the sum without
-    materializing full (B*T, vocab) logits.
     """
     def __init__(self, hidden_size, vocab_size, num_layers, rank=32):
         super().__init__()
+        import warnings
+        warnings.warn(
+            "IndependentMedusaHead is deprecated and 6-7x slower than baseline. "
+            "Use MedusaDeltaHead (--medusa-delta) instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         self.blocks = nn.ModuleList([MedusaResBlock(hidden_size) for _ in range(num_layers)])
         self.rank = rank
 
@@ -129,6 +136,30 @@ class IndependentMedusaHead(nn.Module):
         for block in self.blocks:
             x = block(x)
         return self.W_b(self.W_a(x))
+
+
+class MedusaDeltaHead(nn.Module):
+    """
+    Medusa head that computes a delta in hidden space, then uses shared lm_head.
+
+    Architecture: h_modified = h + ResBlocks(h)
+    Output (computed by caller): lm_head(h_modified)
+
+    This is fast because:
+    - No vocab-sized projections in the head itself
+    - Reuses lm_head with Liger fused CE (no weight composition)
+    - All operations are in hidden-dim space, not vocab-dim space
+    """
+    def __init__(self, hidden_size, num_layers):
+        super().__init__()
+        self.blocks = nn.ModuleList([MedusaResBlock(hidden_size) for _ in range(num_layers)])
+
+    def forward(self, x):
+        """Returns the delta to add to hidden states. Caller computes lm_head(x + delta)."""
+        delta = x
+        for block in self.blocks:
+            delta = block(delta)
+        return delta
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -219,7 +250,7 @@ class Block(nn.Module):
 
 
 def _chunk_loss_fn(h_chunk, z_chunk, lm_head_weight, W_b_weight, t_chunk, vocab_size, softcap):
-    """Compute loss for a single chunk - used with gradient checkpointing."""
+    """DEPRECATED: Compute loss for a single chunk - used with gradient checkpointing."""
     chunk_logits = F.linear(h_chunk, lm_head_weight) + F.linear(z_chunk, W_b_weight)
     chunk_logits = chunk_logits[..., :vocab_size]
     if softcap is not None:
@@ -234,15 +265,18 @@ def _chunk_loss_fn(h_chunk, z_chunk, lm_head_weight, W_b_weight, t_chunk, vocab_
 
 @torch.compiler.disable
 def _chunked_independent_head_loss(h, lm_head_weight, W_a, W_b, targets, vocab_size, softcap, chunk_size=1024):
-    """Compute cross-entropy loss in chunks to avoid huge logits allocation.
+    """DEPRECATED: Use MedusaDeltaHead instead. This is 6-7x slower than baseline.
 
+    Compute cross-entropy loss in chunks to avoid huge logits allocation.
     Computes: loss(h @ lm_head.T + z @ W_b.T, targets) where z = h @ W_a.T
-
-    By chunking, each chunk's logits are ~128MB (at chunk_size=1024) instead of 8GB for full batch.
-    The low-rank projection z = h @ W_a.T is computed once upfront (tiny: B*T x rank).
-    Uses gradient checkpointing per chunk to avoid storing intermediate activations.
-    Disabled from torch.compile to prevent inductor from fusing and OOMing.
     """
+    import warnings
+    warnings.warn(
+        "_chunked_independent_head_loss is deprecated and 6-7x slower than baseline. "
+        "Use MedusaDeltaHead (--medusa-delta) instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     h_flat = h.view(-1, h.size(-1))  # (B*T, hidden)
     targets_flat = targets.view(-1)  # (B*T,)
     num_tokens = h_flat.size(0)
@@ -306,9 +340,14 @@ class GPT(nn.Module):
         # Medusa heads for multi-token prediction (speculative decoding)
         self.medusa_heads = None
         if config.medusa_num_heads > 0:
-            if config.medusa_independent:
-                # Independent low-rank heads (fastest - no weight merge, no Liger needed)
-                # Uses medusa_lora_rank as the bottleneck dimension
+            if config.medusa_delta:
+                # Hidden-space delta heads (fast, reuses lm_head with fused CE)
+                self.medusa_heads = nn.ModuleList([
+                    MedusaDeltaHead(config.n_embd, config.medusa_num_layers)
+                    for _ in range(config.medusa_num_heads)
+                ])
+            elif config.medusa_independent:
+                # DEPRECATED: Independent low-rank heads (6-7x slower than baseline)
                 self.medusa_heads = nn.ModuleList([
                     IndependentMedusaHead(config.n_embd, padded_vocab_size, config.medusa_num_layers,
                                           rank=config.medusa_lora_rank)
@@ -377,15 +416,18 @@ class GPT(nn.Module):
             for head in self.medusa_heads:
                 for block in head.blocks:
                     torch.nn.init.zeros_(block.linear.weight)
-                if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
-                    # Independent head: Kaiming for W_a, zeros for W_b (start near zero output)
+                if isinstance(head, MedusaDeltaHead):
+                    # Delta head: only ResBlocks (already zero-init above), starts as identity
+                    pass
+                elif hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
+                    # DEPRECATED Independent head: Kaiming for W_a, zeros for W_b
                     torch.nn.init.kaiming_uniform_(head.W_a.weight, a=math.sqrt(5))
                     torch.nn.init.zeros_(head.W_b.weight)
                 elif hasattr(head, 'lora_A'):
                     # LoRA: A=Kaiming uniform, B=zeros (adapter starts as identity)
                     torch.nn.init.kaiming_uniform_(head.lora_A.weight, a=math.sqrt(5))
                     torch.nn.init.zeros_(head.lora_B.weight)
-                else:
+                elif hasattr(head, 'proj'):
                     # Full projection
                     torch.nn.init.normal_(head.proj.weight, mean=0.0, std=0.001)
 
@@ -491,15 +533,18 @@ class GPT(nn.Module):
             for head in self.medusa_heads:
                 for block in head.blocks:
                     medusa_matrix_params.append(block.linear.weight)
-                if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
-                    # Independent head: W_a -> Muon; W_b -> AdamW (similar to lm_head)
+                if isinstance(head, MedusaDeltaHead):
+                    # Delta head: only ResBlocks, no additional params (all go to Muon via blocks above)
+                    pass
+                elif hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
+                    # DEPRECATED Independent head: W_a -> Muon; W_b -> AdamW (similar to lm_head)
                     medusa_matrix_params.append(head.W_a.weight)
                     medusa_proj_params.append(head.W_b.weight)
                 elif hasattr(head, 'lora_A'):
                     # LoRA: A -> Muon (it's a matrix), B -> AdamW (similar to lm_head)
                     medusa_matrix_params.append(head.lora_A.weight)
                     medusa_proj_params.append(head.lora_B.weight)
-                else:
+                elif hasattr(head, 'proj'):
                     # Full projection -> AdamW
                     medusa_proj_params.append(head.proj.weight)
         total_params = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params) + len(medusa_matrix_params) + len(medusa_proj_params)
@@ -568,29 +613,37 @@ class GPT(nn.Module):
                     # Slice hidden states and targets for this head
                     x_shifted = x[:, :-shift].contiguous()
                     targets_shifted = targets[:, shift:].contiguous()
-                    # Apply ResBlocks first
-                    h = x_shifted
-                    for block in head.blocks:
-                        h = block(h)
-                    # Compute loss (independent: standard CE, LoRA: merge weights, full: use directly)
-                    if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
-                        # Independent head: use chunked cross-entropy to avoid huge logits allocation
-                        # Computes: lm_head(h) + W_b(W_a(h)) without materializing full logits
+                    # Compute loss based on head type
+                    if isinstance(head, MedusaDeltaHead):
+                        # Delta head: compute h + delta, use shared lm_head with fused CE
+                        delta = head(x_shifted)
+                        h_modified = x_shifted + delta
+                        head_loss = fused_linear_cross_entropy(h_modified, lm_weight, targets_shifted, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
+                    elif hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
+                        # DEPRECATED: Independent head with chunked cross-entropy (6-7x slower)
+                        h = x_shifted
+                        for block in head.blocks:
+                            h = block(h)
                         head_loss = _chunked_independent_head_loss(
                             h, lm_weight, head.W_a, head.W_b, targets_shifted,
                             self.config.vocab_size, softcap
                         )
                     elif hasattr(head, 'lora_A'):
                         # LoRA: W_merged = W_base + scaling * B @ A
-                        # Use full (padded) lm_head weight since LoRA weights use padded vocab size
+                        h = x_shifted
+                        for block in head.blocks:
+                            h = block(h)
                         head_weight = torch.addmm(
                             self.lm_head.weight, head.lora_B.weight, head.lora_A.weight,
                             beta=1.0, alpha=head.scaling
                         )
-                        # Slice to actual vocab size for loss computation
                         head_weight = head_weight[:self.config.vocab_size]
                         head_loss = fused_linear_cross_entropy(h, head_weight, targets_shifted, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
                     else:
+                        # Full projection head
+                        h = x_shifted
+                        for block in head.blocks:
+                            h = block(h)
                         head_weight = head.proj.weight[:self.config.vocab_size]
                         head_loss = fused_linear_cross_entropy(h, head_weight, targets_shifted, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
                     medusa_losses.append(head_loss)
@@ -606,23 +659,31 @@ class GPT(nn.Module):
             # Compute Medusa logits if requested (for speculative decoding)
             if return_medusa and self.medusa_heads is not None and kv_cache is None:
                 medusa_logits = []
-                lm_weight = self.lm_head.weight[:self.config.vocab_size]
                 for head in self.medusa_heads:
-                    # Apply ResBlocks
-                    h = x
-                    for block in head.blocks:
-                        h = block(h)
-                    # Compute logits (type-aware)
-                    if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
-                        # Independent head: lm_head + low-rank delta
+                    # Compute logits based on head type
+                    if isinstance(head, MedusaDeltaHead):
+                        # Delta head: compute h + delta, use shared lm_head
+                        delta = head(x)
+                        head_logits = self.lm_head(x + delta)
+                    elif hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
+                        # DEPRECATED: Independent head
+                        h = x
+                        for block in head.blocks:
+                            h = block(h)
                         head_logits = F.linear(h, self.lm_head.weight) + head.W_b(head.W_a(h))
                     elif hasattr(head, 'lora_A'):
-                        # LoRA: base + scaled delta (use full padded weight for consistency)
+                        # LoRA: base + scaled delta
+                        h = x
+                        for block in head.blocks:
+                            h = block(h)
                         base_logits = F.linear(h, self.lm_head.weight)
                         lora_delta = head.scaling * head.lora_B(head.lora_A(h))
                         head_logits = base_logits + lora_delta
                     else:
                         # Full projection
+                        h = x
+                        for block in head.blocks:
+                            h = block(h)
                         head_logits = head.proj(h)
                     head_logits = head_logits[..., :self.config.vocab_size]
                     head_logits = head_logits.float()
