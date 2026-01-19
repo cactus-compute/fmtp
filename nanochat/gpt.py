@@ -44,10 +44,9 @@ class GPTConfig:
     # Medusa MTP (Multi-Token Prediction) parameters
     medusa_num_heads: int = 0      # 0 = disabled, >0 = number of speculative heads
     medusa_num_layers: int = 1     # ResBlock layers per Medusa head
-    medusa_lora_rank: int = 0      # 0 = full projection, >0 = LoRA rank (shares lm_head)
+    medusa_lora_rank: int = 0      # 0 = full projection, >0 = low-rank dimension (for both LoRA and independent)
     medusa_lora_alpha: int = None  # LoRA alpha scaling (default: same as rank, so scaling=1)
-    medusa_independent: bool = False  # Use independent low-rank heads (faster than LoRA)
-    medusa_bottleneck: int = 32       # Bottleneck dimension for independent heads (hidden -> bottleneck -> vocab)
+    medusa_independent: bool = False  # Use independent low-rank heads (faster than LoRA, no weight merge)
 
 
 def norm(x):
@@ -110,20 +109,20 @@ class IndependentMedusaHead(nn.Module):
 
     Architecture: ResBlocks -> W_a -> W_b -> vocab
     - ResBlocks contain the SiLU nonlinearity (same as other head types)
-    - W_a: down-projection (hidden -> bottleneck)
-    - W_b: up-projection (bottleneck -> vocab)
+    - W_a: down-projection (hidden -> rank)
+    - W_b: up-projection (rank -> vocab)
 
     This is an independent predictor (not a delta over lm_head) which avoids the
     slow weight merge that plagued LoRA-based heads.
     """
-    def __init__(self, hidden_size, vocab_size, num_layers, bottleneck=32):
+    def __init__(self, hidden_size, vocab_size, num_layers, rank=32):
         super().__init__()
         self.blocks = nn.ModuleList([MedusaResBlock(hidden_size) for _ in range(num_layers)])
-        self.bottleneck = bottleneck
+        self.rank = rank
 
-        # Low-rank projection: hidden -> bottleneck -> vocab
-        self.W_a = nn.Linear(hidden_size, bottleneck, bias=False)
-        self.W_b = nn.Linear(bottleneck, vocab_size, bias=False)
+        # Low-rank projection: hidden -> rank -> vocab
+        self.W_a = nn.Linear(hidden_size, rank, bias=False)
+        self.W_b = nn.Linear(rank, vocab_size, bias=False)
 
     def forward(self, x):
         for block in self.blocks:
@@ -260,9 +259,10 @@ class GPT(nn.Module):
         if config.medusa_num_heads > 0:
             if config.medusa_independent:
                 # Independent low-rank heads (fastest - no weight merge, no Liger needed)
+                # Uses medusa_lora_rank as the bottleneck dimension
                 self.medusa_heads = nn.ModuleList([
                     IndependentMedusaHead(config.n_embd, padded_vocab_size, config.medusa_num_layers,
-                                          bottleneck=config.medusa_bottleneck)
+                                          rank=config.medusa_lora_rank)
                     for _ in range(config.medusa_num_heads)
                 ])
             elif config.medusa_lora_rank > 0:

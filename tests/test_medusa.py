@@ -540,7 +540,7 @@ class TestGPTWithLoRAMedusa:
 class TestIndependentMedusaHead:
     """Tests for IndependentMedusaHead class (low-rank independent predictor).
 
-    Architecture: ResBlocks -> W_a (hidden->bottleneck) -> W_b (bottleneck->vocab)
+    Architecture: ResBlocks -> W_a (hidden->rank) -> W_b (rank->vocab)
     The SiLU nonlinearity comes from ResBlocks, not a separate layer.
     """
 
@@ -549,8 +549,8 @@ class TestIndependentMedusaHead:
         hidden_size = 64
         vocab_size = 1000
         num_layers = 1
-        bottleneck = 8
-        head = IndependentMedusaHead(hidden_size, vocab_size, num_layers, bottleneck)
+        rank = 8
+        head = IndependentMedusaHead(hidden_size, vocab_size, num_layers, rank)
 
         x = torch.randn(2, 10, hidden_size)
         out = head(x)
@@ -560,22 +560,22 @@ class TestIndependentMedusaHead:
         """IndependentMedusaHead should have W_a, W_b params (not W_hidden)."""
         hidden_size = 64
         vocab_size = 1000
-        bottleneck = 8
+        rank = 8
         head = IndependentMedusaHead(hidden_size, vocab_size, num_layers=1,
-                                      bottleneck=bottleneck)
+                                      rank=rank)
 
         # Should NOT have W_hidden (SiLU comes from ResBlocks)
         assert not hasattr(head, 'W_hidden')
         assert hasattr(head, 'W_a')
         assert hasattr(head, 'W_b')
-        assert head.W_a.weight.shape == (bottleneck, hidden_size)
-        assert head.W_b.weight.shape == (vocab_size, bottleneck)
+        assert head.W_a.weight.shape == (rank, hidden_size)
+        assert head.W_b.weight.shape == (vocab_size, rank)
 
     def test_independent_head_param_count_reduction(self):
         """Independent head should have far fewer params than full projection."""
         hidden_size = 1280
         vocab_size = 65536
-        bottleneck = 32
+        rank = 32
 
         # Full projection params
         full_head = MedusaHead(hidden_size, vocab_size, num_layers=1)
@@ -583,7 +583,7 @@ class TestIndependentMedusaHead:
 
         # Independent head params (W_a + W_b only, no W_hidden)
         ind_head = IndependentMedusaHead(hidden_size, vocab_size, num_layers=1,
-                                          bottleneck=bottleneck)
+                                          rank=rank)
         ind_params = ind_head.W_a.weight.numel() + ind_head.W_b.weight.numel()
 
         # Independent head should be ~97% smaller
@@ -594,7 +594,7 @@ class TestIndependentMedusaHead:
         hidden_size = 64
         vocab_size = 100
         head = IndependentMedusaHead(hidden_size, vocab_size, num_layers=1,
-                                      bottleneck=8)
+                                      rank=8)
 
         x = torch.randn(2, 10, hidden_size, requires_grad=True)
         out = head(x)
@@ -611,7 +611,7 @@ class TestIndependentMedusaHead:
         vocab_size = 100
         num_layers = 2
         head = IndependentMedusaHead(hidden_size, vocab_size, num_layers,
-                                      bottleneck=8)
+                                      rank=8)
 
         assert len(head.blocks) == num_layers
         x = torch.randn(2, 10, hidden_size)
@@ -635,7 +635,7 @@ class TestGPTWithIndependentMedusa:
             medusa_num_heads=2,
             medusa_num_layers=1,
             medusa_independent=True,  # Independent heads enabled
-            medusa_bottleneck=8,
+            medusa_lora_rank=8,  # Used as bottleneck dimension for independent heads
         )
 
     def test_gpt_creates_independent_heads(self, small_config_independent_medusa):

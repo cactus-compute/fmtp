@@ -50,7 +50,6 @@ parser.add_argument("--medusa-num-layers", type=int, default=1, help="ResBlock l
 parser.add_argument("--medusa-lora-rank", type=int, default=0, help="LoRA rank for Medusa heads (0 = full projection, >0 = LoRA sharing lm_head)")
 parser.add_argument("--medusa-lora-alpha", type=int, default=None, help="LoRA alpha scaling (default: same as rank, so scaling=1)")
 parser.add_argument("--medusa-independent", action="store_true", help="use independent low-rank Medusa heads (faster than LoRA, no weight merge)")
-parser.add_argument("--medusa-bottleneck", type=int, default=32, help="bottleneck dimension for independent heads (hidden->bottleneck->vocab)")
 parser.add_argument("--medusa-loss-weight", type=float, default=1.0, help="weight for Medusa head losses (constant or decay base)")
 parser.add_argument("--medusa-loss-scheme", type=str, default="constant", choices=["constant", "decay"], help="weighting scheme: constant (all heads same weight) or decay (weight^k for head k)")
 parser.add_argument("--ignore-mtp-in-data-ratio", action="store_true", help="exclude Medusa head params from data:param ratio calculation (for fair comparison with baseline)")
@@ -169,7 +168,7 @@ if args.depth != 12:
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, medusa_num_heads=args.medusa_num_heads, medusa_num_layers=args.medusa_num_layers, medusa_lora_rank=args.medusa_lora_rank, medusa_lora_alpha=args.medusa_lora_alpha, medusa_independent=args.medusa_independent, medusa_bottleneck=args.medusa_bottleneck)
+model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, medusa_num_heads=args.medusa_num_heads, medusa_num_layers=args.medusa_num_layers, medusa_lora_rank=args.medusa_lora_rank, medusa_lora_alpha=args.medusa_lora_alpha, medusa_independent=args.medusa_independent)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)
