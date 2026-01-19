@@ -7,7 +7,7 @@ Run: uv run pytest tests/test_medusa.py -v
 import pytest
 import torch
 import torch.nn.functional as F
-from nanochat.gpt import GPT, GPTConfig, MedusaResBlock, MedusaHead
+from nanochat.gpt import GPT, GPTConfig, MedusaResBlock, MedusaHead, MedusaLoRAHead
 
 
 class TestMedusaResBlock:
@@ -329,3 +329,206 @@ class TestConfigDefaults:
         config = GPTConfig(medusa_num_heads=5, medusa_num_layers=3)
         assert config.medusa_num_heads == 5
         assert config.medusa_num_layers == 3
+
+    def test_medusa_lora_rank_default(self):
+        """medusa_lora_rank should default to 0 (full projection)."""
+        config = GPTConfig()
+        assert config.medusa_lora_rank == 0
+
+
+class TestMedusaLoRAHead:
+    """Tests for MedusaLoRAHead class (LoRA adapter over lm_head)."""
+
+    def test_lora_head_output_shape(self):
+        """MedusaLoRAHead should output correct shape."""
+        hidden_size = 64
+        vocab_size = 1000
+        num_layers = 1
+        lora_rank = 8
+        head = MedusaLoRAHead(hidden_size, vocab_size, num_layers, lora_rank)
+
+        x = torch.randn(2, 10, hidden_size)
+        lm_head_weight = torch.randn(vocab_size, hidden_size)
+
+        # Apply ResBlocks
+        h = x
+        for block in head.blocks:
+            h = block(h)
+
+        # Compute logits: base + lora_delta
+        base_logits = F.linear(h, lm_head_weight)
+        lora_delta = head.lora_B(head.lora_A(h))
+        out = base_logits + lora_delta
+
+        assert out.shape == (2, 10, vocab_size)
+
+    def test_lora_head_has_correct_params(self):
+        """MedusaLoRAHead should have lora_A and lora_B params."""
+        hidden_size = 64
+        vocab_size = 1000
+        lora_rank = 16
+        head = MedusaLoRAHead(hidden_size, vocab_size, num_layers=1, lora_rank=lora_rank)
+
+        assert hasattr(head, 'lora_A')
+        assert hasattr(head, 'lora_B')
+        assert head.lora_A.weight.shape == (lora_rank, hidden_size)
+        assert head.lora_B.weight.shape == (vocab_size, lora_rank)
+
+    def test_lora_head_param_count_reduction(self):
+        """LoRA head should have far fewer params than full projection."""
+        hidden_size = 1280
+        vocab_size = 65536
+        lora_rank = 32
+
+        # Full projection params
+        full_head = MedusaHead(hidden_size, vocab_size, num_layers=1)
+        full_proj_params = full_head.proj.weight.numel()  # vocab_size * hidden_size
+
+        # LoRA params
+        lora_head = MedusaLoRAHead(hidden_size, vocab_size, num_layers=1, lora_rank=lora_rank)
+        lora_params = lora_head.lora_A.weight.numel() + lora_head.lora_B.weight.numel()
+
+        # LoRA should be ~97% smaller
+        assert lora_params < full_proj_params * 0.05  # Less than 5% of full
+
+    def test_lora_merged_weight(self):
+        """get_merged_weight should return W_base + B @ A."""
+        hidden_size = 64
+        vocab_size = 100
+        lora_rank = 8
+        head = MedusaLoRAHead(hidden_size, vocab_size, num_layers=1, lora_rank=lora_rank)
+
+        lm_head_weight = torch.randn(vocab_size, hidden_size)
+        merged = head.get_merged_weight(lm_head_weight)
+
+        # Verify merged = lm_head_weight + lora_B.weight @ lora_A.weight
+        expected = lm_head_weight + head.lora_B.weight @ head.lora_A.weight
+        assert torch.allclose(merged, expected)
+
+    def test_lora_identity_at_zero_init(self):
+        """With B=zeros, LoRA should act as identity (output = lm_head(x))."""
+        hidden_size = 64
+        vocab_size = 100
+        lora_rank = 8
+        head = MedusaLoRAHead(hidden_size, vocab_size, num_layers=1, lora_rank=lora_rank)
+
+        # Zero-init B (standard LoRA init)
+        torch.nn.init.zeros_(head.lora_B.weight)
+        # Also zero-init ResBlocks for identity
+        for block in head.blocks:
+            torch.nn.init.zeros_(block.linear.weight)
+
+        x = torch.randn(2, 10, hidden_size)
+        lm_head_weight = torch.randn(vocab_size, hidden_size)
+
+        # With zero B, merged_weight should equal lm_head_weight
+        merged = head.get_merged_weight(lm_head_weight)
+        assert torch.allclose(merged, lm_head_weight)
+
+
+class TestGPTWithLoRAMedusa:
+    """Tests for GPT model with LoRA-based Medusa heads."""
+
+    @pytest.fixture
+    def small_config_lora_medusa(self):
+        """Create a small GPT config with LoRA Medusa heads for testing."""
+        return GPTConfig(
+            sequence_len=64,
+            vocab_size=256,
+            n_layer=2,
+            n_head=4,
+            n_kv_head=4,
+            n_embd=64,
+            medusa_num_heads=2,
+            medusa_num_layers=1,
+            medusa_lora_rank=8,  # LoRA enabled
+        )
+
+    def test_gpt_creates_lora_heads(self, small_config_lora_medusa):
+        """GPT should create MedusaLoRAHead when lora_rank > 0."""
+        with torch.device("cpu"):
+            model = GPT(small_config_lora_medusa)
+        model.init_weights()
+
+        assert model.medusa_heads is not None
+        for head in model.medusa_heads:
+            assert isinstance(head, MedusaLoRAHead)
+            assert hasattr(head, 'lora_A')
+            assert hasattr(head, 'lora_B')
+
+    def test_forward_inference_lora(self, small_config_lora_medusa):
+        """Forward with LoRA heads should work for inference."""
+        with torch.device("cpu"):
+            model = GPT(small_config_lora_medusa)
+        model.init_weights()
+        model.eval()
+
+        idx = torch.randint(0, 256, (2, 32))
+        logits, medusa_logits = model(idx, return_medusa=True)
+
+        assert logits.shape == (2, 32, 256)
+        assert medusa_logits.shape == (2, 2, 32, 256)  # (num_heads, B, T, vocab)
+
+    def test_forward_training_lora(self, small_config_lora_medusa):
+        """Forward with LoRA heads should work for training."""
+        with torch.device("cpu"):
+            model = GPT(small_config_lora_medusa)
+        model.init_weights()
+
+        idx = torch.randint(0, 256, (2, 32))
+        targets = torch.randint(0, 256, (2, 32))
+
+        loss, medusa_losses = model(idx, targets, return_medusa=True)
+
+        assert isinstance(loss, torch.Tensor)
+        assert loss.shape == ()
+        assert len(medusa_losses) == 2  # 2 Medusa heads
+
+    def test_backward_lora(self, small_config_lora_medusa):
+        """Gradients should flow through LoRA params."""
+        with torch.device("cpu"):
+            model = GPT(small_config_lora_medusa)
+        model.init_weights()
+
+        idx = torch.randint(0, 256, (2, 32))
+        targets = torch.randint(0, 256, (2, 32))
+
+        loss, medusa_losses = model(idx, targets, return_medusa=True)
+        total_loss = loss + sum(medusa_losses)
+        total_loss.backward()
+
+        # Check gradients on LoRA params
+        for head in model.medusa_heads:
+            assert head.lora_A.weight.grad is not None
+            assert head.lora_B.weight.grad is not None
+
+    def test_optimizer_includes_lora_params(self, small_config_lora_medusa):
+        """setup_optimizers should handle LoRA params: A->Muon, B->AdamW."""
+        with torch.device("cpu"):
+            model = GPT(small_config_lora_medusa)
+        model.init_weights()
+
+        optimizers = model.setup_optimizers()
+        assert len(optimizers) == 2
+
+        adamw, muon = optimizers
+
+        # Collect all params from each optimizer
+        all_adamw_params = []
+        for group in adamw.param_groups:
+            all_adamw_params.extend(group['params'])
+
+        all_muon_params = []
+        for group in muon.param_groups:
+            all_muon_params.extend(group['params'])
+
+        # Check that lora_A is in Muon, lora_B is in AdamW
+        for head in model.medusa_heads:
+            lora_a = head.lora_A.weight
+            lora_b = head.lora_B.weight
+
+            assert any(p is lora_a for p in all_muon_params), "lora_A should be in Muon"
+            assert not any(p is lora_a for p in all_adamw_params), "lora_A should NOT be in AdamW"
+
+            assert any(p is lora_b for p in all_adamw_params), "lora_B should be in AdamW"
+            assert not any(p is lora_b for p in all_muon_params), "lora_B should NOT be in Muon"

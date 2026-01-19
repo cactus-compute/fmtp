@@ -12,6 +12,7 @@ Notable features:
 - Flash Attention 3 integration
 """
 
+import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -43,6 +44,8 @@ class GPTConfig:
     # Medusa MTP (Multi-Token Prediction) parameters
     medusa_num_heads: int = 0      # 0 = disabled, >0 = number of speculative heads
     medusa_num_layers: int = 1     # ResBlock layers per Medusa head
+    medusa_lora_rank: int = 0      # 0 = full projection, >0 = LoRA rank (shares lm_head)
+    medusa_lora_alpha: int = None  # LoRA alpha scaling (default: same as rank, so scaling=1)
 
 
 def norm(x):
@@ -71,6 +74,32 @@ class MedusaHead(nn.Module):
         for block in self.blocks:
             x = block(x)
         return self.proj(x)
+
+
+class MedusaLoRAHead(nn.Module):
+    """
+    Medusa head using LoRA adapter over the shared lm_head.
+
+    Instead of a full (vocab_size, n_embd) projection, uses:
+    - lora_A: (hidden_size -> rank) down-projection
+    - lora_B: (rank -> vocab_size) up-projection
+
+    Output = lm_head(x) + (alpha / rank) * lora_B(lora_A(x))
+
+    The alpha/rank scaling keeps the adapter contribution stable across different ranks.
+    """
+    def __init__(self, hidden_size, vocab_size, num_layers, lora_rank, lora_alpha=None):
+        super().__init__()
+        self.blocks = nn.ModuleList([MedusaResBlock(hidden_size) for _ in range(num_layers)])
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha if lora_alpha is not None else lora_rank  # default: alpha = rank (scaling = 1)
+        self.scaling = self.lora_alpha / self.lora_rank
+        self.lora_A = nn.Linear(hidden_size, lora_rank, bias=False)
+        self.lora_B = nn.Linear(lora_rank, vocab_size, bias=False)
+
+    def get_merged_weight(self, lm_head_weight):
+        """Merge LoRA weights for fused CE: W_merged = W_base + scaling * B @ A"""
+        return lm_head_weight + self.scaling * (self.lora_B.weight @ self.lora_A.weight)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -200,10 +229,19 @@ class GPT(nn.Module):
         # Medusa heads for multi-token prediction (speculative decoding)
         self.medusa_heads = None
         if config.medusa_num_heads > 0:
-            self.medusa_heads = nn.ModuleList([
-                MedusaHead(config.n_embd, padded_vocab_size, config.medusa_num_layers)
-                for _ in range(config.medusa_num_heads)
-            ])
+            if config.medusa_lora_rank > 0:
+                # LoRA-based Medusa heads (share lm_head, much smaller)
+                self.medusa_heads = nn.ModuleList([
+                    MedusaLoRAHead(config.n_embd, padded_vocab_size, config.medusa_num_layers,
+                                   config.medusa_lora_rank, config.medusa_lora_alpha)
+                    for _ in range(config.medusa_num_heads)
+                ])
+            else:
+                # Original full-projection Medusa heads
+                self.medusa_heads = nn.ModuleList([
+                    MedusaHead(config.n_embd, padded_vocab_size, config.medusa_num_layers)
+                    for _ in range(config.medusa_num_heads)
+                ])
 
     def init_weights(self):
         """
@@ -254,7 +292,13 @@ class GPT(nn.Module):
             for head in self.medusa_heads:
                 for block in head.blocks:
                     torch.nn.init.zeros_(block.linear.weight)
-                torch.nn.init.normal_(head.proj.weight, mean=0.0, std=0.001)
+                if hasattr(head, 'lora_A'):
+                    # LoRA: A=Kaiming uniform, B=zeros (adapter starts as identity)
+                    torch.nn.init.kaiming_uniform_(head.lora_A.weight, a=math.sqrt(5))
+                    torch.nn.init.zeros_(head.lora_B.weight)
+                else:
+                    # Full projection
+                    torch.nn.init.normal_(head.proj.weight, mean=0.0, std=0.001)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -351,14 +395,20 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        # Medusa heads: split into matrix params (ResBlock linears -> Muon) and proj params (-> AdamW like lm_head)
+        # Medusa heads: split into matrix params (ResBlock linears + LoRA A -> Muon) and proj params (LoRA B or full proj -> AdamW)
         medusa_matrix_params = []
         medusa_proj_params = []
         if self.medusa_heads is not None:
             for head in self.medusa_heads:
                 for block in head.blocks:
                     medusa_matrix_params.append(block.linear.weight)
-                medusa_proj_params.append(head.proj.weight)
+                if hasattr(head, 'lora_A'):
+                    # LoRA: A -> Muon (it's a matrix), B -> AdamW (similar to lm_head)
+                    medusa_matrix_params.append(head.lora_A.weight)
+                    medusa_proj_params.append(head.lora_B.weight)
+                else:
+                    # Full projection -> AdamW
+                    medusa_proj_params.append(head.proj.weight)
         total_params = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params) + len(medusa_matrix_params) + len(medusa_proj_params)
         assert len(list(self.parameters())) == total_params
         # Create the AdamW optimizer for the embedding, lm_head, per-layer scalars, and medusa projections
@@ -425,12 +475,17 @@ class GPT(nn.Module):
                     # Slice hidden states and targets for this head
                     x_shifted = x[:, :-shift].contiguous()
                     targets_shifted = targets[:, shift:].contiguous()
-                    # Get the projection weight (non-padded)
-                    head_weight = head.proj.weight[:self.config.vocab_size]
-                    # Apply ResBlocks first, then fused CE with the projection
+                    # Apply ResBlocks first
                     h = x_shifted
                     for block in head.blocks:
                         h = block(h)
+                    # Get the projection weight (LoRA-aware)
+                    if hasattr(head, 'lora_A'):
+                        # LoRA: merge weights, then use fused CE
+                        head_weight = head.get_merged_weight(lm_weight)
+                    else:
+                        # Full projection (non-padded)
+                        head_weight = head.proj.weight[:self.config.vocab_size]
                     head_loss = fused_linear_cross_entropy(h, head_weight, targets_shifted, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
                     medusa_losses.append(head_loss)
                 return loss, medusa_losses
@@ -445,8 +500,21 @@ class GPT(nn.Module):
             # Compute Medusa logits if requested (for speculative decoding)
             if return_medusa and self.medusa_heads is not None and kv_cache is None:
                 medusa_logits = []
+                lm_weight = self.lm_head.weight[:self.config.vocab_size]
                 for head in self.medusa_heads:
-                    head_logits = head(x)
+                    # Apply ResBlocks
+                    h = x
+                    for block in head.blocks:
+                        h = block(h)
+                    # Compute logits (LoRA-aware)
+                    if hasattr(head, 'lora_A'):
+                        # LoRA: base + scaled delta
+                        base_logits = F.linear(h, lm_weight)
+                        lora_delta = head.scaling * head.lora_B(head.lora_A(h))
+                        head_logits = base_logits + lora_delta
+                    else:
+                        # Full projection
+                        head_logits = head.proj(h)
                     head_logits = head_logits[..., :self.config.vocab_size]
                     head_logits = head_logits.float()
                     head_logits = softcap * torch.tanh(head_logits / softcap)
