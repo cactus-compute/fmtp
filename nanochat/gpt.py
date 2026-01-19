@@ -218,14 +218,29 @@ class Block(nn.Module):
         return x
 
 
+def _chunk_loss_fn(h_chunk, z_chunk, lm_head_weight, W_b_weight, t_chunk, vocab_size, softcap):
+    """Compute loss for a single chunk - used with gradient checkpointing."""
+    chunk_logits = F.linear(h_chunk, lm_head_weight) + F.linear(z_chunk, W_b_weight)
+    chunk_logits = chunk_logits[..., :vocab_size]
+    if softcap is not None:
+        chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
+    valid_mask = (t_chunk != -1)
+    chunk_count = valid_mask.sum()
+    if chunk_count > 0:
+        chunk_loss = F.cross_entropy(chunk_logits, t_chunk, ignore_index=-1, reduction='sum')
+        return chunk_loss, chunk_count
+    return torch.tensor(0.0, device=h_chunk.device), torch.tensor(0, device=h_chunk.device)
+
+
 @torch.compiler.disable
-def _chunked_independent_head_loss(h, lm_head_weight, W_a, W_b, targets, vocab_size, softcap, chunk_size=2048):
+def _chunked_independent_head_loss(h, lm_head_weight, W_a, W_b, targets, vocab_size, softcap, chunk_size=1024):
     """Compute cross-entropy loss in chunks to avoid huge logits allocation.
 
     Computes: loss(h @ lm_head.T + z @ W_b.T, targets) where z = h @ W_a.T
 
-    By chunking, each chunk's logits are ~256MB instead of 8GB for full batch.
+    By chunking, each chunk's logits are ~128MB (at chunk_size=1024) instead of 8GB for full batch.
     The low-rank projection z = h @ W_a.T is computed once upfront (tiny: B*T x rank).
+    Uses gradient checkpointing per chunk to avoid storing intermediate activations.
     Disabled from torch.compile to prevent inductor from fusing and OOMing.
     """
     h_flat = h.view(-1, h.size(-1))  # (B*T, hidden)
@@ -241,19 +256,13 @@ def _chunked_independent_head_loss(h, lm_head_weight, W_a, W_b, targets, vocab_s
         h_chunk = h_flat[i:i+chunk_size]
         z_chunk = z[i:i+chunk_size]
         t_chunk = targets_flat[i:i+chunk_size]
-        # Compute chunk logits: lm_head contribution + low-rank delta
-        # (chunk, hidden) @ (vocab, hidden).T + (chunk, rank) @ (vocab, rank).T
-        chunk_logits = F.linear(h_chunk, lm_head_weight) + F.linear(z_chunk, W_b.weight)
-        chunk_logits = chunk_logits[..., :vocab_size]
-        if softcap is not None:
-            chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
-        # Count valid tokens (not ignore_index)
-        valid_mask = (t_chunk != -1)
-        chunk_count = valid_mask.sum()
-        if chunk_count > 0:
-            chunk_loss = F.cross_entropy(chunk_logits, t_chunk, ignore_index=-1, reduction='sum')
-            total_loss = total_loss + chunk_loss
-            total_count = total_count + chunk_count
+        # Use gradient checkpointing to recompute forward during backward
+        chunk_loss, chunk_count = torch.utils.checkpoint.checkpoint(
+            _chunk_loss_fn, h_chunk, z_chunk, lm_head_weight, W_b.weight,
+            t_chunk, vocab_size, softcap, use_reentrant=False
+        )
+        total_loss = total_loss + chunk_loss
+        total_count = total_count + chunk_count
     return total_loss / total_count if total_count > 0 else torch.tensor(0.0, device=h.device)
 
 
