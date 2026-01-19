@@ -1,25 +1,23 @@
 """
-Efficient Medusa speculative decoding evaluation.
+Efficient Medusa speculative decoding evaluation with KV caching.
 
-This module provides an optimized 2-pass Medusa evaluation that:
-1. Does ONE forward pass to get Medusa speculations at ALL positions (amortized)
-2. For each speculation point, does a verification forward pass with tree candidates
+This module provides O(N²) complexity evaluation (same as baseline) by:
+1. First pass: Forward full sequence with KV cache to get Medusa speculations
+2. Verification passes: Reuse KV cache, only forward tree candidates (O(k) tokens)
 
-Complexity: O(1) for speculation + O(seq_len / accept_length) for verification
-This is faster than the naive O(seq_len) approach when accept_length > 1.
+The key insight: the first pass populates KV cache for the full sequence.
+For verification at position P, we can truncate the KV cache to length P+1
+and only forward the tree candidates, making each verification O(k*P) instead of O(P²).
 
-The 2-pass algorithm at each speculation point:
-1. Get Medusa speculations from pre-computed logits (first pass is amortized)
-2. Build candidate tree from top-k predictions
-3. Forward prefix + tree candidates to verify with main model
-4. Find best candidate path (longest matching prefix via greedy acceptance)
-5. Record accepted predictions, advance position
+Total complexity: O(N²) for first pass + O(k * N² / accept_length) for verification
+                = O(N²) when k << N
 """
 
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
 from nanochat.medusa_buffers import generate_medusa_buffers, get_sparse_medusa_choices
+from nanochat.engine import KVCache
 
 
 @torch.no_grad()
@@ -27,21 +25,18 @@ def forward_model_medusa(model, input_ids: torch.Tensor,
                          num_heads_to_use: Optional[int] = None,
                          topk: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Efficient Medusa speculative decoding evaluation with amortized speculation.
-
-    This is the main entry point for Medusa evaluation. It implements true 2-pass
-    verification with an optimization: the first pass (speculation) is done once
-    for the entire sequence, then verification passes are done incrementally.
+    Efficient Medusa speculative decoding evaluation with KV cache reuse.
 
     Algorithm:
-    1. Forward full sequence once to get Medusa speculations at ALL positions
-    2. At each position, build candidate tree from pre-computed top-k
-    3. Forward prefix + tree candidates for verification (2nd pass)
-    4. Greedy acceptance: find longest prefix where verification matches speculation
-    5. Advance by accept_length, repeat until end of sequence
-
-    This achieves O(1) speculation + O(seq_len / avg_accept_length) verification,
-    which is faster than naive O(seq_len) when Medusa heads are accurate.
+    1. Forward full sequence WITH KV cache to get Medusa speculations at ALL positions
+       - This populates KV cache with keys/values for all N positions
+       - Cost: O(N²)
+    2. For each speculation point P:
+       - Truncate KV cache to position P+1 (just update the length counter)
+       - Forward only tree candidates (k tokens) using the cached prefix
+       - Cost: O(k * P) per verification
+    3. Total: O(N²) + O(k * sum(P_i)) where P_i are verification positions
+            ≈ O(N²) when k is small
 
     Args:
         model: GPT model with Medusa heads
@@ -55,6 +50,7 @@ def forward_model_medusa(model, input_ids: torch.Tensor,
     """
     batch_size, seq_len = input_ids.size()
     device = input_ids.device
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     config = model.config
     total_medusa_heads = config.medusa_num_heads
@@ -67,6 +63,7 @@ def forward_model_medusa(model, input_ids: torch.Tensor,
     tree_indices = buffers["tree_indices"]
     retrieve_indices = buffers["retrieve_indices"]
     num_candidates, max_depth = retrieve_indices.shape
+    tree_len = tree_indices.shape[0]
 
     # Output tensors
     all_predictions = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
@@ -75,24 +72,46 @@ def forward_model_medusa(model, input_ids: torch.Tensor,
     # Ground truth targets (for loss computation)
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
 
-    # === First pass (amortized): Get Medusa speculations at ALL positions ===
-    logits, medusa_logits = model(input_ids, return_medusa=True)
-    # logits: (B, T, V), medusa_logits: (num_heads, B, T, V)
-
-    # Pre-compute top-k for all positions (avoids repeated topk calls)
-    main_topk = torch.topk(logits, topk, dim=-1).indices  # (B, T, topk)
-    medusa_topk = torch.topk(medusa_logits[:num_medusa_heads], topk, dim=-1).indices  # (H, B, T, topk)
+    # KV cache config
+    kv_kwargs = {
+        "num_heads": config.n_kv_head,
+        "head_dim": config.n_embd // config.n_head,
+        "num_layers": config.n_layer,
+    }
 
     # Process each batch item
     for b in range(batch_size):
         input_single = input_ids[b:b+1, :]  # (1, seq_len)
 
+        # === First pass: Forward full sequence WITH KV cache ===
+        # This populates the KV cache with all N positions
+        kv_cache = KVCache(
+            batch_size=1,
+            seq_len=seq_len + tree_len + 10,  # Extra space for tree candidates
+            device=device,
+            dtype=dtype,
+            **kv_kwargs
+        )
+
+        # Forward with KV cache - this fills the cache
+        # Note: return_medusa doesn't work with KV cache, so we do it separately
+        logits_with_cache = model(input_single, kv_cache=kv_cache)
+        # KV cache now has all N positions cached
+
+        # Get Medusa speculations (without KV cache since return_medusa needs it)
+        logits, medusa_logits = model(input_single, return_medusa=True)
+        # logits: (1, T, V), medusa_logits: (num_heads, 1, T, V)
+
+        # Pre-compute top-k for all positions
+        main_topk = torch.topk(logits[0], topk, dim=-1).indices  # (T, topk)
+        medusa_topk = torch.topk(medusa_logits[:num_medusa_heads, 0], topk, dim=-1).indices  # (H, T, topk)
+
         pos = 0
         while pos < seq_len - 1:
             # Build candidates from pre-computed Medusa speculations at this position
             flat_candidates = torch.cat([
-                main_topk[b, pos, 0:1],  # Top-1 from main head as root
-                medusa_topk[:, b, pos, :].reshape(-1),  # Top-k from each Medusa head
+                main_topk[pos, 0:1],  # Top-1 from main head as root
+                medusa_topk[:, pos, :].reshape(-1),  # Top-k from each Medusa head
             ])
             tree_candidates = flat_candidates[tree_indices]  # (tree_len,)
 
@@ -111,20 +130,38 @@ def forward_model_medusa(model, input_ids: torch.Tensor,
             if effective_depth == 0:
                 break
 
-            # === Second pass: Verify with tree candidates ===
-            # This is the key 2-pass step: we forward prefix + speculated tree
-            prefix = input_single[:, :pos + 1]
-            verify_input = torch.cat([prefix, tree_candidates.unsqueeze(0)], dim=1)
-            verify_logits = model(verify_input)  # (1, pos+1+tree_len, vocab)
+            # === Second pass: Verify using KV cache ===
+            # Truncate KV cache to position pos+1 (rollback to prefix length)
+            kv_cache.cache_seqlens.fill_(pos + 1)
+
+            # Forward only the tree candidates (k tokens) - O(k * (pos+1))
+            tree_input = tree_candidates.unsqueeze(0)  # (1, tree_len)
+            verify_logits = model(tree_input, kv_cache=kv_cache)  # (1, tree_len, vocab)
+
+            # verify_logits[0, i] is the logit after seeing prefix + tree_candidates[:i+1]
+            # This predicts token at position (pos+1) + i + 1 = pos + i + 2
+            #
+            # But we need:
+            # - Logit predicting pos+1: this is logits[0, pos] from first pass
+            # - Logit predicting pos+2: verify_logits[0, 0] (after seeing prefix + tree[0])
+            # - Logit predicting pos+3: verify_logits[0, 1] (after seeing prefix + tree[0:2])
+            # etc.
+
+            # Combine: first position uses logits from first pass, rest from verification
+            full_verify_logits = torch.cat([
+                logits[:, pos:pos+1, :],  # Logit at pos predicts pos+1
+                verify_logits,  # Logits for pos+2, pos+3, ...
+            ], dim=1)  # (1, 1 + tree_len, vocab)
 
             # Extract candidate-aligned verification logits
-            # verify_logits[0, pos + idx] predicts token at position pos + idx + 1
-            candidate_logits = torch.zeros(num_candidates, max_depth, verify_logits.shape[-1], device=device)
+            candidate_logits = torch.zeros(num_candidates, max_depth, full_verify_logits.shape[-1], device=device)
             for i in range(num_candidates):
                 for j in range(max_depth):
                     idx = retrieve_indices[i, j].item()
                     if idx >= 0:
-                        candidate_logits[i, j] = verify_logits[0, pos + idx, :]
+                        # idx maps to position in the tree
+                        # full_verify_logits[0, idx] gives the logit that predicts candidate[i, j]
+                        candidate_logits[i, j] = full_verify_logits[0, idx, :]
 
             # Greedy acceptance: find candidate with longest matching prefix
             predictions_from_logits = candidate_logits.argmax(dim=-1)  # (num_candidates, max_depth)
@@ -145,7 +182,7 @@ def forward_model_medusa(model, input_ids: torch.Tensor,
                         idx = retrieve_indices[best_candidate_idx, k].item()
                         if idx >= 0:
                             all_losses[b, pred_pos] = F.cross_entropy(
-                                verify_logits[0, pos + idx, :].unsqueeze(0),
+                                full_verify_logits[0, idx, :].unsqueeze(0),
                                 target_ids[b, pred_pos].unsqueeze(0),
                                 reduction='none'
                             )
@@ -154,10 +191,10 @@ def forward_model_medusa(model, input_ids: torch.Tensor,
                 # No speculation accepted - use main model prediction
                 pred_pos = pos + 1
                 if pred_pos < seq_len:
-                    main_pred = verify_logits[0, pos, :].argmax(dim=-1)
+                    main_pred = full_verify_logits[0, 0, :].argmax(dim=-1)
                     all_predictions[b, pred_pos] = main_pred
                     all_losses[b, pred_pos] = F.cross_entropy(
-                        verify_logits[0, pos, :].unsqueeze(0),
+                        full_verify_logits[0, 0, :].unsqueeze(0),
                         target_ids[b, pred_pos].unsqueeze(0),
                         reduction='none'
                     )
