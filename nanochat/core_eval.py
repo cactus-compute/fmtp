@@ -11,6 +11,7 @@ from jinja2 import Template
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
+from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
 # Prompt rendering utilities
@@ -273,7 +274,10 @@ def evaluate_task(model, tokenizer, data, device, task_meta, use_medusa=False, n
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
     # stride the examples to each rank
-    for idx in range(rank, len(data), world_size):
+    my_indices = list(range(rank, len(data), world_size))
+    # Only show progress bar on rank 0
+    iterator = tqdm(my_indices, desc="Examples", disable=(rank != 0))
+    for idx in iterator:
         is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta, use_medusa=use_medusa, num_medusa_heads=num_medusa_heads)
         correct[idx] = float(is_correct)
     # sync results across all the processes if running distributed
