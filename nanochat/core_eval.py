@@ -9,6 +9,7 @@ import random
 
 from jinja2 import Template
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 
 # -----------------------------------------------------------------------------
@@ -165,7 +166,77 @@ def forward_model(model, input_ids):
 
 
 @torch.no_grad()
-def evaluate_example(idx, model, tokenizer, data, device, task_meta):
+def forward_model_medusa(model, input_ids):
+    """
+    Medusa-based forward pass for evaluation.
+
+    With N Medusa heads, we can predict N+1 tokens from each position:
+    - Main head: predicts t+1
+    - Medusa head k: predicts t+k+2
+
+    We forward only every (N+1)th token and use Medusa heads to predict the rest.
+    This tests whether the Medusa heads are actually working correctly.
+
+    Returns losses and predictions tensors of the same shape as forward_model.
+    """
+    batch_size, seq_len = input_ids.size()
+    num_medusa_heads = model.config.medusa_num_heads
+    stride = num_medusa_heads + 1  # How many tokens we can predict from one position
+
+    # We'll build up predictions and losses for all positions
+    all_predictions = torch.zeros(batch_size, seq_len, dtype=torch.long, device=input_ids.device)
+    all_losses = torch.full((batch_size, seq_len), float('nan'), device=input_ids.device)
+
+    # Target ids for computing loss
+    target_ids = torch.roll(input_ids, shifts=-1, dims=1)
+
+    # Positions to actually forward (every stride-th position, starting from 0)
+    # These are the "anchor" positions from which we predict multiple tokens
+    anchor_positions = list(range(0, seq_len - 1, stride))
+
+    if not anchor_positions:
+        # Fallback to regular forward if sequence too short
+        return forward_model(model, input_ids)
+
+    # Extract anchor tokens for batched forward
+    anchor_indices = torch.tensor(anchor_positions, device=input_ids.device)
+    anchor_tokens = input_ids[:, anchor_indices]  # (B, num_anchors)
+
+    # Forward the anchor tokens
+    logits, medusa_logits = model(anchor_tokens, return_medusa=True)
+    # logits: (B, num_anchors, vocab) - main head
+    # medusa_logits: (num_heads, B, num_anchors, vocab) - Medusa heads
+
+    # Now fill in predictions and losses for each anchor and its predicted positions
+    for i, anchor_pos in enumerate(anchor_positions):
+        # Main head predicts position anchor_pos + 1
+        main_pred_pos = anchor_pos + 1
+        if main_pred_pos < seq_len:
+            main_logits = logits[:, i, :]  # (B, vocab)
+            all_predictions[:, main_pred_pos] = main_logits.argmax(dim=-1)
+            all_losses[:, main_pred_pos] = F.cross_entropy(
+                main_logits, target_ids[:, main_pred_pos], reduction='none'
+            )
+
+        # Medusa heads predict positions anchor_pos + 2, anchor_pos + 3, ...
+        for k in range(num_medusa_heads):
+            medusa_pred_pos = anchor_pos + k + 2
+            if medusa_pred_pos < seq_len:
+                medusa_head_logits = medusa_logits[k, :, i, :]  # (B, vocab)
+                all_predictions[:, medusa_pred_pos] = medusa_head_logits.argmax(dim=-1)
+                all_losses[:, medusa_pred_pos] = F.cross_entropy(
+                    medusa_head_logits, target_ids[:, medusa_pred_pos], reduction='none'
+                )
+
+    # Position 0 is the prompt start - we don't predict it, but we need predictions
+    # for positions 1 through seq_len-1. The last position has no target.
+    all_losses[:, -1] = float('nan')
+
+    return all_losses, all_predictions
+
+
+@torch.no_grad()
+def evaluate_example(idx, model, tokenizer, data, device, task_meta, use_medusa=False):
     """Evaluate a single example, return True if correct, False otherwise"""
     item = data[idx]
     task_type = task_meta['task_type']
@@ -218,7 +289,10 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     input_ids = input_ids.to(device)
 
     # Forward the model, get the autoregressive loss and argmax prediction at each token
-    losses, predictions = forward_model(model, input_ids)
+    if use_medusa and hasattr(model, 'config') and getattr(model.config, 'medusa_num_heads', 0) > 0:
+        losses, predictions = forward_model_medusa(model, input_ids)
+    else:
+        losses, predictions = forward_model(model, input_ids)
 
     # See if the losses/predictions come out correctly
     if task_type == 'language_modeling':
@@ -241,7 +315,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     return is_correct
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta):
+def evaluate_task(model, tokenizer, data, device, task_meta, use_medusa=False):
     """
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
@@ -251,7 +325,7 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta, use_medusa=use_medusa)
         correct[idx] = float(is_correct)
     # sync results across all the processes if running distributed
     if world_size > 1:
