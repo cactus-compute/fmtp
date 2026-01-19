@@ -168,76 +168,107 @@ def forward_model(model, input_ids):
 @torch.no_grad()
 def forward_model_medusa(model, input_ids, num_heads_to_use=None):
     """
-    Medusa-based forward pass for evaluation.
+    Medusa speculative decoding evaluation with proper two-pass verification.
 
-    With N Medusa heads, we can predict N+1 tokens from each position:
-    - Main head: predicts t+1
-    - Medusa head k: predicts t+k+2
+    This implements true speculative decoding:
+    1. First forward pass: Generate candidate tokens using Medusa heads
+    2. Second forward pass: Verify candidates with the main model
+    3. Accept the longest prefix where verification matches speculation
 
-    We forward only every (N+1)th token and use Medusa heads to predict the rest.
-    This tests whether the Medusa heads are actually working correctly.
+    With N Medusa heads, we speculate N tokens ahead from each position.
+    We process the sequence in chunks, using speculative decoding at each step.
 
     Args:
         model: The model with Medusa heads
         input_ids: Input token IDs (B, T)
-        num_heads_to_use: Number of Medusa heads to use (default: all). If less than
-                          total heads, only uses heads 0 through num_heads_to_use-1.
+        num_heads_to_use: Number of Medusa heads to use (default: all)
 
     Returns losses and predictions tensors of the same shape as forward_model.
     """
     batch_size, seq_len = input_ids.size()
+    device = input_ids.device
     total_medusa_heads = model.config.medusa_num_heads
     num_medusa_heads = num_heads_to_use if num_heads_to_use is not None else total_medusa_heads
-    num_medusa_heads = min(num_medusa_heads, total_medusa_heads)  # Can't use more than available
-    stride = num_medusa_heads + 1  # How many tokens we can predict from one position
+    num_medusa_heads = min(num_medusa_heads, total_medusa_heads)
 
-    # We'll build up predictions and losses for all positions
-    all_predictions = torch.zeros(batch_size, seq_len, dtype=torch.long, device=input_ids.device)
-    all_losses = torch.full((batch_size, seq_len), float('nan'), device=input_ids.device)
+    # Output tensors
+    all_predictions = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+    all_losses = torch.full((batch_size, seq_len), float('nan'), device=device)
 
     # Target ids for computing loss
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
 
-    # Positions to actually forward (every stride-th position, starting from 0)
-    # These are the "anchor" positions from which we predict multiple tokens
-    anchor_positions = list(range(0, seq_len - 1, stride))
+    # Process sequence with speculative decoding
+    # At each position, we:
+    # 1. Forward the prefix to get Medusa predictions (speculation)
+    # 2. Forward prefix + speculated tokens to verify
+    # 3. Accept matching prefix, record losses/predictions
 
-    if not anchor_positions:
-        # Fallback to regular forward if sequence too short
-        return forward_model(model, input_ids)
+    pos = 0
+    while pos < seq_len - 1:
+        # === First forward pass: Get Medusa speculations ===
+        prefix = input_ids[:, :pos + 1]  # (B, pos+1)
+        logits, medusa_logits = model(prefix, return_medusa=True)
+        # logits: (B, pos+1, vocab) - main head
+        # medusa_logits: (num_heads, B, pos+1, vocab) - Medusa heads
 
-    # Extract anchor tokens for batched forward
-    anchor_indices = torch.tensor(anchor_positions, device=input_ids.device)
-    anchor_tokens = input_ids[:, anchor_indices]  # (B, num_anchors)
+        # Get predictions from last position
+        main_pred = logits[:, -1, :].argmax(dim=-1)  # (B,) - predicts pos+1
 
-    # Forward the anchor tokens
-    logits, medusa_logits = model(anchor_tokens, return_medusa=True)
-    # logits: (B, num_anchors, vocab) - main head
-    # medusa_logits: (num_heads, B, num_anchors, vocab) - Medusa heads
-
-    # Now fill in predictions and losses for each anchor and its predicted positions
-    for i, anchor_pos in enumerate(anchor_positions):
-        # Main head predicts position anchor_pos + 1
-        main_pred_pos = anchor_pos + 1
-        if main_pred_pos < seq_len:
-            main_logits = logits[:, i, :]  # (B, vocab)
-            all_predictions[:, main_pred_pos] = main_logits.argmax(dim=-1)
-            all_losses[:, main_pred_pos] = F.cross_entropy(
-                main_logits, target_ids[:, main_pred_pos], reduction='none'
-            )
-
-        # Medusa heads predict positions anchor_pos + 2, anchor_pos + 3, ...
+        # Speculate next num_medusa_heads tokens using Medusa heads
+        # Medusa head k predicts position pos+k+2 (0-indexed: head 0 predicts pos+2)
+        speculated_tokens = [main_pred]  # Start with main head prediction
         for k in range(num_medusa_heads):
-            medusa_pred_pos = anchor_pos + k + 2
-            if medusa_pred_pos < seq_len:
-                medusa_head_logits = medusa_logits[k, :, i, :]  # (B, vocab)
-                all_predictions[:, medusa_pred_pos] = medusa_head_logits.argmax(dim=-1)
-                all_losses[:, medusa_pred_pos] = F.cross_entropy(
-                    medusa_head_logits, target_ids[:, medusa_pred_pos], reduction='none'
+            medusa_pred = medusa_logits[k, :, -1, :].argmax(dim=-1)  # (B,)
+            speculated_tokens.append(medusa_pred)
+
+        # Stack speculated tokens: (B, 1 + num_medusa_heads)
+        speculated = torch.stack(speculated_tokens, dim=1)
+
+        # Determine how many speculated tokens we can actually verify
+        # (don't go past end of sequence)
+        num_to_verify = min(1 + num_medusa_heads, seq_len - pos - 1)
+        speculated = speculated[:, :num_to_verify]
+
+        # === Second forward pass: Verify speculated tokens ===
+        # Concatenate prefix with speculated tokens
+        verify_input = torch.cat([prefix, speculated], dim=1)  # (B, pos+1+num_to_verify)
+        verify_logits = model(verify_input)  # (B, pos+1+num_to_verify, vocab)
+
+        # Extract verification logits for speculated positions
+        # verify_logits[:, pos, :] predicts position pos+1 (first speculated token)
+        # verify_logits[:, pos+k, :] predicts position pos+k+1
+
+        # Check which speculated tokens match verification
+        accepted_length = 0
+        for k in range(num_to_verify):
+            verify_pos = pos + k  # Position in verify_logits that predicts pos+k+1
+            actual_target = input_ids[:, pos + k + 1]  # Ground truth at pos+k+1
+            verify_pred = verify_logits[:, verify_pos, :].argmax(dim=-1)
+
+            # Record prediction and loss at this position
+            pred_pos = pos + k + 1  # Position being predicted
+            if pred_pos < seq_len:
+                all_predictions[:, pred_pos] = verify_pred
+                all_losses[:, pred_pos] = F.cross_entropy(
+                    verify_logits[:, verify_pos, :].view(batch_size, -1),
+                    target_ids[:, pred_pos],
+                    reduction='none'
                 )
 
-    # Position 0 is the prompt start - we don't predict it, but we need predictions
-    # for positions 1 through seq_len-1. The last position has no target.
+            # Check if speculation matched verification
+            speculated_token = speculated[:, k]
+            if torch.all(verify_pred == speculated_token):
+                accepted_length = k + 1
+            else:
+                # First mismatch - stop accepting
+                accepted_length = k + 1  # Still accept up to and including this position
+                break
+
+        # Advance position by accepted length (at minimum 1)
+        pos += max(1, accepted_length)
+
+    # Last position has no target
     all_losses[:, -1] = float('nan')
 
     return all_losses, all_predictions
