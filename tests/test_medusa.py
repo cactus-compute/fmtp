@@ -7,7 +7,7 @@ Run: uv run pytest tests/test_medusa.py -v
 import pytest
 import torch
 import torch.nn.functional as F
-from nanochat.gpt import GPT, GPTConfig, MedusaResBlock, MedusaHead, MedusaLoRAHead
+from nanochat.gpt import GPT, GPTConfig, MedusaResBlock, MedusaHead, MedusaLoRAHead, IndependentMedusaHead
 
 
 class TestMedusaResBlock:
@@ -169,7 +169,7 @@ class TestGPTWithMedusa:
         assert loss.item() > 0
 
     def test_forward_with_targets_and_medusa(self, small_config_with_medusa):
-        """Forward with targets and return_medusa should return loss, logits, medusa_logits."""
+        """Forward with targets and return_medusa should return loss and medusa_losses."""
         with torch.device("cpu"):
             model = GPT(small_config_with_medusa)
         model.init_weights()
@@ -177,12 +177,15 @@ class TestGPTWithMedusa:
         idx = torch.randint(0, 256, (2, 32))
         targets = torch.randint(0, 256, (2, 32))
 
-        loss, logits, medusa_logits = model(idx, targets, return_medusa=True)
+        # Training mode returns (loss, medusa_losses), not logits
+        loss, medusa_losses = model(idx, targets, return_medusa=True)
 
         assert isinstance(loss, torch.Tensor)
         assert loss.shape == ()
-        assert logits.shape == (2, 32, 256)
-        assert medusa_logits.shape == (3, 2, 32, 256)
+        assert len(medusa_losses) == 3  # 3 Medusa heads
+        for ml in medusa_losses:
+            assert isinstance(ml, torch.Tensor)
+            assert ml.shape == ()
 
     def test_backward_compatible_no_medusa(self, small_config_no_medusa):
         """GPT without Medusa should work exactly as before."""
@@ -532,3 +535,196 @@ class TestGPTWithLoRAMedusa:
 
             assert any(p is lora_b for p in all_adamw_params), "lora_B should be in AdamW"
             assert not any(p is lora_b for p in all_muon_params), "lora_B should NOT be in Muon"
+
+
+class TestIndependentMedusaHead:
+    """Tests for IndependentMedusaHead class (low-rank independent predictor).
+
+    Architecture: ResBlocks -> W_a (hidden->bottleneck) -> W_b (bottleneck->vocab)
+    The SiLU nonlinearity comes from ResBlocks, not a separate layer.
+    """
+
+    def test_independent_head_output_shape(self):
+        """IndependentMedusaHead should output correct shape."""
+        hidden_size = 64
+        vocab_size = 1000
+        num_layers = 1
+        bottleneck = 8
+        head = IndependentMedusaHead(hidden_size, vocab_size, num_layers, bottleneck)
+
+        x = torch.randn(2, 10, hidden_size)
+        out = head(x)
+        assert out.shape == (2, 10, vocab_size)
+
+    def test_independent_head_has_correct_params(self):
+        """IndependentMedusaHead should have W_a, W_b params (not W_hidden)."""
+        hidden_size = 64
+        vocab_size = 1000
+        bottleneck = 8
+        head = IndependentMedusaHead(hidden_size, vocab_size, num_layers=1,
+                                      bottleneck=bottleneck)
+
+        # Should NOT have W_hidden (SiLU comes from ResBlocks)
+        assert not hasattr(head, 'W_hidden')
+        assert hasattr(head, 'W_a')
+        assert hasattr(head, 'W_b')
+        assert head.W_a.weight.shape == (bottleneck, hidden_size)
+        assert head.W_b.weight.shape == (vocab_size, bottleneck)
+
+    def test_independent_head_param_count_reduction(self):
+        """Independent head should have far fewer params than full projection."""
+        hidden_size = 1280
+        vocab_size = 65536
+        bottleneck = 32
+
+        # Full projection params
+        full_head = MedusaHead(hidden_size, vocab_size, num_layers=1)
+        full_proj_params = full_head.proj.weight.numel()  # vocab_size * hidden_size
+
+        # Independent head params (W_a + W_b only, no W_hidden)
+        ind_head = IndependentMedusaHead(hidden_size, vocab_size, num_layers=1,
+                                          bottleneck=bottleneck)
+        ind_params = ind_head.W_a.weight.numel() + ind_head.W_b.weight.numel()
+
+        # Independent head should be ~97% smaller
+        assert ind_params < full_proj_params * 0.05  # Less than 5% of full
+
+    def test_independent_head_gradient_flow(self):
+        """Gradients should flow through both weight matrices."""
+        hidden_size = 64
+        vocab_size = 100
+        head = IndependentMedusaHead(hidden_size, vocab_size, num_layers=1,
+                                      bottleneck=8)
+
+        x = torch.randn(2, 10, hidden_size, requires_grad=True)
+        out = head(x)
+        loss = out.sum()
+        loss.backward()
+
+        assert x.grad is not None
+        assert head.W_a.weight.grad is not None
+        assert head.W_b.weight.grad is not None
+
+    def test_independent_head_resblocks(self):
+        """Independent head should apply ResBlocks before low-rank projection."""
+        hidden_size = 64
+        vocab_size = 100
+        num_layers = 2
+        head = IndependentMedusaHead(hidden_size, vocab_size, num_layers,
+                                      bottleneck=8)
+
+        assert len(head.blocks) == num_layers
+        x = torch.randn(2, 10, hidden_size)
+        out = head(x)
+        assert out.shape == (2, 10, vocab_size)
+
+
+class TestGPTWithIndependentMedusa:
+    """Tests for GPT model with Independent low-rank Medusa heads."""
+
+    @pytest.fixture
+    def small_config_independent_medusa(self):
+        """Create a small GPT config with Independent Medusa heads for testing."""
+        return GPTConfig(
+            sequence_len=64,
+            vocab_size=256,
+            n_layer=2,
+            n_head=4,
+            n_kv_head=4,
+            n_embd=64,
+            medusa_num_heads=2,
+            medusa_num_layers=1,
+            medusa_independent=True,  # Independent heads enabled
+            medusa_bottleneck=8,
+        )
+
+    def test_gpt_creates_independent_heads(self, small_config_independent_medusa):
+        """GPT should create IndependentMedusaHead when medusa_independent=True."""
+        with torch.device("cpu"):
+            model = GPT(small_config_independent_medusa)
+        model.init_weights()
+
+        assert model.medusa_heads is not None
+        for head in model.medusa_heads:
+            assert isinstance(head, IndependentMedusaHead)
+            # Should NOT have W_hidden (SiLU comes from ResBlocks)
+            assert not hasattr(head, 'W_hidden')
+            assert hasattr(head, 'W_a')
+            assert hasattr(head, 'W_b')
+
+    def test_forward_inference_independent(self, small_config_independent_medusa):
+        """Forward with independent heads should work for inference."""
+        with torch.device("cpu"):
+            model = GPT(small_config_independent_medusa)
+        model.init_weights()
+        model.eval()
+
+        idx = torch.randint(0, 256, (2, 32))
+        logits, medusa_logits = model(idx, return_medusa=True)
+
+        assert logits.shape == (2, 32, 256)
+        assert medusa_logits.shape == (2, 2, 32, 256)  # (num_heads, B, T, vocab)
+
+    def test_forward_training_independent(self, small_config_independent_medusa):
+        """Forward with independent heads should work for training."""
+        with torch.device("cpu"):
+            model = GPT(small_config_independent_medusa)
+        model.init_weights()
+
+        idx = torch.randint(0, 256, (2, 32))
+        targets = torch.randint(0, 256, (2, 32))
+
+        loss, medusa_losses = model(idx, targets, return_medusa=True)
+
+        assert isinstance(loss, torch.Tensor)
+        assert loss.shape == ()
+        assert len(medusa_losses) == 2  # 2 Medusa heads
+
+    def test_backward_independent(self, small_config_independent_medusa):
+        """Gradients should flow through independent head params."""
+        with torch.device("cpu"):
+            model = GPT(small_config_independent_medusa)
+        model.init_weights()
+
+        idx = torch.randint(0, 256, (2, 32))
+        targets = torch.randint(0, 256, (2, 32))
+
+        loss, medusa_losses = model(idx, targets, return_medusa=True)
+        total_loss = loss + sum(medusa_losses)
+        total_loss.backward()
+
+        # Check gradients on independent head params (W_a and W_b only)
+        for head in model.medusa_heads:
+            assert head.W_a.weight.grad is not None
+            assert head.W_b.weight.grad is not None
+
+    def test_optimizer_includes_independent_params(self, small_config_independent_medusa):
+        """setup_optimizers should handle independent head params: W_a->Muon, W_b->AdamW."""
+        with torch.device("cpu"):
+            model = GPT(small_config_independent_medusa)
+        model.init_weights()
+
+        optimizers = model.setup_optimizers()
+        assert len(optimizers) == 2
+
+        adamw, muon = optimizers
+
+        # Collect all params from each optimizer
+        all_adamw_params = []
+        for group in adamw.param_groups:
+            all_adamw_params.extend(group['params'])
+
+        all_muon_params = []
+        for group in muon.param_groups:
+            all_muon_params.extend(group['params'])
+
+        # Check that W_a is in Muon; W_b is in AdamW
+        for head in model.medusa_heads:
+            w_a = head.W_a.weight
+            w_b = head.W_b.weight
+
+            assert any(p is w_a for p in all_muon_params), "W_a should be in Muon"
+            assert not any(p is w_a for p in all_adamw_params), "W_a should NOT be in AdamW"
+
+            assert any(p is w_b for p in all_adamw_params), "W_b should be in AdamW"
+            assert not any(p is w_b for p in all_muon_params), "W_b should NOT be in Muon"

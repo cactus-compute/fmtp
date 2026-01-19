@@ -46,6 +46,8 @@ class GPTConfig:
     medusa_num_layers: int = 1     # ResBlock layers per Medusa head
     medusa_lora_rank: int = 0      # 0 = full projection, >0 = LoRA rank (shares lm_head)
     medusa_lora_alpha: int = None  # LoRA alpha scaling (default: same as rank, so scaling=1)
+    medusa_independent: bool = False  # Use independent low-rank heads (faster than LoRA)
+    medusa_bottleneck: int = 32       # Bottleneck dimension for independent heads (hidden -> bottleneck -> vocab)
 
 
 def norm(x):
@@ -100,6 +102,33 @@ class MedusaLoRAHead(nn.Module):
     def get_merged_weight(self, lm_head_weight):
         """Merge LoRA weights for fused CE: W_merged = W_base + scaling * B @ A"""
         return lm_head_weight + self.scaling * (self.lora_B.weight @ self.lora_A.weight)
+
+
+class IndependentMedusaHead(nn.Module):
+    """
+    Independent low-rank Medusa head - no weight merge, no Liger needed.
+
+    Architecture: ResBlocks -> W_a -> W_b -> vocab
+    - ResBlocks contain the SiLU nonlinearity (same as other head types)
+    - W_a: down-projection (hidden -> bottleneck)
+    - W_b: up-projection (bottleneck -> vocab)
+
+    This is an independent predictor (not a delta over lm_head) which avoids the
+    slow weight merge that plagued LoRA-based heads.
+    """
+    def __init__(self, hidden_size, vocab_size, num_layers, bottleneck=32):
+        super().__init__()
+        self.blocks = nn.ModuleList([MedusaResBlock(hidden_size) for _ in range(num_layers)])
+        self.bottleneck = bottleneck
+
+        # Low-rank projection: hidden -> bottleneck -> vocab
+        self.W_a = nn.Linear(hidden_size, bottleneck, bias=False)
+        self.W_b = nn.Linear(bottleneck, vocab_size, bias=False)
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return self.W_b(self.W_a(x))
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -229,7 +258,14 @@ class GPT(nn.Module):
         # Medusa heads for multi-token prediction (speculative decoding)
         self.medusa_heads = None
         if config.medusa_num_heads > 0:
-            if config.medusa_lora_rank > 0:
+            if config.medusa_independent:
+                # Independent low-rank heads (fastest - no weight merge, no Liger needed)
+                self.medusa_heads = nn.ModuleList([
+                    IndependentMedusaHead(config.n_embd, padded_vocab_size, config.medusa_num_layers,
+                                          bottleneck=config.medusa_bottleneck)
+                    for _ in range(config.medusa_num_heads)
+                ])
+            elif config.medusa_lora_rank > 0:
                 # LoRA-based Medusa heads (share lm_head, much smaller)
                 self.medusa_heads = nn.ModuleList([
                     MedusaLoRAHead(config.n_embd, padded_vocab_size, config.medusa_num_layers,
@@ -292,7 +328,11 @@ class GPT(nn.Module):
             for head in self.medusa_heads:
                 for block in head.blocks:
                     torch.nn.init.zeros_(block.linear.weight)
-                if hasattr(head, 'lora_A'):
+                if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
+                    # Independent head: Kaiming for W_a, zeros for W_b (start near zero output)
+                    torch.nn.init.kaiming_uniform_(head.W_a.weight, a=math.sqrt(5))
+                    torch.nn.init.zeros_(head.W_b.weight)
+                elif hasattr(head, 'lora_A'):
                     # LoRA: A=Kaiming uniform, B=zeros (adapter starts as identity)
                     torch.nn.init.kaiming_uniform_(head.lora_A.weight, a=math.sqrt(5))
                     torch.nn.init.zeros_(head.lora_B.weight)
@@ -395,14 +435,18 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        # Medusa heads: split into matrix params (ResBlock linears + LoRA A -> Muon) and proj params (LoRA B or full proj -> AdamW)
+        # Medusa heads: split into matrix params (ResBlock linears + hidden layers -> Muon) and proj params (vocab projection -> AdamW)
         medusa_matrix_params = []
         medusa_proj_params = []
         if self.medusa_heads is not None:
             for head in self.medusa_heads:
                 for block in head.blocks:
                     medusa_matrix_params.append(block.linear.weight)
-                if hasattr(head, 'lora_A'):
+                if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
+                    # Independent head: W_a -> Muon; W_b -> AdamW (similar to lm_head)
+                    medusa_matrix_params.append(head.W_a.weight)
+                    medusa_proj_params.append(head.W_b.weight)
+                elif hasattr(head, 'lora_A'):
                     # LoRA: A -> Muon (it's a matrix), B -> AdamW (similar to lm_head)
                     medusa_matrix_params.append(head.lora_A.weight)
                     medusa_proj_params.append(head.lora_B.weight)
@@ -479,13 +523,30 @@ class GPT(nn.Module):
                     h = x_shifted
                     for block in head.blocks:
                         h = block(h)
-                    # Compute loss (LoRA: merge weights on-the-fly, full: use directly)
-                    if hasattr(head, 'lora_A'):
+                    # Compute loss (independent: standard CE, LoRA: merge weights, full: use directly)
+                    if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
+                        # Independent head: use gradient checkpointing to avoid storing logits tensor
+                        # This recomputes the forward during backward, saving ~2GB per head
+                        def _independent_head_loss(h, W_a, W_b, targets, vocab_size, softcap, reduction):
+                            head_logits = W_b(W_a(h))
+                            head_logits = head_logits[..., :vocab_size]
+                            if softcap is not None:
+                                head_logits = softcap * torch.tanh(head_logits / softcap)
+                            return F.cross_entropy(head_logits.view(-1, head_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=reduction)
+                        head_loss = torch.utils.checkpoint.checkpoint(
+                            _independent_head_loss, h, head.W_a, head.W_b,
+                            targets_shifted, self.config.vocab_size, softcap, loss_reduction,
+                            use_reentrant=False
+                        )
+                    elif hasattr(head, 'lora_A'):
                         # LoRA: W_merged = W_base + scaling * B @ A
+                        # Use full (padded) lm_head weight since LoRA weights use padded vocab size
                         head_weight = torch.addmm(
-                            lm_weight, head.lora_B.weight, head.lora_A.weight,
+                            self.lm_head.weight, head.lora_B.weight, head.lora_A.weight,
                             beta=1.0, alpha=head.scaling
                         )
+                        # Slice to actual vocab size for loss computation
+                        head_weight = head_weight[:self.config.vocab_size]
                         head_loss = fused_linear_cross_entropy(h, head_weight, targets_shifted, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
                     else:
                         head_weight = head.proj.weight[:self.config.vocab_size]
@@ -509,10 +570,13 @@ class GPT(nn.Module):
                     h = x
                     for block in head.blocks:
                         h = block(h)
-                    # Compute logits (LoRA-aware)
-                    if hasattr(head, 'lora_A'):
-                        # LoRA: base + scaled delta
-                        base_logits = F.linear(h, lm_weight)
+                    # Compute logits (type-aware)
+                    if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
+                        # Independent head: direct forward (ResBlocks already applied above)
+                        head_logits = head.W_b(head.W_a(h))
+                    elif hasattr(head, 'lora_A'):
+                        # LoRA: base + scaled delta (use full padded weight for consistency)
+                        base_logits = F.linear(h, self.lm_head.weight)
                         lora_delta = head.scaling * head.lora_B(head.lora_A(h))
                         head_logits = base_logits + lora_delta
                     else:
