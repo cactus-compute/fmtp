@@ -150,7 +150,7 @@ def main():
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path to evaluate')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
     parser.add_argument('--model-tag', type=str, default=None, help='optional model tag for the output directory name')
-    parser.add_argument('--step', type=str, default=None, help='optional model step for the output directory name')
+    parser.add_argument('--step', type=int, default=None, help='optional model step for the output directory name')
     args = parser.parse_args()
 
     # distributed / precision setup
