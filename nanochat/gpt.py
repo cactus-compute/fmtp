@@ -479,14 +479,17 @@ class GPT(nn.Module):
                     h = x_shifted
                     for block in head.blocks:
                         h = block(h)
-                    # Get the projection weight (LoRA-aware)
+                    # Compute loss (LoRA: merge weights on-the-fly, full: use directly)
                     if hasattr(head, 'lora_A'):
-                        # LoRA: merge weights, then use fused CE
-                        head_weight = head.get_merged_weight(lm_weight)
+                        # LoRA: W_merged = W_base + scaling * B @ A
+                        head_weight = torch.addmm(
+                            lm_weight, head.lora_B.weight, head.lora_A.weight,
+                            beta=1.0, alpha=head.scaling
+                        )
+                        head_loss = fused_linear_cross_entropy(h, head_weight, targets_shifted, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
                     else:
-                        # Full projection (non-padded)
                         head_weight = head.proj.weight[:self.config.vocab_size]
-                    head_loss = fused_linear_cross_entropy(h, head_weight, targets_shifted, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
+                        head_loss = fused_linear_cross_entropy(h, head_weight, targets_shifted, ignore_index=-1, softcap=softcap, reduction=loss_reduction)
                     medusa_losses.append(head_loss)
                 return loss, medusa_losses
             return loss
