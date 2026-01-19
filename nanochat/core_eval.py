@@ -166,7 +166,7 @@ def forward_model(model, input_ids):
 
 
 @torch.no_grad()
-def forward_model_medusa(model, input_ids):
+def forward_model_medusa(model, input_ids, num_heads_to_use=None):
     """
     Medusa-based forward pass for evaluation.
 
@@ -177,10 +177,18 @@ def forward_model_medusa(model, input_ids):
     We forward only every (N+1)th token and use Medusa heads to predict the rest.
     This tests whether the Medusa heads are actually working correctly.
 
+    Args:
+        model: The model with Medusa heads
+        input_ids: Input token IDs (B, T)
+        num_heads_to_use: Number of Medusa heads to use (default: all). If less than
+                          total heads, only uses heads 0 through num_heads_to_use-1.
+
     Returns losses and predictions tensors of the same shape as forward_model.
     """
     batch_size, seq_len = input_ids.size()
-    num_medusa_heads = model.config.medusa_num_heads
+    total_medusa_heads = model.config.medusa_num_heads
+    num_medusa_heads = num_heads_to_use if num_heads_to_use is not None else total_medusa_heads
+    num_medusa_heads = min(num_medusa_heads, total_medusa_heads)  # Can't use more than available
     stride = num_medusa_heads + 1  # How many tokens we can predict from one position
 
     # We'll build up predictions and losses for all positions
@@ -236,7 +244,7 @@ def forward_model_medusa(model, input_ids):
 
 
 @torch.no_grad()
-def evaluate_example(idx, model, tokenizer, data, device, task_meta, use_medusa=False):
+def evaluate_example(idx, model, tokenizer, data, device, task_meta, use_medusa=False, num_medusa_heads=None):
     """Evaluate a single example, return True if correct, False otherwise"""
     item = data[idx]
     task_type = task_meta['task_type']
@@ -290,7 +298,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta, use_medusa=
 
     # Forward the model, get the autoregressive loss and argmax prediction at each token
     if use_medusa and hasattr(model, 'config') and getattr(model.config, 'medusa_num_heads', 0) > 0:
-        losses, predictions = forward_model_medusa(model, input_ids)
+        losses, predictions = forward_model_medusa(model, input_ids, num_heads_to_use=num_medusa_heads)
     else:
         losses, predictions = forward_model(model, input_ids)
 
@@ -315,7 +323,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta, use_medusa=
     return is_correct
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta, use_medusa=False):
+def evaluate_task(model, tokenizer, data, device, task_meta, use_medusa=False, num_medusa_heads=None):
     """
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
@@ -325,7 +333,7 @@ def evaluate_task(model, tokenizer, data, device, task_meta, use_medusa=False):
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta, use_medusa=use_medusa)
+        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta, use_medusa=use_medusa, num_medusa_heads=num_medusa_heads)
         correct[idx] = float(is_correct)
     # sync results across all the processes if running distributed
     if world_size > 1:

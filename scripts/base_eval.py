@@ -45,11 +45,12 @@ def place_eval_bundle(file_path):
         shutil.move(extracted_bundle_dir, eval_bundle_dir)
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
-def evaluate_model(model, tokenizer, device, max_per_task=-1, use_medusa=False):
+def evaluate_model(model, tokenizer, device, max_per_task=-1, use_medusa=False, num_medusa_heads=None):
     """
     Evaluate a base model on the CORE benchmark.
     - max_per_task: crop the data to this many examples per task for testing (-1 = disable)
     - use_medusa: if True, use Medusa heads for evaluation (tests MTP head accuracy)
+    - num_medusa_heads: number of Medusa heads to use (default: all available)
     """
     # Load config and task metadata
     base_dir = get_base_dir()
@@ -100,7 +101,7 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1, use_medusa=False):
             data = data[:max_per_task]
 
         # run the evaluation for this task
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta, use_medusa=use_medusa)
+        accuracy = evaluate_task(model, tokenizer, data, device, task_meta, use_medusa=use_medusa, num_medusa_heads=num_medusa_heads)
 
         results[label] = accuracy
         random_baseline = random_baselines[label]
@@ -153,6 +154,7 @@ def main():
     parser.add_argument('--model-tag', type=str, default=None, help='optional model tag for the output directory name')
     parser.add_argument('--step', type=int, default=None, help='optional model step for the output directory name')
     parser.add_argument('--use-medusa', action='store_true', help='Use Medusa heads for evaluation (tests MTP head accuracy)')
+    parser.add_argument('--medusa-heads', type=int, default=None, help='Number of Medusa heads to use (default: all available)')
     args = parser.parse_args()
 
     # distributed / precision setup
@@ -176,17 +178,23 @@ def main():
 
     # Check if Medusa mode requested and model supports it
     use_medusa = args.use_medusa
+    medusa_heads_to_use = args.medusa_heads
     if use_medusa:
-        num_medusa_heads = getattr(model.config, 'medusa_num_heads', 0) if hasattr(model, 'config') else 0
-        if num_medusa_heads > 0:
-            print0(f"Using Medusa evaluation mode with {num_medusa_heads} heads (stride={num_medusa_heads + 1})")
+        total_medusa_heads = getattr(model.config, 'medusa_num_heads', 0) if hasattr(model, 'config') else 0
+        if total_medusa_heads > 0:
+            # Determine how many heads to actually use
+            if medusa_heads_to_use is not None:
+                medusa_heads_to_use = min(medusa_heads_to_use, total_medusa_heads)
+            else:
+                medusa_heads_to_use = total_medusa_heads
+            print0(f"Using Medusa evaluation mode with {medusa_heads_to_use} heads (stride={medusa_heads_to_use + 1})")
         else:
             print0("Warning: --use-medusa specified but model has no Medusa heads, falling back to standard evaluation")
             use_medusa = False
 
     # Evaluate the model
     with autocast_ctx:
-        out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task, use_medusa=use_medusa)
+        out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task, use_medusa=use_medusa, num_medusa_heads=medusa_heads_to_use)
 
     # Write out the results to a csv file
     core_metric = None
