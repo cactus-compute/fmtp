@@ -105,15 +105,16 @@ class MedusaLoRAHead(nn.Module):
 
 class IndependentMedusaHead(nn.Module):
     """
-    Independent low-rank Medusa head - no weight merge, no Liger needed.
+    Low-rank Medusa head that adds a delta to lm_head output.
 
-    Architecture: ResBlocks -> W_a -> W_b -> vocab
-    - ResBlocks contain the SiLU nonlinearity (same as other head types)
+    Architecture: output = lm_head(h) + W_b(W_a(ResBlocks(h)))
+    - ResBlocks contain the SiLU nonlinearity
     - W_a: down-projection (hidden -> rank)
     - W_b: up-projection (rank -> vocab)
 
-    This is an independent predictor (not a delta over lm_head) which avoids the
-    slow weight merge that plagued LoRA-based heads.
+    Unlike LoRA heads, this avoids the expensive weight merge (addmm) by using
+    chunked cross-entropy during training that computes the sum without
+    materializing full (B*T, vocab) logits.
     """
     def __init__(self, hidden_size, vocab_size, num_layers, rank=32):
         super().__init__()
@@ -215,6 +216,45 @@ class Block(nn.Module):
         x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
+
+
+@torch.compiler.disable
+def _chunked_independent_head_loss(h, lm_head_weight, W_a, W_b, targets, vocab_size, softcap, chunk_size=2048):
+    """Compute cross-entropy loss in chunks to avoid huge logits allocation.
+
+    Computes: loss(h @ lm_head.T + z @ W_b.T, targets) where z = h @ W_a.T
+
+    By chunking, each chunk's logits are ~256MB instead of 8GB for full batch.
+    The low-rank projection z = h @ W_a.T is computed once upfront (tiny: B*T x rank).
+    Disabled from torch.compile to prevent inductor from fusing and OOMing.
+    """
+    h_flat = h.view(-1, h.size(-1))  # (B*T, hidden)
+    targets_flat = targets.view(-1)  # (B*T,)
+    num_tokens = h_flat.size(0)
+
+    # Compute low-rank projection once: (B*T, hidden) @ (hidden, rank) -> (B*T, rank)
+    z = F.linear(h_flat, W_a.weight)  # tiny: e.g. (65536, 32) = ~4MB
+
+    total_loss = 0.0
+    total_count = 0
+    for i in range(0, num_tokens, chunk_size):
+        h_chunk = h_flat[i:i+chunk_size]
+        z_chunk = z[i:i+chunk_size]
+        t_chunk = targets_flat[i:i+chunk_size]
+        # Compute chunk logits: lm_head contribution + low-rank delta
+        # (chunk, hidden) @ (vocab, hidden).T + (chunk, rank) @ (vocab, rank).T
+        chunk_logits = F.linear(h_chunk, lm_head_weight) + F.linear(z_chunk, W_b.weight)
+        chunk_logits = chunk_logits[..., :vocab_size]
+        if softcap is not None:
+            chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
+        # Count valid tokens (not ignore_index)
+        valid_mask = (t_chunk != -1)
+        chunk_count = valid_mask.sum()
+        if chunk_count > 0:
+            chunk_loss = F.cross_entropy(chunk_logits, t_chunk, ignore_index=-1, reduction='sum')
+            total_loss = total_loss + chunk_loss
+            total_count = total_count + chunk_count
+    return total_loss / total_count if total_count > 0 else torch.tensor(0.0, device=h.device)
 
 
 class GPT(nn.Module):
@@ -525,18 +565,11 @@ class GPT(nn.Module):
                         h = block(h)
                     # Compute loss (independent: standard CE, LoRA: merge weights, full: use directly)
                     if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
-                        # Independent head: use gradient checkpointing to avoid storing logits tensor
-                        # This recomputes the forward during backward, saving ~2GB per head
-                        def _independent_head_loss(h, W_a, W_b, targets, vocab_size, softcap, reduction):
-                            head_logits = W_b(W_a(h))
-                            head_logits = head_logits[..., :vocab_size]
-                            if softcap is not None:
-                                head_logits = softcap * torch.tanh(head_logits / softcap)
-                            return F.cross_entropy(head_logits.view(-1, head_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=reduction)
-                        head_loss = torch.utils.checkpoint.checkpoint(
-                            _independent_head_loss, h, head.W_a, head.W_b,
-                            targets_shifted, self.config.vocab_size, softcap, loss_reduction,
-                            use_reentrant=False
+                        # Independent head: use chunked cross-entropy to avoid huge logits allocation
+                        # Computes: lm_head(h) + W_b(W_a(h)) without materializing full logits
+                        head_loss = _chunked_independent_head_loss(
+                            h, lm_weight, head.W_a, head.W_b, targets_shifted,
+                            self.config.vocab_size, softcap
                         )
                     elif hasattr(head, 'lora_A'):
                         # LoRA: W_merged = W_base + scaling * B @ A
@@ -572,8 +605,8 @@ class GPT(nn.Module):
                         h = block(h)
                     # Compute logits (type-aware)
                     if hasattr(head, 'W_a') and not hasattr(head, 'lora_A'):
-                        # Independent head: direct forward (ResBlocks already applied above)
-                        head_logits = head.W_b(head.W_a(h))
+                        # Independent head: lm_head + low-rank delta
+                        head_logits = F.linear(h, self.lm_head.weight) + head.W_b(head.W_a(h))
                     elif hasattr(head, 'lora_A'):
                         # LoRA: base + scaled delta (use full padded weight for consistency)
                         base_logits = F.linear(h, self.lm_head.weight)
