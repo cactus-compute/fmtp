@@ -361,14 +361,9 @@ if __name__ == "__main__":
         adam_betas=tuple(args.adam_betas),
     )
 
-    # Set initial LR scaling
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * args.init_lr_frac
-
-    # LR schedule: linear decay from init_lr_frac to 0
+    # LR schedule: linear decay from init_lr_frac * base_lr to 0
     def get_lr_multiplier(it):
-        return 1.0 - it / num_iterations
+        return args.init_lr_frac * (1.0 - it / num_iterations)
 
     # -----------------------------------------------------------------------------
     # Setup data loaders
