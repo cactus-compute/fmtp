@@ -6,11 +6,10 @@ Runs a sequential sweep of hyperparameters, using results from earlier
 runs to inform later sweeps (greedy selection).
 
 Usage:
-    python -m scripts.run_ablations --data-path data/openhermes_75k.json
+    python -m scripts.run_ablations --data-path data/openhermes_filtered.json
 
     # Or with torchrun for multi-GPU
-    torchrun --standalone --nproc_per_node=8 -m scripts.run_ablations \
-        --data-path data/openhermes_75k.json
+    python -m scripts.run_ablations --data-path data/openhermes_filtered.json --nproc 8
 """
 
 import argparse
@@ -18,7 +17,7 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -28,8 +27,8 @@ class AblationConfig:
     """Single ablation run configuration."""
     name: str
     zero_init_mlp: bool = False
-    proj_lr: float = 0.004
-    lora_rank: int = 64
+    proj_lr: float = 0.002  # baseline from user's command
+    lora_rank: int = 32     # baseline from user's command
     lora_alpha: int | None = None  # None = same as rank
     medusa_num_layers: int = 1
 
@@ -53,7 +52,7 @@ def generate_ablation_configs() -> list[AblationConfig]:
 
     Sweep order (greedy selection):
     1. Zero-init MLP: False vs True (pick best)
-    2. LR sweep: 0.001, 0.004, 0.01 (pick best)
+    2. LR sweep: 0.001, 0.002, 0.004 (pick best)
     3. Rank sweep: 32, 64, 128 (pick best)
     4. Alpha sweep: rank vs 2*rank (pick best)
     5. Layers sweep: 0, 1, 2 (pick best)
@@ -65,11 +64,13 @@ def generate_ablation_configs() -> list[AblationConfig]:
     configs.append(AblationConfig(name="zero_init", zero_init_mlp=True))
 
     # Phase 2: LR sweep (will use best zero_init from phase 1)
-    for lr in [0.001, 0.01]:  # 0.004 is baseline
+    # baseline is 0.002, test 0.001 and 0.004
+    for lr in [0.001, 0.004]:
         configs.append(AblationConfig(name=f"lr_{lr}", proj_lr=lr))
 
     # Phase 3: Rank sweep (will use best zero_init + lr)
-    for rank in [32, 128]:  # 64 is baseline
+    # baseline is 32, test 64 and 128
+    for rank in [64, 128]:
         configs.append(AblationConfig(name=f"rank_{rank}", lora_rank=rank))
 
     # Phase 4: Alpha sweep (will use best config so far)
@@ -144,23 +145,51 @@ def main():
                         help="Path to validation data")
 
     # Training config (shared across all ablations)
-    parser.add_argument("--num-iterations", type=int, default=500,
-                        help="Number of training iterations per ablation")
-    parser.add_argument("--device-batch-size", type=int, default=4,
+    parser.add_argument("--num-iterations", type=int, default=-1,
+                        help="Number of training iterations per ablation (-1 = use num-epochs)")
+    parser.add_argument("--num-epochs", type=int, default=1,
+                        help="Number of epochs per ablation (used if num-iterations=-1)")
+    parser.add_argument("--device-batch-size", type=int, default=5,
                         help="Per-device batch size")
-    parser.add_argument("--total-batch-size", type=int, default=32,
+    parser.add_argument("--total-batch-size", type=int, default=120,
                         help="Total batch size")
-    parser.add_argument("--max-seq-len", type=int, default=2048,
+    parser.add_argument("--max-seq-len", type=int, default=1024,
                         help="Maximum sequence length")
-    parser.add_argument("--eval-every", type=int, default=100,
+    parser.add_argument("--eval-every", type=int, default=1000,
                         help="Evaluate every N steps")
+    parser.add_argument("--save-every", type=int, default=-1,
+                        help="Save checkpoint every N steps (-1 = only at end)")
 
     # Model
-    parser.add_argument("--base-model", type=str, default="google/gemma-3-1b-it",
+    parser.add_argument("--base-model", type=str, default="google/gemma-3-270m-it",
                         help="Base model name")
+    parser.add_argument("--medusa-num-heads", type=int, default=4,
+                        help="Number of Medusa heads")
+
+    # Optimizer defaults (can be overridden per-ablation)
+    parser.add_argument("--matrix-lr", type=float, default=0.01,
+                        help="Learning rate for matrix params (Muon)")
+    parser.add_argument("--weight-decay", type=float, default=0.2,
+                        help="Weight decay for Muon optimizer")
+    parser.add_argument("--adam-weight-decay", type=float, default=0.0,
+                        help="Weight decay for AdamW optimizer")
+
+    # Schedule
+    parser.add_argument("--warmup-ratio", type=float, default=0.0,
+                        help="Warmup ratio")
+    parser.add_argument("--warmdown-ratio", type=float, default=1.0,
+                        help="Warmdown ratio")
+    parser.add_argument("--final-lr-frac", type=float, default=0.0,
+                        help="Final LR fraction")
+
+    # Memory optimization
+    parser.add_argument("--use-chunked-loss", action="store_true", default=True,
+                        help="Use chunked loss computation")
+    parser.add_argument("--chunk-size", type=int, default=128,
+                        help="Chunk size for chunked loss")
 
     # Multi-GPU
-    parser.add_argument("--nproc", type=int, default=1,
+    parser.add_argument("--nproc", type=int, default=8,
                         help="Number of GPUs (if > 1, uses torchrun)")
 
     # Output
@@ -185,14 +214,33 @@ def main():
     # Base arguments shared by all runs
     base_args = [
         f"--data-path={args.data_path}",
-        f"--num-iterations={args.num_iterations}",
         f"--device-batch-size={args.device_batch_size}",
         f"--total-batch-size={args.total_batch_size}",
         f"--max-seq-len={args.max_seq_len}",
         f"--eval-every={args.eval_every}",
+        f"--save-every={args.save_every}",
         f"--base-model={args.base_model}",
-        "--save-every=-1",  # Only save at end
+        f"--medusa-num-heads={args.medusa_num_heads}",
+        f"--matrix-lr={args.matrix_lr}",
+        f"--weight-decay={args.weight_decay}",
+        f"--adam-weight-decay={args.adam_weight_decay}",
+        f"--warmup-ratio={args.warmup_ratio}",
+        f"--warmdown-ratio={args.warmdown_ratio}",
+        f"--final-lr-frac={args.final_lr_frac}",
+        "--skip-filter",  # Assume data is pre-filtered
     ]
+
+    # Training horizon
+    if args.num_iterations > 0:
+        base_args.append(f"--num-iterations={args.num_iterations}")
+    else:
+        base_args.append(f"--num-epochs={args.num_epochs}")
+
+    # Memory optimization
+    if args.use_chunked_loss:
+        base_args.append("--use-chunked-loss")
+        base_args.append(f"--chunk-size={args.chunk_size}")
+
     if args.val_data_path:
         base_args.append(f"--val-data-path={args.val_data_path}")
 
@@ -213,6 +261,9 @@ def main():
     print(f"\n{'#'*60}")
     print(f"# Gemma Medusa Ablation Study")
     print(f"# Output: {args.output_dir}")
+    print(f"# Base model: {args.base_model}")
+    print(f"# Data: {args.data_path}")
+    print(f"# GPUs: {args.nproc}")
     print(f"# Ablations to run: {len(configs)}")
     print(f"{'#'*60}\n")
 
@@ -233,7 +284,7 @@ def main():
                 pass
 
         # Phase 3+: use best lr
-        if i >= 4 and config.proj_lr == 0.004:  # Only override if using default
+        if i >= 4 and config.proj_lr == 0.002:  # Only override if using default
             lr_results = [r for r in results if r["name"].startswith("lr_") or r["name"] == "baseline"]
             # Would need actual loss values to pick best
 
