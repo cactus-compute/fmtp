@@ -577,15 +577,31 @@ if __name__ == "__main__":
         debiased_head_losses = [shl / debias for shl in smooth_head_losses]
 
         pct_done = 100 * step / num_iterations
-        current_lr = optimizers[0].param_groups[0]['lr']  # AdamW lr for logging
-        print0(f"Step {step:05d}/{num_iterations:05d} ({pct_done:.1f}%) | loss: {debiased_loss:.6f} | main: {debiased_main_loss:.6f} | lr: {current_lr:.2e} | dt: {dt*1000:.0f}ms | epoch: {current_epoch}")
+        adamw_lr = optimizers[0].param_groups[0]['lr']  # AdamW lr (LoRA params)
+        muon_lr = optimizers[1].param_groups[0]['lr']   # Muon lr (ResBlock linears)
+
+        # Calculate ETA
+        steps_done = step - start_step + 1
+        steps_remaining = num_iterations - step - 1
+        if steps_done > 10 and total_training_time > 0:
+            avg_dt = total_training_time / (steps_done - 10)
+            eta_seconds = avg_dt * steps_remaining
+            eta_h, eta_rem = divmod(int(eta_seconds), 3600)
+            eta_m, eta_s = divmod(eta_rem, 60)
+            eta_str = f"{eta_h}h{eta_m:02d}m" if eta_h > 0 else f"{eta_m}m{eta_s:02d}s"
+        else:
+            eta_str = "..."
+
+        print0(f"Step {step:05d}/{num_iterations:05d} ({pct_done:.1f}%) ETA: {eta_str} | loss: {debiased_loss:.6f} | main: {debiased_main_loss:.6f}")
+        print0(f"  AdamW(LoRA): {adamw_lr:.2e} | Muon(ResBlock): {muon_lr:.2e} | dt: {dt*1000:.0f}ms | epoch: {current_epoch}")
 
         if step % 10 == 0:
             log_data = {
                 "step": step,
                 "train/loss": debiased_loss,
                 "train/main_loss": debiased_main_loss,
-                "train/lr": current_lr,
+                "train/adamw_lr": adamw_lr,
+                "train/muon_lr": muon_lr,
                 "train/epoch": current_epoch,
                 "train/dt_ms": dt * 1000,
             }
