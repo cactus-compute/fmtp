@@ -196,7 +196,7 @@ class GemmaModelWrapper(nn.Module):
             try:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                     device_map=device,
                     trust_remote_code=True,
                 )
@@ -204,13 +204,13 @@ class GemmaModelWrapper(nn.Module):
                 # Fallback if accelerate is not available
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                     trust_remote_code=True,
                 ).to(device)
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=dtype,
+                dtype=dtype,
                 trust_remote_code=True,
             ).to(device)
         self.model.eval()
@@ -426,20 +426,20 @@ class GemmaMedusaModel(nn.Module):
             try:
                 self.base_model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                     device_map=device,
                     trust_remote_code=True,
                 )
             except ValueError:
                 self.base_model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                     trust_remote_code=True,
                 ).to(device)
         else:
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=dtype,
+                dtype=dtype,
                 trust_remote_code=True,
             ).to(device)
 
