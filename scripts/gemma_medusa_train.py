@@ -260,6 +260,8 @@ if __name__ == "__main__":
                         help="Path to training data (JSON/JSONL in ShareGPT format)")
     parser.add_argument("--val-data-path", type=str, default=None,
                         help="Path to validation data (optional)")
+    parser.add_argument("--skip-filter", action="store_true",
+                        help="Skip dataset filtering (use if data is pre-filtered)")
 
     # Evaluation
     parser.add_argument("--eval-every", type=int, default=250,
@@ -331,17 +333,22 @@ if __name__ == "__main__":
 
     # Filter out conversations with 0 valid tokens (would cause NaN in cross-entropy)
     # This happens when user message is so long it gets truncated before assistant response
-    print0("Filtering conversations with 0 valid assistant tokens...")
-    train_data, skipped = filter_dataset(train_data, tokenizer, args.max_seq_len, min_valid_tokens=1)
-    print0(f"Filtered to {len(train_data)} conversations (skipped {skipped})")
+    # Skip if data is pre-filtered (e.g., from scripts/download_openhermes.py)
+    if not args.skip_filter:
+        print0("Filtering conversations with 0 valid assistant tokens...")
+        train_data, skipped = filter_dataset(train_data, tokenizer, args.max_seq_len, min_valid_tokens=1)
+        print0(f"Filtered to {len(train_data)} conversations (skipped {skipped})")
+    else:
+        print0("Skipping dataset filtering (--skip-filter)")
 
     val_data = None
     if args.val_data_path:
         print0(f"Loading validation data from: {args.val_data_path}")
         val_data = load_sharegpt_data(args.val_data_path)
         print0(f"Loaded {len(val_data)} validation conversations")
-        val_data, val_skipped = filter_dataset(val_data, tokenizer, args.max_seq_len, min_valid_tokens=1)
-        print0(f"Filtered to {len(val_data)} validation conversations (skipped {val_skipped})")
+        if not args.skip_filter:
+            val_data, val_skipped = filter_dataset(val_data, tokenizer, args.max_seq_len, min_valid_tokens=1)
+            print0(f"Filtered to {len(val_data)} validation conversations (skipped {val_skipped})")
 
     # -----------------------------------------------------------------------------
     # Calculate training schedule
