@@ -533,7 +533,15 @@ class GemmaMedusaModel(nn.Module):
             output_hidden_states=False,
             return_dict=True,
         )
-        return outputs.last_hidden_state
+        hidden_states = outputs.last_hidden_state
+
+        # NaN detection for debugging
+        if self.training and torch.isnan(hidden_states).any():
+            print(f"[NaN DEBUG] NaN in hidden_states from base model!", flush=True)
+            print(f"[NaN DEBUG]   hidden_states shape: {hidden_states.shape}", flush=True)
+            print(f"[NaN DEBUG]   hidden_states has {torch.isnan(hidden_states).sum().item()} NaN values", flush=True)
+
+        return hidden_states
 
     def _get_hidden_states_with_cache(
         self,
@@ -600,10 +608,13 @@ class GemmaMedusaModel(nn.Module):
 
         # Step 1: Compute ResBlocks for each head (sequential to preserve gradients during training)
         resblock_outputs = []
-        for head in self.medusa_heads:
+        for head_idx, head in enumerate(self.medusa_heads):
             x = hidden_states
             for block in head.blocks:
                 x = block(x)
+            # NaN detection after ResBlocks
+            if self.training and torch.isnan(x).any():
+                print(f"[NaN DEBUG] NaN after ResBlock for head {head_idx}!", flush=True)
             resblock_outputs.append(x)  # (B, T, hidden_size)
 
         # Step 2: Stack ResBlock outputs and do batched lora_A projection
@@ -624,9 +635,25 @@ class GemmaMedusaModel(nn.Module):
         # lora_A projection: (num_heads, rank, hidden)
         lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
 
+        # NaN detection after lora_A
+        if self.training and torch.isnan(lora_a_out).any():
+            print(f"[NaN DEBUG] NaN after lora_A projection!", flush=True)
+            print(f"[NaN DEBUG]   stacked_resblock has NaN: {torch.isnan(stacked_resblock).any()}", flush=True)
+            print(f"[NaN DEBUG]   stacked_lora_a has NaN: {torch.isnan(stacked_lora_a).any()}", flush=True)
+            for i, head in enumerate(self.medusa_heads):
+                print(f"[NaN DEBUG]   head{i} lora_A weight max: {head.lora_A.weight.abs().max().item():.4f}", flush=True)
+
         # Step 3: Batched lora_B projection
         # (num_heads, B, T, rank) @ (num_heads, vocab, rank).T -> (num_heads, B, T, vocab)
         lora_deltas = torch.einsum('hbtr,hvr->hbtv', lora_a_out, stacked_lora_b)
+
+        # NaN detection after lora_B
+        if self.training and torch.isnan(lora_deltas).any():
+            print(f"[NaN DEBUG] NaN after lora_B projection!", flush=True)
+            print(f"[NaN DEBUG]   lora_a_out has NaN: {torch.isnan(lora_a_out).any()}", flush=True)
+            print(f"[NaN DEBUG]   stacked_lora_b has NaN: {torch.isnan(stacked_lora_b).any()}", flush=True)
+            for i, head in enumerate(self.medusa_heads):
+                print(f"[NaN DEBUG]   head{i} lora_B weight max: {head.lora_B.weight.abs().max().item():.4f}", flush=True)
 
         # Step 4: Apply per-head scaling
         lora_deltas = lora_deltas * scalings.view(num_heads, 1, 1, 1)
@@ -634,6 +661,13 @@ class GemmaMedusaModel(nn.Module):
         # Step 5: Batched lm_head projection for main + all heads
         all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)  # (num_heads+1, B, T, hidden)
         base_logits = self.base_model.lm_head(all_hiddens)  # (num_heads+1, B, T, vocab)
+
+        # NaN detection after lm_head
+        if self.training and torch.isnan(base_logits).any():
+            print(f"[NaN DEBUG] NaN after lm_head projection!", flush=True)
+            print(f"[NaN DEBUG]   all_hiddens has NaN: {torch.isnan(all_hiddens).any()}", flush=True)
+            print(f"[NaN DEBUG]   lm_head weight max: {self.base_model.lm_head.weight.abs().max().item():.4f}", flush=True)
+
         medusa_logits = base_logits[1:] + lora_deltas  # (num_heads, B, T, vocab)
 
         return base_logits[0], medusa_logits
