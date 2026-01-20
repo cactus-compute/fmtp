@@ -188,7 +188,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Medusa heads for Gemma 3")
 
     # Logging
-    parser.add_argument("--run", type=str, default="dummy",
+    parser.add_argument("--wandb-run", type=str, default="dummy",
                         help="wandb run name ('dummy' disables wandb logging)")
 
     # Model configuration
@@ -281,10 +281,10 @@ if __name__ == "__main__":
     synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 
     # wandb logging init
-    use_dummy_wandb = args.run == "dummy" or not master_process
+    use_dummy_wandb = args.wandb_run == "dummy" or not master_process
     wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(
         project="gemma-medusa",
-        name=args.run,
+        name=args.wandb_run,
         config=user_config,
         save_code=True
     )
