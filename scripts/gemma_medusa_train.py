@@ -497,6 +497,18 @@ if __name__ == "__main__":
             with autocast_ctx:
                 main_loss, head_losses = model(train_inputs, train_targets, return_medusa=True)
 
+                # Check for NaN in losses
+                if torch.isnan(main_loss) or any(torch.isnan(hl) for hl in head_losses):
+                    print0(f"NaN detected at step {step}, micro_step {micro_step}")
+                    print0(f"  main_loss: {main_loss.item()}")
+                    for k, hl in enumerate(head_losses):
+                        print0(f"  head{k}_loss: {hl.item()}")
+                    # Check for NaN in model weights
+                    for name, param in model.named_parameters():
+                        if param.requires_grad and torch.isnan(param).any():
+                            print0(f"  NaN in param: {name}")
+                    raise RuntimeError(f"NaN loss at step {step}")
+
                 # Compute total loss with weighting
                 loss = main_loss.clone()
                 for k, head_loss in enumerate(head_losses):
@@ -515,6 +527,12 @@ if __name__ == "__main__":
             # Normalize and backward
             (loss / grad_accum_steps).backward()
 
+            # Check for NaN in gradients after backward
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.grad is not None and torch.isnan(param.grad).any():
+                    print0(f"NaN gradient at step {step}, micro_step {micro_step} in: {name}")
+                    raise RuntimeError(f"NaN gradient at step {step}")
+
         # Average over accumulation steps
         total_loss /= grad_accum_steps
         total_main_loss /= grad_accum_steps
@@ -526,10 +544,43 @@ if __name__ == "__main__":
             for group in opt.param_groups:
                 group['lr'] = group['initial_lr'] * lrm
 
+        # Compute gradient norms before optimizer step (for logging)
+        grad_norms = {}
+        total_grad_norm_sq = 0.0
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                total_grad_norm_sq += grad_norm ** 2
+                # Track per-component gradient norms
+                if 'lora_A' in name:
+                    grad_norms.setdefault('lora_A', []).append(grad_norm)
+                elif 'lora_B' in name:
+                    grad_norms.setdefault('lora_B', []).append(grad_norm)
+                elif 'blocks' in name:
+                    grad_norms.setdefault('resblock', []).append(grad_norm)
+        total_grad_norm = total_grad_norm_sq ** 0.5
+
         # Gradient step
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
+
+        # Compute weight norms after optimizer step (for logging)
+        weight_norms = {}
+        weight_maxes = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                w_norm = param.norm().item()
+                w_max = param.abs().max().item()
+                if 'lora_A' in name:
+                    weight_norms.setdefault('lora_A', []).append(w_norm)
+                    weight_maxes.setdefault('lora_A', []).append(w_max)
+                elif 'lora_B' in name:
+                    weight_norms.setdefault('lora_B', []).append(w_norm)
+                    weight_maxes.setdefault('lora_B', []).append(w_max)
+                elif 'blocks' in name:
+                    weight_norms.setdefault('resblock', []).append(w_norm)
+                    weight_maxes.setdefault('resblock', []).append(w_max)
 
         synchronize()
         t1 = time.time()
@@ -566,7 +617,7 @@ if __name__ == "__main__":
         else:
             eta_str = ""
 
-        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_loss:.6f} | main: {debiased_main_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_loss:.6f} | main: {debiased_main_loss:.6f} | gnorm: {total_grad_norm:.2f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
 
         if step % 100 == 0:
             log_data = {
@@ -577,6 +628,19 @@ if __name__ == "__main__":
                 "train/lrm": lrm,
                 "train/dt": dt,
                 "train/epoch": current_epoch,
+                # Gradient norms
+                "grad/total_norm": total_grad_norm,
+                "grad/lora_A_norm": sum(grad_norms.get('lora_A', [0])) / max(len(grad_norms.get('lora_A', [1])), 1),
+                "grad/lora_B_norm": sum(grad_norms.get('lora_B', [0])) / max(len(grad_norms.get('lora_B', [1])), 1),
+                "grad/resblock_norm": sum(grad_norms.get('resblock', [0])) / max(len(grad_norms.get('resblock', [1])), 1),
+                # Weight norms
+                "weight/lora_A_norm": sum(weight_norms.get('lora_A', [0])) / max(len(weight_norms.get('lora_A', [1])), 1),
+                "weight/lora_B_norm": sum(weight_norms.get('lora_B', [0])) / max(len(weight_norms.get('lora_B', [1])), 1),
+                "weight/resblock_norm": sum(weight_norms.get('resblock', [0])) / max(len(weight_norms.get('resblock', [1])), 1),
+                # Weight max values (can indicate overflow)
+                "weight/lora_A_max": max(weight_maxes.get('lora_A', [0])),
+                "weight/lora_B_max": max(weight_maxes.get('lora_B', [0])),
+                "weight/resblock_max": max(weight_maxes.get('resblock', [0])),
             }
             for k, hl in enumerate(debiased_head_losses):
                 log_data[f"train/head{k}_loss"] = hl
