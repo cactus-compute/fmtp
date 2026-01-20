@@ -116,6 +116,33 @@ def load_sharegpt_data(filepath):
     return conversations
 
 
+def filter_dataset(dataset, tokenizer, max_seq_len, min_valid_tokens=10):
+    """
+    Filter dataset to remove conversations without enough valid (assistant) tokens.
+
+    Args:
+        dataset: List of conversations
+        tokenizer: Tokenizer wrapper
+        max_seq_len: Maximum sequence length
+        min_valid_tokens: Minimum number of valid (non-masked) tokens required
+
+    Returns:
+        Filtered dataset
+    """
+    filtered = []
+    skipped = 0
+    for doc in dataset:
+        ids, mask = tokenizer.render_conversation(doc, max_tokens=max_seq_len)
+        # Count valid tokens (mask=1 means assistant content we train on)
+        # We check mask[1:] because targets are shifted by 1
+        valid_count = sum(mask[1:])
+        if valid_count >= min_valid_tokens:
+            filtered.append(doc)
+        else:
+            skipped += 1
+    return filtered, skipped
+
+
 def medusa_data_generator(dataset, tokenizer, batch_size, max_seq_len, device, ddp_rank=0, ddp_world_size=1):
     """
     Generate batches of tokenized conversations for Medusa training.
@@ -302,11 +329,19 @@ if __name__ == "__main__":
     train_data = load_sharegpt_data(args.data_path)
     print0(f"Loaded {len(train_data)} training conversations")
 
+    # Filter out conversations with 0 valid tokens (would cause NaN in cross-entropy)
+    # This happens when user message is so long it gets truncated before assistant response
+    print0("Filtering conversations with 0 valid assistant tokens...")
+    train_data, skipped = filter_dataset(train_data, tokenizer, args.max_seq_len, min_valid_tokens=1)
+    print0(f"Filtered to {len(train_data)} conversations (skipped {skipped})")
+
     val_data = None
     if args.val_data_path:
         print0(f"Loading validation data from: {args.val_data_path}")
         val_data = load_sharegpt_data(args.val_data_path)
         print0(f"Loaded {len(val_data)} validation conversations")
+        val_data, val_skipped = filter_dataset(val_data, tokenizer, args.max_seq_len, min_valid_tokens=1)
+        print0(f"Filtered to {len(val_data)} validation conversations (skipped {val_skipped})")
 
     # -----------------------------------------------------------------------------
     # Calculate training schedule
