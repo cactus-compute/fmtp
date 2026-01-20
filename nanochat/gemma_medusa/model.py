@@ -649,12 +649,13 @@ class GemmaMedusaModel(nn.Module):
         # Step 4: Apply pre-cached per-head scaling (already shaped for broadcast)
         lora_deltas = lora_deltas * self._scalings
 
-        # Step 5: Batched lm_head projection for main + all heads
-        all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)
-        base_logits = self.base_model.lm_head(all_hiddens)  # (num_heads+1, B, T, vocab)
-        medusa_logits = base_logits[1:] + lora_deltas  # (num_heads, B, T, vocab)
+        # Step 5: Compute main logits once, reuse for all heads
+        main_logits = self.base_model.lm_head(hidden_states)  # (B, T, vocab)
 
-        return base_logits[0], medusa_logits
+        # Medusa logits = main_logits + lora_delta (NOT lm_head(resblock) + lora_delta)
+        medusa_logits = main_logits.unsqueeze(0) + lora_deltas  # (num_heads, B, T, vocab)
+
+        return main_logits, medusa_logits
 
     def forward(
         self,
