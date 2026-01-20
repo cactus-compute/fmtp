@@ -759,6 +759,16 @@ class GemmaMedusaModel(nn.Module):
             # NaN detection after main loss
             if self.training and torch.isnan(main_loss):
                 print(f"[NaN DEBUG] NaN in main_loss after CE!", flush=True)
+                # Check if all targets are ignored
+                valid_count = (targets != -1).sum().item()
+                total_count = targets.numel()
+                print(f"[NaN DEBUG]   valid targets: {valid_count}/{total_count}", flush=True)
+                print(f"[NaN DEBUG]   targets unique values: {torch.unique(targets).tolist()[:20]}", flush=True)
+                print(f"[NaN DEBUG]   main_logits has NaN: {torch.isnan(main_logits).any()}", flush=True)
+                print(f"[NaN DEBUG]   main_logits has Inf: {torch.isinf(main_logits).any()}", flush=True)
+                if not torch.isnan(main_logits).any() and not torch.isinf(main_logits).any():
+                    print(f"[NaN DEBUG]   main_logits max: {main_logits.max().item()}", flush=True)
+                    print(f"[NaN DEBUG]   main_logits min: {main_logits.min().item()}", flush=True)
 
             if return_medusa and medusa_logits is not None:
                 # NaN/Inf detection for medusa logits
@@ -792,10 +802,14 @@ class GemmaMedusaModel(nn.Module):
                     # NaN detection per head
                     if self.training and torch.isnan(head_loss):
                         print(f"[NaN DEBUG] NaN in head{k}_loss after CE!", flush=True)
+                        valid_count = (head_targets != -1).sum().item()
+                        total_count = head_targets.numel()
+                        print(f"[NaN DEBUG]   head{k} valid targets: {valid_count}/{total_count}", flush=True)
                         print(f"[NaN DEBUG]   head_logits has NaN: {torch.isnan(head_logits).any()}", flush=True)
                         print(f"[NaN DEBUG]   head_logits has Inf: {torch.isinf(head_logits).any()}", flush=True)
-                        if torch.isinf(head_logits).any():
+                        if not torch.isnan(head_logits).any() and not torch.isinf(head_logits).any():
                             print(f"[NaN DEBUG]   head_logits max: {head_logits.max().item()}", flush=True)
+                            print(f"[NaN DEBUG]   head_logits min: {head_logits.min().item()}", flush=True)
 
                     medusa_losses.append(head_loss)
 
