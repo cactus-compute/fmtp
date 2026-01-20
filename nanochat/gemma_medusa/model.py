@@ -748,8 +748,11 @@ class GemmaMedusaModel(nn.Module):
         # We accumulate chunk losses and then compute mean. This ensures proper gradient flow.
 
         # Process main head in chunks - collect losses for proper gradient flow
+        # NOTE: We always compute CE for every chunk (no `if chunk_valid > 0` conditional)
+        # to ensure all DDP ranks have identical computation graphs. CE with ignore_index=-1
+        # handles chunks with no valid targets correctly (returns 0).
         main_chunk_losses = []
-        main_chunk_counts = []
+        total_valid = (targets != -1).sum().item()
 
         for t_start in range(0, T, chunk_size):
             t_end = min(t_start + chunk_size, T)
@@ -759,37 +762,37 @@ class GemmaMedusaModel(nn.Module):
             chunk_logits = lm_head(chunk_hidden)  # (B, chunk, vocab)
             chunk_targets = targets[:, t_start:t_end]  # (B, chunk)
 
-            # Count valid targets in this chunk
-            chunk_valid = (chunk_targets != -1).sum().item()
-
-            if chunk_valid > 0:
-                chunk_loss = F.cross_entropy(
-                    chunk_logits.reshape(-1, chunk_logits.shape[-1]),
-                    chunk_targets.reshape(-1),
-                    ignore_index=-1,
-                    reduction='sum',
-                )
-                main_chunk_losses.append(chunk_loss)
-                main_chunk_counts.append(chunk_valid)
+            chunk_loss = F.cross_entropy(
+                chunk_logits.reshape(-1, chunk_logits.shape[-1]),
+                chunk_targets.reshape(-1),
+                ignore_index=-1,
+                reduction='sum',
+            )
+            main_chunk_losses.append(chunk_loss)
 
         # Compute mean main loss
-        if main_chunk_losses:
-            main_loss = sum(main_chunk_losses) / sum(main_chunk_counts)
+        if total_valid > 0:
+            main_loss = sum(main_chunk_losses) / total_valid
         else:
-            main_loss = hidden_states.new_zeros(())  # differentiable zero
+            main_loss = sum(main_chunk_losses)  # Will be 0, but keeps graph consistent
 
         # Process each Medusa head in chunks
+        # Same principle: always compute CE for every chunk to keep DDP graphs identical
         medusa_losses = []
         for k in range(num_heads):
             shift = 2 + k
             if shift >= T:
-                medusa_losses.append(hidden_states.new_zeros(()))
+                # Still need a tensor in the graph for DDP consistency
+                medusa_losses.append(hidden_states.new_zeros((), requires_grad=True) * 0)
                 continue
 
             # Effective sequence length for this head
             T_eff = T - shift
             head_chunk_losses = []
-            head_chunk_counts = []
+
+            # Count valid targets for this head (shifted targets)
+            head_targets = targets[:, shift:]
+            head_valid = (head_targets != -1).sum().item()
 
             for t_start in range(0, T_eff, chunk_size):
                 t_end = min(t_start + chunk_size, T_eff)
@@ -811,24 +814,19 @@ class GemmaMedusaModel(nn.Module):
                 # Targets are shifted
                 chunk_targets = targets[:, t_start + shift:t_end + shift]  # (B, chunk)
 
-                # Count valid targets
-                chunk_valid = (chunk_targets != -1).sum().item()
-
-                if chunk_valid > 0:
-                    chunk_loss = F.cross_entropy(
-                        chunk_logits.reshape(-1, chunk_logits.shape[-1]),
-                        chunk_targets.reshape(-1),
-                        ignore_index=-1,
-                        reduction='sum',
-                    )
-                    head_chunk_losses.append(chunk_loss)
-                    head_chunk_counts.append(chunk_valid)
+                chunk_loss = F.cross_entropy(
+                    chunk_logits.reshape(-1, chunk_logits.shape[-1]),
+                    chunk_targets.reshape(-1),
+                    ignore_index=-1,
+                    reduction='sum',
+                )
+                head_chunk_losses.append(chunk_loss)
 
             # Compute mean loss for this head
-            if head_chunk_losses:
-                medusa_losses.append(sum(head_chunk_losses) / sum(head_chunk_counts))
+            if head_valid > 0:
+                medusa_losses.append(sum(head_chunk_losses) / head_valid)
             else:
-                medusa_losses.append(hidden_states.new_zeros(()))
+                medusa_losses.append(sum(head_chunk_losses))  # Will be 0, but keeps graph consistent
 
         return main_loss, medusa_losses
 
