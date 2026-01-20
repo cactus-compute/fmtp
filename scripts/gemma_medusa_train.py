@@ -184,6 +184,8 @@ if __name__ == "__main__":
                         help="Number of ResBlock layers per head")
     parser.add_argument("--lora-rank", type=int, default=64,
                         help="LoRA rank for Medusa heads")
+    parser.add_argument("--lora-alpha", type=int, default=None,
+                        help="LoRA alpha scaling (default: same as rank)")
     parser.add_argument("--max-seq-len", type=int, default=2048,
                         help="Maximum sequence length")
     parser.add_argument("--zero-init-mtp-mlp", action="store_true",
@@ -275,6 +277,7 @@ if __name__ == "__main__":
         medusa_num_heads=args.medusa_num_heads,
         medusa_num_layers=args.medusa_num_layers,
         lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         device=device,
         dtype=torch.bfloat16,
         freeze_base=True,

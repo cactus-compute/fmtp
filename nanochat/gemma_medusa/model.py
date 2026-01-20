@@ -402,6 +402,7 @@ class GemmaMedusaModel(nn.Module):
         medusa_num_heads: int = 4,
         medusa_num_layers: int = 1,
         lora_rank: int = 64,
+        lora_alpha: int | None = None,
         device=None,
         dtype=None,
         freeze_base: bool = True,
@@ -412,6 +413,7 @@ class GemmaMedusaModel(nn.Module):
         self.medusa_num_heads = medusa_num_heads
         self.medusa_num_layers = medusa_num_layers
         self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha if lora_alpha is not None else lora_rank
         self.zero_init_mlp = zero_init_mlp
 
         # Determine device and dtype
@@ -458,7 +460,8 @@ class GemmaMedusaModel(nn.Module):
 
         # Create Medusa LoRA heads
         self.medusa_heads = nn.ModuleList([
-            MedusaLoRAHead(hidden_size, vocab_size, medusa_num_layers, lora_rank, zero_init_mlp=zero_init_mlp)
+            MedusaLoRAHead(hidden_size, vocab_size, medusa_num_layers, lora_rank,
+                          lora_alpha=self.lora_alpha, zero_init_mlp=zero_init_mlp)
             for _ in range(medusa_num_heads)
         ])
         # Move heads to device and dtype
@@ -1605,6 +1608,7 @@ def load_gemma_medusa_model(
     medusa_num_heads: int = 4,
     medusa_num_layers: int = 1,
     lora_rank: int = 64,
+    lora_alpha: int | None = None,
     device=None,
     dtype=None,
     freeze_base: bool = True,
@@ -1618,6 +1622,7 @@ def load_gemma_medusa_model(
         medusa_num_heads: Number of Medusa prediction heads
         medusa_num_layers: Number of ResBlock layers per head
         lora_rank: Rank for LoRA projections
+        lora_alpha: LoRA alpha scaling (defaults to lora_rank)
         device: Device to load model on
         dtype: Data type for model weights
         freeze_base: Whether to freeze base model parameters
@@ -1631,6 +1636,7 @@ def load_gemma_medusa_model(
         medusa_num_heads=medusa_num_heads,
         medusa_num_layers=medusa_num_layers,
         lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
         device=device,
         dtype=dtype,
         freeze_base=freeze_base,
