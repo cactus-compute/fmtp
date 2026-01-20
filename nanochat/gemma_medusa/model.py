@@ -1523,7 +1523,7 @@ class GemmaMedusaModel(nn.Module):
         """Return only Medusa head parameters (for training)."""
         return self.medusa_heads.parameters()
 
-    def setup_optimizers(self, matrix_lr=0.02, proj_lr=0.004, weight_decay=0.0, adam_betas=(0.8, 0.95)):
+    def setup_optimizers(self, matrix_lr=0.02, proj_lr=0.004, weight_decay=0.2, adam_weight_decay=0.0, adam_betas=(0.8, 0.95)):
         """
         Setup optimizers following nanochat's pattern:
         - Muon for matrix params (ResBlock linears, LoRA A weights)
@@ -1571,7 +1571,7 @@ class GemmaMedusaModel(nn.Module):
         if medusa_proj_params:
             adam_groups.append(dict(params=medusa_proj_params, lr=proj_lr * dmodel_lr_scale))
 
-        adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0)
+        adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=adam_weight_decay)
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
 
         if adam_groups:

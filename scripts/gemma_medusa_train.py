@@ -213,8 +213,10 @@ if __name__ == "__main__":
                         help="Learning rate for matrix params (Muon)")
     parser.add_argument("--proj-lr", type=float, default=0.004,
                         help="Learning rate for projection params (Adam)")
-    parser.add_argument("--weight-decay", type=float, default=0.0,
-                        help="Weight decay for Muon optimizer")
+    parser.add_argument("--weight-decay", type=float, default=0.2,
+                        help="Weight decay for Muon optimizer (ResBlock params)")
+    parser.add_argument("--adam-weight-decay", type=float, default=0.0,
+                        help="Weight decay for AdamW optimizer (LoRA params)")
     parser.add_argument("--adam-beta1", type=float, default=0.8,
                         help="Adam beta1 for projection params")
     parser.add_argument("--adam-beta2", type=float, default=0.95,
@@ -334,6 +336,7 @@ if __name__ == "__main__":
         matrix_lr=args.matrix_lr,
         proj_lr=args.proj_lr,
         weight_decay=args.weight_decay,
+        adam_weight_decay=args.adam_weight_decay,
         adam_betas=adam_betas,
     )
 
@@ -497,16 +500,22 @@ if __name__ == "__main__":
             with autocast_ctx:
                 main_loss, head_losses = model(train_inputs, train_targets, return_medusa=True)
 
-                # Check for NaN in losses
+                # Check for NaN in losses (print from all ranks, not just master)
                 if torch.isnan(main_loss) or any(torch.isnan(hl) for hl in head_losses):
-                    print0(f"NaN detected at step {step}, micro_step {micro_step}")
-                    print0(f"  main_loss: {main_loss.item()}")
+                    print(f"[rank{ddp_rank}] NaN detected at step {step}, micro_step {micro_step}", flush=True)
+                    print(f"[rank{ddp_rank}]   main_loss: {main_loss.item() if not torch.isnan(main_loss) else 'NaN'}", flush=True)
                     for k, hl in enumerate(head_losses):
-                        print0(f"  head{k}_loss: {hl.item()}")
-                    # Check for NaN in model weights
+                        print(f"[rank{ddp_rank}]   head{k}_loss: {hl.item() if not torch.isnan(hl) else 'NaN'}", flush=True)
+                    # Check for NaN/Inf in model weights
                     for name, param in model.named_parameters():
-                        if param.requires_grad and torch.isnan(param).any():
-                            print0(f"  NaN in param: {name}")
+                        if param.requires_grad:
+                            if torch.isnan(param).any():
+                                print(f"[rank{ddp_rank}]   NaN in param: {name}", flush=True)
+                            if torch.isinf(param).any():
+                                print(f"[rank{ddp_rank}]   Inf in param: {name}", flush=True)
+                    # Check hidden states if available
+                    print(f"[rank{ddp_rank}]   input shape: {train_inputs.shape}", flush=True)
+                    print(f"[rank{ddp_rank}]   target shape: {train_targets.shape}", flush=True)
                     raise RuntimeError(f"NaN loss at step {step}")
 
                 # Compute total loss with weighting
@@ -527,11 +536,17 @@ if __name__ == "__main__":
             # Normalize and backward
             (loss / grad_accum_steps).backward()
 
-            # Check for NaN in gradients after backward
+            # Check for NaN in gradients after backward (print from all ranks)
             for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None and torch.isnan(param.grad).any():
-                    print0(f"NaN gradient at step {step}, micro_step {micro_step} in: {name}")
-                    raise RuntimeError(f"NaN gradient at step {step}")
+                if param.requires_grad and param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        print(f"[rank{ddp_rank}] NaN gradient at step {step}, micro_step {micro_step} in: {name}", flush=True)
+                        print(f"[rank{ddp_rank}]   grad norm: {param.grad.norm().item()}", flush=True)
+                        print(f"[rank{ddp_rank}]   weight norm: {param.norm().item()}", flush=True)
+                        raise RuntimeError(f"NaN gradient at step {step}")
+                    if torch.isinf(param.grad).any():
+                        print(f"[rank{ddp_rank}] Inf gradient at step {step}, micro_step {micro_step} in: {name}", flush=True)
+                        raise RuntimeError(f"Inf gradient at step {step}")
 
         # Average over accumulation steps
         total_loss /= grad_accum_steps
