@@ -498,37 +498,20 @@ class GemmaMedusaModel(nn.Module):
         return sum(p.numel() for p in self.medusa_heads.parameters())
 
     def _cache_stacked_weights(self):
-        """Pre-stack LoRA weights and scalings for efficient batched forward pass.
-
-        Uses BMM-friendly layouts (contiguous, transposed) for CUDA optimization.
-        """
+        """Pre-stack LoRA weights and scalings for efficient batched forward pass."""
         if len(self.medusa_heads) == 0:
             self._stacked_lora_a = None
             self._stacked_lora_b = None
-            self._stacked_resblock_weights = None
             self._scalings = None
             return
 
-        # Stack lora_A weights: (num_heads, rank, hidden) -> transpose for bmm: (num_heads, hidden, rank)
-        lora_a_list = [head.lora_A.weight for head in self.medusa_heads]  # type: ignore
-        self._stacked_lora_a = torch.stack(lora_a_list, dim=0).transpose(1, 2).contiguous()
-
-        # Stack lora_B weights: (num_heads, vocab, rank) -> transpose for bmm: (num_heads, rank, vocab)
-        lora_b_list = [head.lora_B.weight for head in self.medusa_heads]  # type: ignore
-        self._stacked_lora_b = torch.stack(lora_b_list, dim=0).transpose(1, 2).contiguous()
-
-        # Stack ResBlock weights for batched computation (if single layer)
-        if self.medusa_num_layers == 1:
-            resblock_list = [head.blocks[0].linear.weight for head in self.medusa_heads]  # type: ignore
-            self._stacked_resblock_weights = torch.stack(resblock_list, dim=0).contiguous()
-        else:
-            self._stacked_resblock_weights = None
-
-        # Pre-compute scalings tensor: (num_heads, 1, 1, 1) for broadcasting
-        scalings_list = [head.scaling for head in self.medusa_heads]  # type: ignore
-        self._scalings = torch.tensor(
-            scalings_list, device=self._device, dtype=self._dtype
-        ).view(-1, 1, 1, 1)
+        # Stack lora_A weights: (num_heads, rank, hidden)
+        self._stacked_lora_a = torch.stack([head.lora_A.weight for head in self.medusa_heads], dim=0)
+        # Stack lora_B weights: (num_heads, vocab, rank)
+        self._stacked_lora_b = torch.stack([head.lora_B.weight for head in self.medusa_heads], dim=0)
+        # Pre-compute scalings tensor: (num_heads,)
+        self._scalings = torch.tensor([head.scaling for head in self.medusa_heads],
+                                      device=self._device, dtype=self._dtype)
 
     def _get_hidden_states(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -609,53 +592,33 @@ class GemmaMedusaModel(nn.Module):
             return self.base_model.lm_head(hidden_states), None  # (B, T, vocab) or (B, 1, vocab)
 
         num_heads = len(self.medusa_heads)
-        B, T, H = hidden_states.shape
 
-        # Step 1: Compute ResBlocks - batched if single layer, else sequential
-        if self._stacked_resblock_weights is not None:
-            # Batched ResBlock for num_layers=1 (common case)
-            # hidden_states: (B, T, H) -> expand to (num_heads, B, T, H)
-            h_expanded = hidden_states.unsqueeze(0).expand(num_heads, -1, -1, -1)
-            # Batched linear: reshape for bmm
-            h_flat = h_expanded.reshape(num_heads, B * T, H)  # (num_heads, B*T, H)
-            linear_out = torch.bmm(h_flat, self._stacked_resblock_weights.transpose(1, 2))  # (num_heads, B*T, H)
-            linear_out = linear_out.view(num_heads, B, T, H)
-            stacked_resblock = h_expanded + F.silu(linear_out)  # (num_heads, B, T, H)
-        else:
-            # Sequential for multi-layer ResBlocks
-            resblock_outputs = []
-            for head in self.medusa_heads:
-                x = hidden_states
-                for block in head.blocks:  # type: ignore
-                    x = block(x)
-                resblock_outputs.append(x)
-            stacked_resblock = torch.stack(resblock_outputs, dim=0)
+        # Step 1: Compute ResBlocks for each head (sequential to preserve gradients during training)
+        resblock_outputs = []
+        for head in self.medusa_heads:
+            x = hidden_states
+            for block in head.blocks:
+                x = block(x)
+            resblock_outputs.append(x)  # (B, T, hidden_size)
 
-        # Step 2: Batched LoRA projections using BMM (faster than einsum on CUDA)
-        # stacked_resblock: (num_heads, B, T, H)
-        # _stacked_lora_a: (num_heads, H, rank) - pre-transposed for bmm
-        assert self._stacked_lora_a is not None
-        assert self._stacked_lora_b is not None
-        assert self._scalings is not None
+        # Step 2: Stack ResBlock outputs and do batched lora_A projection
+        stacked_resblock = torch.stack(resblock_outputs, dim=0)  # (num_heads, B, T, hidden)
+        # Use pre-cached lora_A weights: (num_heads, rank, hidden)
+        stacked_lora_a = torch.einsum('hbti,hri->hbtr', stacked_resblock, self._stacked_lora_a)
 
-        resblock_flat = stacked_resblock.reshape(num_heads, B * T, H)  # (num_heads, B*T, H)
-        lora_a_out = torch.bmm(resblock_flat, self._stacked_lora_a)  # (num_heads, B*T, rank)
+        # Step 3: Batched lora_B projection using pre-cached weights
+        # (num_heads, B, T, rank) @ (num_heads, vocab, rank).T -> (num_heads, B, T, vocab)
+        lora_deltas = torch.einsum('hbtr,hvr->hbtv', stacked_lora_a, self._stacked_lora_b)
 
-        # Step 3: LoRA B projection
-        # _stacked_lora_b: (num_heads, rank, vocab) - pre-transposed for bmm
-        lora_deltas_flat = torch.bmm(lora_a_out, self._stacked_lora_b)  # (num_heads, B*T, vocab)
-        lora_deltas = lora_deltas_flat.view(num_heads, B, T, -1)  # (num_heads, B, T, vocab)
+        # Step 4: Apply pre-cached per-head scaling
+        lora_deltas = lora_deltas * self._scalings.view(num_heads, 1, 1, 1)
 
-        # Step 4: Apply pre-cached per-head scaling (already shaped for broadcast)
-        lora_deltas = lora_deltas * self._scalings
+        # Step 5: Batched lm_head projection for main + all heads
+        all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)  # (num_heads+1, B, T, hidden)
+        base_logits = self.base_model.lm_head(all_hiddens)  # (num_heads+1, B, T, vocab)
+        medusa_logits = base_logits[1:] + lora_deltas  # (num_heads, B, T, vocab)
 
-        # Step 5: Compute main logits once, reuse for all heads
-        main_logits = self.base_model.lm_head(hidden_states)  # (B, T, vocab)
-
-        # Medusa logits = main_logits + lora_delta (NOT lm_head(resblock) + lora_delta)
-        medusa_logits = main_logits.unsqueeze(0) + lora_deltas  # (num_heads, B, T, vocab)
-
-        return main_logits, medusa_logits
+        return base_logits[0], medusa_logits
 
     def forward(
         self,
