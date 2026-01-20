@@ -745,14 +745,12 @@ class GemmaMedusaModel(nn.Module):
 
         # Step 3: Chunked loss computation
         # For main loss, we need full sequence. For medusa, we need shifted sequences.
-        # We'll accumulate weighted losses and counts for proper mean reduction.
+        # We accumulate chunk losses and then compute mean. This ensures proper gradient flow.
 
-        main_loss_sum = torch.tensor(0.0, device=self._device, dtype=torch.float32)
-        main_count = 0
-        head_loss_sums = [torch.tensor(0.0, device=self._device, dtype=torch.float32) for _ in range(num_heads)]
-        head_counts = [0 for _ in range(num_heads)]
+        # Process main head in chunks - collect losses for proper gradient flow
+        main_chunk_losses = []
+        main_chunk_counts = []
 
-        # Process main head in chunks
         for t_start in range(0, T, chunk_size):
             t_end = min(t_start + chunk_size, T)
 
@@ -762,8 +760,7 @@ class GemmaMedusaModel(nn.Module):
             chunk_targets = targets[:, t_start:t_end]  # (B, chunk)
 
             # Count valid targets in this chunk
-            valid_mask = chunk_targets != -1
-            chunk_valid = valid_mask.sum().item()
+            chunk_valid = (chunk_targets != -1).sum().item()
 
             if chunk_valid > 0:
                 chunk_loss = F.cross_entropy(
@@ -772,24 +769,27 @@ class GemmaMedusaModel(nn.Module):
                     ignore_index=-1,
                     reduction='sum',
                 )
-                main_loss_sum = main_loss_sum + chunk_loss
-                main_count += chunk_valid
+                main_chunk_losses.append(chunk_loss)
+                main_chunk_counts.append(chunk_valid)
 
         # Compute mean main loss
-        if main_count > 0:
-            main_loss = main_loss_sum / main_count
+        if main_chunk_losses:
+            main_loss = sum(main_chunk_losses) / sum(main_chunk_counts)
         else:
-            main_loss = torch.tensor(0.0, device=self._device)
+            main_loss = hidden_states.new_zeros(())  # differentiable zero
 
         # Process each Medusa head in chunks
+        medusa_losses = []
         for k in range(num_heads):
             shift = 2 + k
             if shift >= T:
-                head_loss_sums[k] = torch.tensor(0.0, device=self._device)
+                medusa_losses.append(hidden_states.new_zeros(()))
                 continue
 
             # Effective sequence length for this head
             T_eff = T - shift
+            head_chunk_losses = []
+            head_chunk_counts = []
 
             for t_start in range(0, T_eff, chunk_size):
                 t_end = min(t_start + chunk_size, T_eff)
@@ -812,8 +812,7 @@ class GemmaMedusaModel(nn.Module):
                 chunk_targets = targets[:, t_start + shift:t_end + shift]  # (B, chunk)
 
                 # Count valid targets
-                valid_mask = chunk_targets != -1
-                chunk_valid = valid_mask.sum().item()
+                chunk_valid = (chunk_targets != -1).sum().item()
 
                 if chunk_valid > 0:
                     chunk_loss = F.cross_entropy(
@@ -822,16 +821,14 @@ class GemmaMedusaModel(nn.Module):
                         ignore_index=-1,
                         reduction='sum',
                     )
-                    head_loss_sums[k] = head_loss_sums[k] + chunk_loss
-                    head_counts[k] += chunk_valid
+                    head_chunk_losses.append(chunk_loss)
+                    head_chunk_counts.append(chunk_valid)
 
-        # Compute mean losses for each head
-        medusa_losses = []
-        for k in range(num_heads):
-            if head_counts[k] > 0:
-                medusa_losses.append(head_loss_sums[k] / head_counts[k])
+            # Compute mean loss for this head
+            if head_chunk_losses:
+                medusa_losses.append(sum(head_chunk_losses) / sum(head_chunk_counts))
             else:
-                medusa_losses.append(torch.tensor(0.0, device=self._device))
+                medusa_losses.append(hidden_states.new_zeros(()))
 
         return main_loss, medusa_losses
 
