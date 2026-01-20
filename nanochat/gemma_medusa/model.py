@@ -605,15 +605,28 @@ class GemmaMedusaModel(nn.Module):
 
         # Step 2: Stack ResBlock outputs and do batched lora_A projection
         stacked_resblock = torch.stack(resblock_outputs, dim=0)  # (num_heads, B, T, hidden)
-        # Use pre-cached lora_A weights: (num_heads, rank, hidden)
-        stacked_lora_a = torch.einsum('hbti,hri->hbtr', stacked_resblock, self._stacked_lora_a)
 
-        # Step 3: Batched lora_B projection using pre-cached weights
+        # During training, stack weights fresh each forward to capture gradient updates
+        # During inference, use pre-cached weights for efficiency
+        if self.training:
+            stacked_lora_a = torch.stack([head.lora_A.weight for head in self.medusa_heads], dim=0)
+            stacked_lora_b = torch.stack([head.lora_B.weight for head in self.medusa_heads], dim=0)
+            scalings = torch.tensor([head.scaling for head in self.medusa_heads],
+                                    device=self._device, dtype=self._dtype)
+        else:
+            stacked_lora_a = self._stacked_lora_a
+            stacked_lora_b = self._stacked_lora_b
+            scalings = self._scalings
+
+        # lora_A projection: (num_heads, rank, hidden)
+        lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
+
+        # Step 3: Batched lora_B projection
         # (num_heads, B, T, rank) @ (num_heads, vocab, rank).T -> (num_heads, B, T, vocab)
-        lora_deltas = torch.einsum('hbtr,hvr->hbtv', stacked_lora_a, self._stacked_lora_b)
+        lora_deltas = torch.einsum('hbtr,hvr->hbtv', lora_a_out, stacked_lora_b)
 
-        # Step 4: Apply pre-cached per-head scaling
-        lora_deltas = lora_deltas * self._scalings.view(num_heads, 1, 1, 1)
+        # Step 4: Apply per-head scaling
+        lora_deltas = lora_deltas * scalings.view(num_heads, 1, 1, 1)
 
         # Step 5: Batched lm_head projection for main + all heads
         all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)  # (num_heads+1, B, T, hidden)
@@ -1487,9 +1500,11 @@ class GemmaMedusaModel(nn.Module):
         return current_tokens, forward_passes
 
     def eval(self):
-        """Set model to evaluation mode."""
+        """Set model to evaluation mode and refresh cached weights."""
         self.base_model.eval()
         self.medusa_heads.eval()
+        # Refresh cached LoRA weights for inference (they may have changed during training)
+        self._cache_stacked_weights()
         return self
 
     def train(self, mode=True):
