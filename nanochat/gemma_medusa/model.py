@@ -694,6 +694,147 @@ class GemmaMedusaModel(nn.Module):
 
         return base_logits[0], medusa_logits
 
+    def _compute_losses_chunked(
+        self,
+        hidden_states: torch.Tensor,
+        targets: torch.Tensor,
+        loss_reduction: str = 'mean',
+        chunk_size: int = 128,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Compute losses with chunked cross-entropy to reduce peak memory.
+
+        Instead of materializing the full (num_heads+1, B, T, vocab) logits tensor,
+        we process the sequence in chunks, computing lm_head projection and CE loss
+        for each chunk. This reduces peak memory from O(B*T*vocab) to O(B*chunk*vocab).
+
+        The ResBlock and LoRA projections are still computed in full (they're small),
+        only the vocab-sized tensors are chunked.
+
+        Args:
+            hidden_states: (B, T, hidden_size) from transformer
+            targets: (B, T) target token IDs
+            loss_reduction: 'mean' or 'none'
+            chunk_size: Number of sequence positions to process at once
+
+        Returns:
+            main_loss: scalar loss for main head
+            medusa_losses: list of scalar losses for each Medusa head
+        """
+        B, T, hidden_size = hidden_states.shape
+        num_heads = len(self.medusa_heads)
+        lm_head = self.base_model.lm_head
+
+        # Step 1: Compute ResBlocks for all heads (small memory: num_heads * B * T * hidden)
+        resblock_outputs = []
+        for head in self.medusa_heads:
+            x = hidden_states
+            for block in head.blocks:
+                x = block(x)
+            resblock_outputs.append(x)
+        stacked_resblock = torch.stack(resblock_outputs, dim=0)  # (num_heads, B, T, hidden)
+
+        # Step 2: Compute LoRA projections (small memory: num_heads * B * T * rank)
+        # Stack weights for batched computation
+        stacked_lora_a = torch.stack([h.lora_A.weight for h in self.medusa_heads], dim=0)
+        stacked_lora_b = torch.stack([h.lora_B.weight for h in self.medusa_heads], dim=0)
+        scalings = torch.tensor([h.scaling for h in self.medusa_heads], device=self._device, dtype=self._dtype)
+
+        # lora_A: (num_heads, B, T, hidden) @ (num_heads, rank, hidden).T -> (num_heads, B, T, rank)
+        lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
+
+        # Step 3: Chunked loss computation
+        # For main loss, we need full sequence. For medusa, we need shifted sequences.
+        # We'll accumulate weighted losses and counts for proper mean reduction.
+
+        main_loss_sum = torch.tensor(0.0, device=self._device, dtype=torch.float32)
+        main_count = 0
+        head_loss_sums = [torch.tensor(0.0, device=self._device, dtype=torch.float32) for _ in range(num_heads)]
+        head_counts = [0 for _ in range(num_heads)]
+
+        # Process main head in chunks
+        for t_start in range(0, T, chunk_size):
+            t_end = min(t_start + chunk_size, T)
+
+            # Main head: lm_head(hidden_states)
+            chunk_hidden = hidden_states[:, t_start:t_end, :]  # (B, chunk, hidden)
+            chunk_logits = lm_head(chunk_hidden)  # (B, chunk, vocab)
+            chunk_targets = targets[:, t_start:t_end]  # (B, chunk)
+
+            # Count valid targets in this chunk
+            valid_mask = chunk_targets != -1
+            chunk_valid = valid_mask.sum().item()
+
+            if chunk_valid > 0:
+                chunk_loss = F.cross_entropy(
+                    chunk_logits.reshape(-1, chunk_logits.shape[-1]),
+                    chunk_targets.reshape(-1),
+                    ignore_index=-1,
+                    reduction='sum',
+                )
+                main_loss_sum = main_loss_sum + chunk_loss
+                main_count += chunk_valid
+
+        # Compute mean main loss
+        if main_count > 0:
+            main_loss = main_loss_sum / main_count
+        else:
+            main_loss = torch.tensor(0.0, device=self._device)
+
+        # Process each Medusa head in chunks
+        for k in range(num_heads):
+            shift = 2 + k
+            if shift >= T:
+                head_loss_sums[k] = torch.tensor(0.0, device=self._device)
+                continue
+
+            # Effective sequence length for this head
+            T_eff = T - shift
+
+            for t_start in range(0, T_eff, chunk_size):
+                t_end = min(t_start + chunk_size, T_eff)
+
+                # Get chunk of ResBlock output and LoRA-A output
+                chunk_resblock = stacked_resblock[k, :, t_start:t_end, :]  # (B, chunk, hidden)
+                chunk_lora_a = lora_a_out[k, :, t_start:t_end, :]  # (B, chunk, rank)
+
+                # Compute lm_head(resblock) for this chunk
+                chunk_base_logits = lm_head(chunk_resblock)  # (B, chunk, vocab)
+
+                # Compute LoRA delta: lora_B(lora_a) * scaling
+                # (B, chunk, rank) @ (vocab, rank).T -> (B, chunk, vocab)
+                chunk_lora_delta = torch.einsum('btr,vr->btv', chunk_lora_a, stacked_lora_b[k]) * scalings[k]
+
+                # Full logits for this head
+                chunk_logits = chunk_base_logits + chunk_lora_delta  # (B, chunk, vocab)
+
+                # Targets are shifted
+                chunk_targets = targets[:, t_start + shift:t_end + shift]  # (B, chunk)
+
+                # Count valid targets
+                valid_mask = chunk_targets != -1
+                chunk_valid = valid_mask.sum().item()
+
+                if chunk_valid > 0:
+                    chunk_loss = F.cross_entropy(
+                        chunk_logits.reshape(-1, chunk_logits.shape[-1]),
+                        chunk_targets.reshape(-1),
+                        ignore_index=-1,
+                        reduction='sum',
+                    )
+                    head_loss_sums[k] = head_loss_sums[k] + chunk_loss
+                    head_counts[k] += chunk_valid
+
+        # Compute mean losses for each head
+        medusa_losses = []
+        for k in range(num_heads):
+            if head_counts[k] > 0:
+                medusa_losses.append(head_loss_sums[k] / head_counts[k])
+            else:
+                medusa_losses.append(torch.tensor(0.0, device=self._device))
+
+        return main_loss, medusa_losses
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -702,6 +843,8 @@ class GemmaMedusaModel(nn.Module):
         loss_reduction: str = 'mean',
         return_medusa: bool = False,
         last_only: bool = False,
+        use_chunked_loss: bool = False,
+        chunk_size: int = 128,
     ):
         """
         Forward pass with optional Medusa head computation.
@@ -714,6 +857,9 @@ class GemmaMedusaModel(nn.Module):
             return_medusa: Whether to return Medusa outputs
             last_only: If True, only compute logits for the last token position.
                        Use this during generation for efficiency.
+            use_chunked_loss: If True, compute losses in chunks to reduce memory.
+                              Reduces peak memory from O(B*T*vocab) to O(B*chunk*vocab).
+            chunk_size: Sequence chunk size when use_chunked_loss=True.
 
         Returns:
             If targets is None:
@@ -727,7 +873,11 @@ class GemmaMedusaModel(nn.Module):
         # Get hidden states from transformer
         hidden_states = self._get_hidden_states(input_ids)
 
-        # Compute logits (optionally only for last position during generation)
+        # Use chunked loss computation for memory efficiency during training
+        if use_chunked_loss and targets is not None and return_medusa:
+            return self._compute_losses_chunked(hidden_states, targets, loss_reduction, chunk_size)
+
+        # Standard path: compute logits then losses
         main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa, last_only)
 
         if targets is not None:

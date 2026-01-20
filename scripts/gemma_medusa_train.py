@@ -262,6 +262,10 @@ if __name__ == "__main__":
                         help="Path to validation data (optional)")
     parser.add_argument("--skip-filter", action="store_true",
                         help="Skip dataset filtering (use if data is pre-filtered)")
+    parser.add_argument("--use-chunked-loss", action="store_true",
+                        help="Compute loss in chunks to reduce memory (allows larger batch sizes)")
+    parser.add_argument("--chunk-size", type=int, default=128,
+                        help="Chunk size for chunked loss computation (default: 128)")
 
     # Evaluation
     parser.add_argument("--eval-every", type=int, default=250,
@@ -323,6 +327,8 @@ if __name__ == "__main__":
     print0(f"Medusa parameters: {num_medusa_params:,}")
     print0(f"Trainable parameters: {trainable_params:,}")
     print0(f"Vocab size: {tokenizer.get_vocab_size()}")
+    if args.use_chunked_loss:
+        print0(f"Using chunked loss (chunk_size={args.chunk_size}) for memory efficiency")
 
     # -----------------------------------------------------------------------------
     # Load data
@@ -540,7 +546,10 @@ if __name__ == "__main__":
             current_epoch = epoch
 
             with autocast_ctx:
-                main_loss, head_losses = model(train_inputs, train_targets, return_medusa=True)
+                main_loss, head_losses = model(
+                    train_inputs, train_targets, return_medusa=True,
+                    use_chunked_loss=args.use_chunked_loss, chunk_size=args.chunk_size
+                )
 
                 # Check for NaN in losses (print from all ranks, not just master)
                 if torch.isnan(main_loss) or any(torch.isnan(hl) for hl in head_losses):
