@@ -15,10 +15,12 @@ import torch.nn.functional as F
 
 
 class MedusaResBlock(nn.Module):
-    """Residual block for Medusa heads. Zero-init for identity at start."""
-    def __init__(self, hidden_size):
+    """Residual block for Medusa heads. Optional zero-init for identity at start."""
+    def __init__(self, hidden_size, zero_init=False):
         super().__init__()
         self.linear = nn.Linear(hidden_size, hidden_size, bias=False)
+        if zero_init:
+            nn.init.zeros_(self.linear.weight)
 
     def forward(self, x):
         return x + F.silu(self.linear(x))
@@ -49,14 +51,17 @@ class MedusaLoRAHead(nn.Module):
 
     The alpha/rank scaling keeps the adapter contribution stable across different ranks.
     """
-    def __init__(self, hidden_size, vocab_size, num_layers, lora_rank, lora_alpha=None):
+    def __init__(self, hidden_size, vocab_size, num_layers, lora_rank, lora_alpha=None, zero_init_mlp=False):
         super().__init__()
-        self.blocks = nn.ModuleList([MedusaResBlock(hidden_size) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([MedusaResBlock(hidden_size, zero_init=zero_init_mlp) for _ in range(num_layers)])
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha if lora_alpha is not None else lora_rank  # default: alpha = rank (scaling = 1)
         self.scaling = self.lora_alpha / self.lora_rank
         self.lora_A = nn.Linear(hidden_size, lora_rank, bias=False)
         self.lora_B = nn.Linear(lora_rank, vocab_size, bias=False)
+        # Standard LoRA init: A gets default Kaiming, B gets zeros
+        # This ensures LoRA contribution starts at zero
+        nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x):
         """

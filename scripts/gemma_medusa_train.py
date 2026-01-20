@@ -186,6 +186,8 @@ if __name__ == "__main__":
                         help="LoRA rank for Medusa heads")
     parser.add_argument("--max-seq-len", type=int, default=2048,
                         help="Maximum sequence length")
+    parser.add_argument("--zero-init-mtp-mlp", action="store_true",
+                        help="Zero-initialize ResBlock MLP weights (ablation)")
 
     # Medusa loss configuration
     parser.add_argument("--medusa-loss-weight", type=float, default=1.0,
@@ -276,6 +278,7 @@ if __name__ == "__main__":
         device=device,
         dtype=torch.bfloat16,
         freeze_base=True,
+        zero_init_mlp=args.zero_init_mtp_mlp,
     )
     tokenizer = GemmaTokenizerWrapper(args.base_model)
 

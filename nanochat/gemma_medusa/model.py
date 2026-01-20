@@ -405,12 +405,14 @@ class GemmaMedusaModel(nn.Module):
         device=None,
         dtype=None,
         freeze_base: bool = True,
+        zero_init_mlp: bool = False,
     ):
         super().__init__()
         self.model_name = model_name
         self.medusa_num_heads = medusa_num_heads
         self.medusa_num_layers = medusa_num_layers
         self.lora_rank = lora_rank
+        self.zero_init_mlp = zero_init_mlp
 
         # Determine device and dtype
         if device is None:
@@ -456,7 +458,7 @@ class GemmaMedusaModel(nn.Module):
 
         # Create Medusa LoRA heads
         self.medusa_heads = nn.ModuleList([
-            MedusaLoRAHead(hidden_size, vocab_size, medusa_num_layers, lora_rank)
+            MedusaLoRAHead(hidden_size, vocab_size, medusa_num_layers, lora_rank, zero_init_mlp=zero_init_mlp)
             for _ in range(medusa_num_heads)
         ])
         # Move heads to device and dtype
@@ -1591,6 +1593,7 @@ def load_gemma_medusa_model(
     device=None,
     dtype=None,
     freeze_base: bool = True,
+    zero_init_mlp: bool = False,
 ):
     """
     Load a Gemma model with Medusa LoRA heads.
@@ -1603,6 +1606,7 @@ def load_gemma_medusa_model(
         device: Device to load model on
         dtype: Data type for model weights
         freeze_base: Whether to freeze base model parameters
+        zero_init_mlp: Whether to zero-initialize ResBlock MLP weights
 
     Returns:
         GemmaMedusaModel instance
@@ -1615,4 +1619,5 @@ def load_gemma_medusa_model(
         device=device,
         dtype=dtype,
         freeze_base=freeze_base,
+        zero_init_mlp=zero_init_mlp,
     )
