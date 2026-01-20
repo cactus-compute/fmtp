@@ -229,14 +229,18 @@ if __name__ == "__main__":
                         help="Per-device batch size")
     parser.add_argument("--target-batch-size", type=int, default=32,
                         help="Target batch size for gradient accumulation")
-    parser.add_argument("--matrix-lr", type=float, default=0.02,
+    parser.add_argument("--matrix-lr", type=float, default=0.005,
                         help="Learning rate for matrix params (Muon optimizer)")
-    parser.add_argument("--proj-lr", type=float, default=0.004,
+    parser.add_argument("--proj-lr", type=float, default=0.001,
                         help="Learning rate for projection params (AdamW optimizer)")
     parser.add_argument("--weight-decay", type=float, default=0.0,
                         help="Weight decay for Muon optimizer")
-    parser.add_argument("--init-lr-frac", type=float, default=0.02,
-                        help="Initial LR as fraction of base LR (for warmup)")
+    parser.add_argument("--warmup-ratio", type=float, default=0.0,
+                        help="Fraction of training for LR warmup (default: 0, no warmup)")
+    parser.add_argument("--warmdown-ratio", type=float, default=0.4,
+                        help="Fraction of training for LR warmdown (default: 0.4)")
+    parser.add_argument("--final-lr-frac", type=float, default=0.0,
+                        help="Final LR as fraction of base LR (default: 0)")
     parser.add_argument("--adam-betas", type=float, nargs=2, default=[0.8, 0.95],
                         help="Adam betas (default: 0.8 0.95, nanochat-style)")
 
@@ -361,15 +365,21 @@ if __name__ == "__main__":
         adam_betas=tuple(args.adam_betas),
     )
 
-    # Set initial LR fraction for warmup (nanochat-style)
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * args.init_lr_frac
-
-    # Linear warmdown LR schedule (nanochat-style: ramp up then linear decay)
+    # LR schedule: constant for (1 - warmdown_ratio), then linear decay to final_lr_frac
+    # With warmup_ratio > 0, ramp up first
     def get_lr_multiplier(it):
-        # Linear decay from 1.0 to 0.0 over training
-        return 1.0 - it / num_iterations
+        warmup_iters = round(args.warmup_ratio * num_iterations)
+        warmdown_iters = round(args.warmdown_ratio * num_iterations)
+        if it < warmup_iters:
+            # Linear warmup
+            return (it + 1) / warmup_iters
+        elif it <= num_iterations - warmdown_iters:
+            # Constant LR
+            return 1.0
+        else:
+            # Linear warmdown to final_lr_frac
+            progress = (num_iterations - it) / warmdown_iters
+            return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
     # -----------------------------------------------------------------------------
     # Setup data loaders
