@@ -1124,7 +1124,7 @@ class GemmaMedusaModel(nn.Module):
         def run_forward(tokens: List[int], return_medusa: bool = True, last_only: bool = True):
             input_tensor = torch.tensor([tokens], dtype=torch.long, device=self._device)
             if is_cuda:
-                with torch.cuda.amp.autocast(dtype=dtype):
+                with torch.amp.autocast('cuda', dtype=dtype):
                     return self.forward(input_tensor, return_medusa=return_medusa, last_only=last_only)
             else:
                 return self.forward(input_tensor, return_medusa=return_medusa, last_only=last_only)
@@ -1132,7 +1132,7 @@ class GemmaMedusaModel(nn.Module):
         def run_forward_mtp(tokens: List[int], tree_cands: torch.Tensor, bufs: Dict[str, torch.Tensor]):
             input_tensor = torch.tensor([tokens], dtype=torch.long, device=self._device)
             if is_cuda:
-                with torch.cuda.amp.autocast(dtype=dtype):
+                with torch.amp.autocast('cuda', dtype=dtype):
                     return self.forward_mtp(input_tensor, tree_cands, bufs)
             else:
                 return self.forward_mtp(input_tensor, tree_cands, bufs)
@@ -1261,7 +1261,7 @@ class GemmaMedusaModel(nn.Module):
         input_tensor = torch.tensor([current_tokens], dtype=torch.long, device=self._device)
 
         if is_cuda:
-            with torch.cuda.amp.autocast(dtype=dtype):
+            with torch.amp.autocast('cuda', dtype=dtype):
                 hidden_states, past_key_values = self._get_hidden_states_with_cache(input_tensor)
                 main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa=True, last_only=True)
         else:
@@ -1286,7 +1286,7 @@ class GemmaMedusaModel(nn.Module):
 
             # Verify candidates with tree attention using KV cache
             if is_cuda:
-                with torch.cuda.amp.autocast(dtype=dtype):
+                with torch.amp.autocast('cuda', dtype=dtype):
                     tree_logits, ret_indices, valid_mask, _ = self.forward_mtp_with_cache(
                         tree_candidates, buffers, past_key_values, current_seq_len
                     )
@@ -1344,7 +1344,7 @@ class GemmaMedusaModel(nn.Module):
             ).unsqueeze(0)
 
             if is_cuda:
-                with torch.cuda.amp.autocast(dtype=dtype):
+                with torch.amp.autocast('cuda', dtype=dtype):
                     hidden_states, past_key_values = self._get_hidden_states_with_cache(
                         new_tokens_tensor,
                         past_key_values=past_key_values,
@@ -1398,7 +1398,7 @@ class GemmaMedusaModel(nn.Module):
         for _ in range(max_new_tokens):
             input_tensor = torch.tensor([current_tokens], dtype=torch.long, device=self._device)
             if self._device.type == "cuda":
-                with torch.cuda.amp.autocast(dtype=dtype):
+                with torch.amp.autocast('cuda', dtype=dtype):
                     result = self.forward(input_tensor, return_medusa=False, last_only=True)
             else:
                 result = self.forward(input_tensor, return_medusa=False, last_only=True)
@@ -1456,7 +1456,7 @@ class GemmaMedusaModel(nn.Module):
         input_tensor = torch.tensor([current_tokens], dtype=torch.long, device=self._device)
 
         if is_cuda:
-            with torch.cuda.amp.autocast(dtype=dtype):
+            with torch.amp.autocast('cuda', dtype=dtype):
                 hidden_states, past_key_values = self._get_hidden_states_with_cache(input_tensor)
                 logits, _ = self._compute_logits(hidden_states, return_medusa=False, last_only=True)
         else:
@@ -1487,7 +1487,7 @@ class GemmaMedusaModel(nn.Module):
             new_position_ids = torch.tensor([[current_seq_len - 1]], dtype=torch.long, device=self._device)
 
             if is_cuda:
-                with torch.cuda.amp.autocast(dtype=dtype):
+                with torch.amp.autocast('cuda', dtype=dtype):
                     hidden_states, past_key_values = self._get_hidden_states_with_cache(
                         new_token_tensor,
                         past_key_values=past_key_values,
