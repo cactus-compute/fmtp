@@ -237,7 +237,7 @@ def main():
     # Schedule
     parser.add_argument("--warmup-ratio", type=float, default=0.0,
                         help="Warmup ratio")
-    parser.add_argument("--warmdown-ratio", type=float, default=1.0,
+    parser.add_argument("--warmdown-ratio", type=float, default=0.4,
                         help="Warmdown ratio")
     parser.add_argument("--final-lr-frac", type=float, default=0.0,
                         help="Final LR fraction")
