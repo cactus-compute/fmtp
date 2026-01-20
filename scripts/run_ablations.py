@@ -10,6 +10,9 @@ Usage:
 
     # Or with torchrun for multi-GPU
     python -m scripts.run_ablations --data-path data/openhermes_filtered.json --nproc 8
+
+    # Use only 7.5% of the dataset
+    python -m scripts.run_ablations --data-path data/openhermes.json --data-percent 7.5
 """
 
 import argparse
@@ -17,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -84,6 +88,44 @@ def generate_ablation_configs() -> list[AblationConfig]:
     return configs
 
 
+def subset_data(input_path: str, percent: float, output_dir: str) -> str:
+    """
+    Subset a JSON/JSONL dataset to the first N percent of examples.
+
+    Returns path to the subsetted data file.
+    """
+    print(f"Subsetting data to {percent}% of {input_path}...")
+
+    # Load the data
+    with open(input_path, 'r') as f:
+        content = f.read().strip()
+        if content.startswith('['):
+            # JSON array format
+            data = json.loads(content)
+        else:
+            # JSONL format
+            data = [json.loads(line) for line in content.split('\n') if line.strip()]
+
+    total_samples = len(data)
+    subset_size = int(total_samples * percent / 100)
+    subset_data = data[:subset_size]
+
+    print(f"  Total samples: {total_samples:,}")
+    print(f"  Subset size: {subset_size:,} ({percent}%)")
+
+    # Save to output directory
+    os.makedirs(output_dir, exist_ok=True)
+    basename = os.path.basename(input_path)
+    name, ext = os.path.splitext(basename)
+    output_path = os.path.join(output_dir, f"{name}_{percent}pct{ext}")
+
+    with open(output_path, 'w') as f:
+        json.dump(subset_data, f)
+
+    print(f"  Saved to: {output_path}")
+    return output_path
+
+
 def run_single_ablation(
     config: AblationConfig,
     base_args: list[str],
@@ -117,21 +159,37 @@ def run_single_ablation(
     # Run the training
     result = subprocess.run(cmd, capture_output=False)
 
-    # Parse results from output config
-    results_file = os.path.join(run_output_dir, "final", "medusa_heads.pt")
-    config_file = os.path.join(run_output_dir, "config.json")
-
+    # Parse final loss from output
+    final_loss_file = os.path.join(run_output_dir, "final_loss.json")
     final_loss = float('inf')
-    if os.path.exists(config_file):
-        # Try to extract final loss from logs or checkpoint
-        # For now, we'll rely on wandb or manual inspection
-        pass
+    final_main_loss = float('inf')
+    final_head_losses = []
+    parsed_results = False
+
+    if os.path.exists(final_loss_file):
+        with open(final_loss_file, 'r') as f:
+            loss_data = json.load(f)
+            final_loss = loss_data.get('final_loss', float('inf'))
+            final_main_loss = loss_data.get('final_main_loss', float('inf'))
+            final_head_losses = loss_data.get('final_head_losses', [])
+            parsed_results = final_loss < float('inf')
+
+    # Check that we were able to parse results for successful runs
+    if result.returncode == 0 and not parsed_results:
+        print(f"WARNING: Run '{config.name}' succeeded but could not parse final_loss.json!")
+        print(f"  Expected file: {final_loss_file}")
+        print(f"  File exists: {os.path.exists(final_loss_file)}")
+    elif result.returncode != 0:
+        print(f"WARNING: Run '{config.name}' failed with return code {result.returncode}")
 
     return {
         "name": config.name,
         "config": vars(config),
         "output_dir": run_output_dir,
-        "success": result.returncode == 0,
+        "success": result.returncode == 0 and parsed_results,
+        "final_loss": final_loss,
+        "final_main_loss": final_main_loss,
+        "final_head_losses": final_head_losses,
     }
 
 
@@ -140,7 +198,9 @@ def main():
 
     # Data
     parser.add_argument("--data-path", type=str, required=True,
-                        help="Path to training data (7.5%% of OpenHermes)")
+                        help="Path to training data")
+    parser.add_argument("--data-percent", type=float, default=None,
+                        help="Subset data to first N%% (e.g., 7.5 for 7.5%%)")
     parser.add_argument("--val-data-path", type=str, default=None,
                         help="Path to validation data")
 
@@ -211,9 +271,14 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Subset data if requested
+    data_path = args.data_path
+    if args.data_percent is not None:
+        data_path = subset_data(args.data_path, args.data_percent, args.output_dir)
+
     # Base arguments shared by all runs
     base_args = [
-        f"--data-path={args.data_path}",
+        f"--data-path={data_path}",
         f"--device-batch-size={args.device_batch_size}",
         f"--total-batch-size={args.total_batch_size}",
         f"--max-seq-len={args.max_seq_len}",
@@ -256,16 +321,50 @@ def main():
 
     # Track results for greedy selection
     results = []
-    best_config = AblationConfig(name="baseline")  # Start with defaults
+    best_config = AblationConfig(name="best")  # Accumulates best settings
 
     print(f"\n{'#'*60}")
     print(f"# Gemma Medusa Ablation Study")
     print(f"# Output: {args.output_dir}")
     print(f"# Base model: {args.base_model}")
-    print(f"# Data: {args.data_path}")
+    print(f"# Data: {data_path}")
     print(f"# GPUs: {args.nproc}")
     print(f"# Ablations to run: {len(configs)}")
     print(f"{'#'*60}\n")
+
+    def select_best(candidates: list[dict], metric: str = "final_loss") -> dict | None:
+        """Select the result with lowest loss from candidates."""
+        valid = [r for r in candidates if r["success"] and r.get(metric, float('inf')) < float('inf')]
+        if not valid:
+            return None
+        return min(valid, key=lambda r: r[metric])
+
+    def update_best_config_after_phase(phase_name: str, phase_results: list[dict]):
+        """Update best_config based on phase results."""
+        best_result = select_best(phase_results)
+        if best_result is None:
+            print(f"  Warning: No successful runs in {phase_name}, keeping previous best")
+            return
+
+        best_name = best_result["name"]
+        best_loss = best_result["final_loss"]
+        print(f"\n>>> Phase {phase_name} winner: {best_name} (loss={best_loss:.6f})")
+
+        cfg = best_result["config"]
+        if phase_name == "zero_init":
+            best_config.zero_init_mlp = cfg["zero_init_mlp"]
+        elif phase_name == "lr":
+            best_config.proj_lr = cfg["proj_lr"]
+        elif phase_name == "rank":
+            best_config.lora_rank = cfg["lora_rank"]
+        elif phase_name == "alpha":
+            best_config.lora_alpha = cfg["lora_alpha"]
+        elif phase_name == "layers":
+            best_config.medusa_num_layers = cfg["medusa_num_layers"]
+
+    # Phase tracking
+    phase_results = []
+    current_phase = None
 
     for i, config in enumerate(configs):
         if skip_mode:
@@ -275,32 +374,44 @@ def main():
                 print(f"Skipping {config.name}...")
                 continue
 
-        # Apply best settings from previous phases
-        # Phase 2+: use best zero_init
-        if i >= 2 and results:
-            phase1_results = [r for r in results if r["name"] in ["baseline", "zero_init"]]
-            if phase1_results:
-                # For now, default to baseline unless zero_init clearly won
-                pass
+        # Determine which phase this config belongs to
+        if config.name in ["baseline", "zero_init"]:
+            new_phase = "zero_init"
+        elif config.name.startswith("lr_"):
+            new_phase = "lr"
+        elif config.name.startswith("rank_"):
+            new_phase = "rank"
+        elif config.name == "alpha_2x":
+            new_phase = "alpha"
+        elif config.name.startswith("layers_"):
+            new_phase = "layers"
+        else:
+            new_phase = "unknown"
 
-        # Phase 3+: use best lr
-        if i >= 4 and config.proj_lr == 0.002:  # Only override if using default
-            lr_results = [r for r in results if r["name"].startswith("lr_") or r["name"] == "baseline"]
-            # Would need actual loss values to pick best
+        # If phase changed, update best_config from previous phase
+        if current_phase is not None and new_phase != current_phase and phase_results:
+            update_best_config_after_phase(current_phase, phase_results)
+            phase_results = []
 
-        # Handle alpha_2x special case
-        if config.name == "alpha_2x":
-            config.lora_alpha = best_config.lora_rank * 2
+        current_phase = new_phase
 
-        # Merge best config with current ablation
+        # Build final config by merging current ablation with best_config
+        # Each phase tests one variable while using best values for others
         final_config = AblationConfig(
             name=config.name,
-            zero_init_mlp=config.zero_init_mlp if config.name in ["baseline", "zero_init"] else best_config.zero_init_mlp,
-            proj_lr=config.proj_lr if config.name.startswith("lr_") or config.name == "baseline" else best_config.proj_lr,
-            lora_rank=config.lora_rank if config.name.startswith("rank_") or config.name == "baseline" else best_config.lora_rank,
-            lora_alpha=config.lora_alpha,
-            medusa_num_layers=config.medusa_num_layers if config.name.startswith("layers_") or config.name == "baseline" else best_config.medusa_num_layers,
+            zero_init_mlp=config.zero_init_mlp if new_phase == "zero_init" else best_config.zero_init_mlp,
+            proj_lr=config.proj_lr if new_phase == "lr" else best_config.proj_lr,
+            lora_rank=config.lora_rank if new_phase == "rank" else best_config.lora_rank,
+            lora_alpha=(best_config.lora_rank * 2) if config.name == "alpha_2x" else best_config.lora_alpha,
+            medusa_num_layers=config.medusa_num_layers if new_phase == "layers" else best_config.medusa_num_layers,
         )
+
+        # For LR phase, include baseline in comparison
+        if new_phase == "lr" and config.name.startswith("lr_"):
+            # baseline result should be used as the "lr=0.002" comparison point
+            baseline_result = next((r for r in results if r["name"] == "baseline"), None)
+            if baseline_result and baseline_result not in phase_results:
+                phase_results.append(baseline_result)
 
         result = run_single_ablation(
             final_config,
@@ -310,23 +421,49 @@ def main():
             nproc=args.nproc,
         )
         results.append(result)
+        phase_results.append(result)
+
+        # Print result
+        if result["success"]:
+            print(f"  -> {config.name}: loss={result['final_loss']:.6f}")
+        else:
+            print(f"  -> {config.name}: FAILED")
 
         # Save intermediate results
         results_file = os.path.join(args.output_dir, "ablation_results.json")
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2, default=str)
 
+    # Final phase update
+    if phase_results:
+        update_best_config_after_phase(current_phase, phase_results)
+
+    # Save best config
+    best_config_file = os.path.join(args.output_dir, "best_config.json")
+    with open(best_config_file, 'w') as f:
+        json.dump(vars(best_config), f, indent=2)
+
     print(f"\n{'#'*60}")
     print(f"# Ablation study complete!")
     print(f"# Results saved to: {os.path.join(args.output_dir, 'ablation_results.json')}")
+    print(f"# Best config saved to: {best_config_file}")
     print(f"{'#'*60}\n")
 
     # Print summary
     print("\nSummary:")
-    print("-" * 40)
+    print("-" * 60)
     for r in results:
         status = "✓" if r["success"] else "✗"
-        print(f"  {status} {r['name']}")
+        loss_str = f"loss={r['final_loss']:.6f}" if r["success"] and r.get("final_loss", float('inf')) < float('inf') else "N/A"
+        print(f"  {status} {r['name']:20s} {loss_str}")
+
+    print("\nBest configuration found:")
+    print("-" * 60)
+    print(f"  zero_init_mlp:     {best_config.zero_init_mlp}")
+    print(f"  proj_lr:           {best_config.proj_lr}")
+    print(f"  lora_rank:         {best_config.lora_rank}")
+    print(f"  lora_alpha:        {best_config.lora_alpha}")
+    print(f"  medusa_num_layers: {best_config.medusa_num_layers}")
 
 
 if __name__ == "__main__":

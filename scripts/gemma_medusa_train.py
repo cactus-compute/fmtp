@@ -727,6 +727,18 @@ if __name__ == "__main__":
         torch.save(checkpoint, os.path.join(final_checkpoint_dir, "medusa_heads.pt"))
         print0(f"\nSaved final checkpoint to {final_checkpoint_dir}")
 
+        # Save final loss for ablation orchestration
+        final_loss_data = {
+            'final_loss': debiased_loss,
+            'final_main_loss': debiased_main_loss,
+            'final_head_losses': debiased_head_losses,
+            'total_training_time': total_training_time,
+            'num_iterations': num_iterations,
+        }
+        with open(os.path.join(args.output_dir, "final_loss.json"), 'w') as f:
+            json.dump(final_loss_data, f, indent=2)
+        print0(f"Saved final loss to {os.path.join(args.output_dir, 'final_loss.json')}")
+
     # Summary
     print0("\n" + "=" * 50)
     print0("Training complete!")
