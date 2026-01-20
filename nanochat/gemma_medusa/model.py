@@ -531,6 +531,85 @@ class GemmaMedusaModel(nn.Module):
         """Return only Medusa head parameters (for training)."""
         return self.medusa_heads.parameters()
 
+    def setup_optimizers(self, matrix_lr=0.02, proj_lr=0.004, weight_decay=0.0, adam_betas=(0.8, 0.95)):
+        """
+        Setup optimizers following nanochat's pattern:
+        - Muon for matrix params (ResBlock linears, LoRA A weights)
+        - AdamW for projection params (LoRA B weights)
+
+        Args:
+            matrix_lr: Learning rate for Muon (matrix parameters)
+            proj_lr: Learning rate for AdamW (projection parameters)
+            weight_decay: Weight decay for Muon
+            adam_betas: Betas for AdamW
+
+        Returns:
+            List of [adamw_optimizer, muon_optimizer]
+        """
+        from functools import partial
+        from nanochat.common import get_dist_info, print0
+        from nanochat.muon import Muon, DistMuon
+        from nanochat.adamw import DistAdamW
+
+        ddp, rank, local_rank, world_size = get_dist_info()
+        hidden_size = self._hidden_size
+
+        # Separate Medusa params into matrix (Muon) and projection (AdamW)
+        # Muon: Only ResBlock linears (2D matrix params)
+        # AdamW: LoRA A, LoRA B (all LoRA params)
+        medusa_matrix_params = []
+        medusa_proj_params = []
+
+        for head in self.medusa_heads:
+            # ResBlock linear weights -> Muon
+            for block in head.blocks:
+                medusa_matrix_params.append(block.linear.weight)
+            # LoRA A and B -> AdamW (user requested LoRA uses AdamW, not Muon)
+            if hasattr(head, 'lora_A'):
+                medusa_proj_params.append(head.lora_A.weight)
+            if hasattr(head, 'lora_B'):
+                medusa_proj_params.append(head.lora_B.weight)
+
+        # Scale LR by 1/sqrt(hidden_size/768) like nanochat does
+        dmodel_lr_scale = (hidden_size / 768) ** -0.5
+        print0(f"Scaling AdamW LR by 1/sqrt({hidden_size}/768) = {dmodel_lr_scale:.4f}")
+
+        # AdamW for projection params
+        adam_groups = []
+        if medusa_proj_params:
+            adam_groups.append(dict(params=medusa_proj_params, lr=proj_lr * dmodel_lr_scale))
+
+        adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0)
+        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
+
+        if adam_groups:
+            adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+        else:
+            # Dummy optimizer if no AdamW params
+            adamw_optimizer = torch.optim.AdamW([torch.zeros(1, device=self._device)], lr=1e-10)
+
+        # Muon for matrix params
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
+        MuonFactory = DistMuon if ddp else Muon
+
+        if medusa_matrix_params:
+            muon_optimizer = MuonFactory(medusa_matrix_params, **muon_kwargs)
+        else:
+            # Dummy optimizer if no Muon params
+            muon_optimizer = torch.optim.SGD([torch.zeros(1, device=self._device)], lr=1e-10)
+
+        optimizers = [adamw_optimizer, muon_optimizer]
+
+        # Store initial LR for scheduling
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+
+        print0(f"Medusa matrix params (Muon): {sum(p.numel() for p in medusa_matrix_params):,}")
+        print0(f"Medusa proj params (AdamW): {sum(p.numel() for p in medusa_proj_params):,}")
+
+        return optimizers
+
 
 def load_gemma_medusa_model(
     model_name: str = "google/gemma-3-1b-it",

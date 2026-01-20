@@ -224,21 +224,21 @@ if __name__ == "__main__":
     parser.add_argument("--num-iterations", type=int, default=-1,
                         help="Override number of iterations (-1 = use num_epochs)")
 
-    # Batch sizes and optimization
+    # Batch sizes and optimization (nanochat-style: Muon for matrices, AdamW for projections)
     parser.add_argument("--batch-size", type=int, default=4,
                         help="Per-device batch size")
     parser.add_argument("--target-batch-size", type=int, default=32,
                         help="Target batch size for gradient accumulation")
-    parser.add_argument("--learning-rate", type=float, default=1e-4,
-                        help="Learning rate for Medusa heads")
-    parser.add_argument("--weight-decay", type=float, default=0.01,
-                        help="Weight decay")
-    parser.add_argument("--warmup-ratio", type=float, default=0.1,
-                        help="Ratio of iterations for LR warmup")
-    parser.add_argument("--adam-beta1", type=float, default=0.9,
-                        help="Adam beta1")
-    parser.add_argument("--adam-beta2", type=float, default=0.999,
-                        help="Adam beta2")
+    parser.add_argument("--matrix-lr", type=float, default=0.02,
+                        help="Learning rate for matrix params (Muon optimizer)")
+    parser.add_argument("--proj-lr", type=float, default=0.004,
+                        help="Learning rate for projection params (AdamW optimizer)")
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                        help="Weight decay for Muon optimizer")
+    parser.add_argument("--init-lr-frac", type=float, default=0.02,
+                        help="Initial LR as fraction of base LR (for warmup)")
+    parser.add_argument("--adam-betas", type=float, nargs=2, default=[0.8, 0.95],
+                        help="Adam betas (default: 0.8 0.95, nanochat-style)")
 
     # Medusa loss configuration
     parser.add_argument("--medusa-loss-weight", type=float, default=1.0,
@@ -351,28 +351,25 @@ if __name__ == "__main__":
         num_iterations = iterations_per_epoch * args.num_epochs
     print0(f"Total iterations: {num_iterations}")
 
-    warmup_iters = int(args.warmup_ratio * num_iterations)
-    print0(f"Warmup iterations: {warmup_iters}")
-
     # -----------------------------------------------------------------------------
-    # Setup optimizer
+    # Setup optimizer (nanochat-style: Muon + AdamW)
 
-    # Only optimize Medusa parameters
-    optimizer = torch.optim.AdamW(
-        model.medusa_parameters(),
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
+    optimizers = model.setup_optimizers(
+        matrix_lr=args.matrix_lr,
+        proj_lr=args.proj_lr,
         weight_decay=args.weight_decay,
+        adam_betas=tuple(args.adam_betas),
     )
 
-    # Learning rate scheduler with warmup and linear decay
+    # Set initial LR fraction for warmup (nanochat-style)
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * args.init_lr_frac
+
+    # Linear warmdown LR schedule (nanochat-style: ramp up then linear decay)
     def get_lr_multiplier(it):
-        if it < warmup_iters:
-            return (it + 1) / warmup_iters
-        else:
-            # Linear decay to 0
-            progress = (it - warmup_iters) / (num_iterations - warmup_iters)
-            return max(0.0, 1.0 - progress)
+        # Linear decay from 1.0 to 0.0 over training
+        return 1.0 - it / num_iterations
 
     # -----------------------------------------------------------------------------
     # Setup data loaders
@@ -400,7 +397,10 @@ if __name__ == "__main__":
             print0(f"Resuming from: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=device)
             model.medusa_heads.load_state_dict(checkpoint['medusa_heads'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            # Load optimizer states if available
+            if 'optimizers' in checkpoint:
+                for opt, state in zip(optimizers, checkpoint['optimizers']):
+                    opt.load_state_dict(state)
             start_step = checkpoint['step']
             print0(f"Resumed from step {start_step}")
         else:
@@ -495,7 +495,7 @@ if __name__ == "__main__":
             checkpoint = {
                 'step': step,
                 'medusa_heads': model.medusa_heads.state_dict(),
-                'optimizer': optimizer.state_dict(),
+                'optimizers': [opt.state_dict() for opt in optimizers],
                 'config': user_config,
             }
             torch.save(checkpoint, os.path.join(checkpoint_dir, "medusa_heads.pt"))
@@ -542,14 +542,16 @@ if __name__ == "__main__":
         total_main_loss /= grad_accum_steps
         total_head_losses = [hl / grad_accum_steps for hl in total_head_losses]
 
-        # Learning rate schedule
+        # Learning rate schedule (nanochat-style linear warmdown)
         lrm = get_lr_multiplier(step)
-        for group in optimizer.param_groups:
-            group['lr'] = args.learning_rate * lrm
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group['lr'] = group['initial_lr'] * lrm
 
         # Gradient step
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
 
         synchronize()
         t1 = time.time()
@@ -575,7 +577,7 @@ if __name__ == "__main__":
         debiased_head_losses = [shl / debias for shl in smooth_head_losses]
 
         pct_done = 100 * step / num_iterations
-        current_lr = args.learning_rate * lrm
+        current_lr = optimizers[0].param_groups[0]['lr']  # AdamW lr for logging
         print0(f"Step {step:05d}/{num_iterations:05d} ({pct_done:.1f}%) | loss: {debiased_loss:.6f} | main: {debiased_main_loss:.6f} | lr: {current_lr:.2e} | dt: {dt*1000:.0f}ms | epoch: {current_epoch}")
 
         if step % 10 == 0:
@@ -600,7 +602,7 @@ if __name__ == "__main__":
         checkpoint = {
             'step': num_iterations,
             'medusa_heads': model.medusa_heads.state_dict(),
-            'optimizer': optimizer.state_dict(),
+            'optimizers': [opt.state_dict() for opt in optimizers],
             'config': user_config,
         }
         torch.save(checkpoint, os.path.join(final_checkpoint_dir, "medusa_heads.pt"))
