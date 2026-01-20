@@ -535,11 +535,16 @@ class GemmaMedusaModel(nn.Module):
         )
         hidden_states = outputs.last_hidden_state
 
-        # NaN detection for debugging
-        if self.training and torch.isnan(hidden_states).any():
-            print(f"[NaN DEBUG] NaN in hidden_states from base model!", flush=True)
-            print(f"[NaN DEBUG]   hidden_states shape: {hidden_states.shape}", flush=True)
-            print(f"[NaN DEBUG]   hidden_states has {torch.isnan(hidden_states).sum().item()} NaN values", flush=True)
+        # NaN/Inf detection for debugging
+        if self.training:
+            if torch.isnan(hidden_states).any():
+                print(f"[NaN DEBUG] NaN in hidden_states from base model!", flush=True)
+                print(f"[NaN DEBUG]   hidden_states shape: {hidden_states.shape}", flush=True)
+                print(f"[NaN DEBUG]   hidden_states has {torch.isnan(hidden_states).sum().item()} NaN values", flush=True)
+            if torch.isinf(hidden_states).any():
+                print(f"[NaN DEBUG] Inf in hidden_states from base model!", flush=True)
+                print(f"[NaN DEBUG]   hidden_states max: {hidden_states.max().item()}", flush=True)
+                print(f"[NaN DEBUG]   hidden_states min: {hidden_states.min().item()}", flush=True)
 
         return hidden_states
 
@@ -612,9 +617,12 @@ class GemmaMedusaModel(nn.Module):
             x = hidden_states
             for block in head.blocks:
                 x = block(x)
-            # NaN detection after ResBlocks
-            if self.training and torch.isnan(x).any():
-                print(f"[NaN DEBUG] NaN after ResBlock for head {head_idx}!", flush=True)
+            # NaN/Inf detection after ResBlocks
+            if self.training:
+                if torch.isnan(x).any():
+                    print(f"[NaN DEBUG] NaN after ResBlock for head {head_idx}!", flush=True)
+                if torch.isinf(x).any():
+                    print(f"[NaN DEBUG] Inf after ResBlock for head {head_idx}! max={x.max().item()}, min={x.min().item()}", flush=True)
             resblock_outputs.append(x)  # (B, T, hidden_size)
 
         # Step 2: Stack ResBlock outputs and do batched lora_A projection
@@ -635,25 +643,35 @@ class GemmaMedusaModel(nn.Module):
         # lora_A projection: (num_heads, rank, hidden)
         lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
 
-        # NaN detection after lora_A
-        if self.training and torch.isnan(lora_a_out).any():
-            print(f"[NaN DEBUG] NaN after lora_A projection!", flush=True)
-            print(f"[NaN DEBUG]   stacked_resblock has NaN: {torch.isnan(stacked_resblock).any()}", flush=True)
-            print(f"[NaN DEBUG]   stacked_lora_a has NaN: {torch.isnan(stacked_lora_a).any()}", flush=True)
+        # NaN/Inf detection after lora_A
+        if self.training:
+            if torch.isnan(lora_a_out).any():
+                print(f"[NaN DEBUG] NaN after lora_A projection!", flush=True)
+                print(f"[NaN DEBUG]   stacked_resblock has NaN: {torch.isnan(stacked_resblock).any()}", flush=True)
+                print(f"[NaN DEBUG]   stacked_lora_a has NaN: {torch.isnan(stacked_lora_a).any()}", flush=True)
+            if torch.isinf(lora_a_out).any():
+                print(f"[NaN DEBUG] Inf after lora_A projection! max={lora_a_out.max().item()}, min={lora_a_out.min().item()}", flush=True)
             for i, head in enumerate(self.medusa_heads):
-                print(f"[NaN DEBUG]   head{i} lora_A weight max: {head.lora_A.weight.abs().max().item():.4f}", flush=True)
+                w_max = head.lora_A.weight.abs().max().item()
+                if w_max > 1e4:
+                    print(f"[NaN DEBUG]   head{i} lora_A weight max: {w_max:.4f} (LARGE!)", flush=True)
 
         # Step 3: Batched lora_B projection
         # (num_heads, B, T, rank) @ (num_heads, vocab, rank).T -> (num_heads, B, T, vocab)
         lora_deltas = torch.einsum('hbtr,hvr->hbtv', lora_a_out, stacked_lora_b)
 
-        # NaN detection after lora_B
-        if self.training and torch.isnan(lora_deltas).any():
-            print(f"[NaN DEBUG] NaN after lora_B projection!", flush=True)
-            print(f"[NaN DEBUG]   lora_a_out has NaN: {torch.isnan(lora_a_out).any()}", flush=True)
-            print(f"[NaN DEBUG]   stacked_lora_b has NaN: {torch.isnan(stacked_lora_b).any()}", flush=True)
+        # NaN/Inf detection after lora_B
+        if self.training:
+            if torch.isnan(lora_deltas).any():
+                print(f"[NaN DEBUG] NaN after lora_B projection!", flush=True)
+                print(f"[NaN DEBUG]   lora_a_out has NaN: {torch.isnan(lora_a_out).any()}", flush=True)
+                print(f"[NaN DEBUG]   stacked_lora_b has NaN: {torch.isnan(stacked_lora_b).any()}", flush=True)
+            if torch.isinf(lora_deltas).any():
+                print(f"[NaN DEBUG] Inf after lora_B projection! max={lora_deltas.max().item()}, min={lora_deltas.min().item()}", flush=True)
             for i, head in enumerate(self.medusa_heads):
-                print(f"[NaN DEBUG]   head{i} lora_B weight max: {head.lora_B.weight.abs().max().item():.4f}", flush=True)
+                w_max = head.lora_B.weight.abs().max().item()
+                if w_max > 1e4:
+                    print(f"[NaN DEBUG]   head{i} lora_B weight max: {w_max:.4f} (LARGE!)", flush=True)
 
         # Step 4: Apply per-head scaling
         lora_deltas = lora_deltas * scalings.view(num_heads, 1, 1, 1)
@@ -662,11 +680,15 @@ class GemmaMedusaModel(nn.Module):
         all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)  # (num_heads+1, B, T, hidden)
         base_logits = self.base_model.lm_head(all_hiddens)  # (num_heads+1, B, T, vocab)
 
-        # NaN detection after lm_head
-        if self.training and torch.isnan(base_logits).any():
-            print(f"[NaN DEBUG] NaN after lm_head projection!", flush=True)
-            print(f"[NaN DEBUG]   all_hiddens has NaN: {torch.isnan(all_hiddens).any()}", flush=True)
-            print(f"[NaN DEBUG]   lm_head weight max: {self.base_model.lm_head.weight.abs().max().item():.4f}", flush=True)
+        # NaN/Inf detection after lm_head
+        if self.training:
+            if torch.isnan(base_logits).any():
+                print(f"[NaN DEBUG] NaN after lm_head projection!", flush=True)
+                print(f"[NaN DEBUG]   all_hiddens has NaN: {torch.isnan(all_hiddens).any()}", flush=True)
+            if torch.isinf(base_logits).any():
+                print(f"[NaN DEBUG] Inf after lm_head projection! max={base_logits.max().item()}, min={base_logits.min().item()}", flush=True)
+                print(f"[NaN DEBUG]   all_hiddens has Inf: {torch.isinf(all_hiddens).any()}", flush=True)
+                print(f"[NaN DEBUG]   lm_head weight max: {self.base_model.lm_head.weight.abs().max().item():.4f}", flush=True)
 
         medusa_logits = base_logits[1:] + lora_deltas  # (num_heads, B, T, vocab)
 
@@ -712,6 +734,20 @@ class GemmaMedusaModel(nn.Module):
             # Training mode - compute losses
             vocab_size = main_logits.shape[-1]
 
+            # NaN/Inf detection before loss computation
+            if self.training:
+                if torch.isnan(main_logits).any():
+                    print(f"[NaN DEBUG] NaN in main_logits before CE loss!", flush=True)
+                if torch.isinf(main_logits).any():
+                    print(f"[NaN DEBUG] Inf in main_logits before CE loss!", flush=True)
+                    print(f"[NaN DEBUG]   main_logits max: {main_logits.max().item()}", flush=True)
+                    print(f"[NaN DEBUG]   main_logits min: {main_logits.min().item()}", flush=True)
+                # Check targets for invalid values
+                valid_targets = targets[targets != -1]
+                if valid_targets.numel() > 0:
+                    if (valid_targets < 0).any() or (valid_targets >= vocab_size).any():
+                        print(f"[NaN DEBUG] Invalid target IDs! min={valid_targets.min().item()}, max={valid_targets.max().item()}, vocab_size={vocab_size}", flush=True)
+
             # Main loss
             main_loss = F.cross_entropy(
                 main_logits.view(-1, vocab_size),
@@ -720,7 +756,20 @@ class GemmaMedusaModel(nn.Module):
                 reduction=loss_reduction,
             )
 
+            # NaN detection after main loss
+            if self.training and torch.isnan(main_loss):
+                print(f"[NaN DEBUG] NaN in main_loss after CE!", flush=True)
+
             if return_medusa and medusa_logits is not None:
+                # NaN/Inf detection for medusa logits
+                if self.training:
+                    if torch.isnan(medusa_logits).any():
+                        print(f"[NaN DEBUG] NaN in medusa_logits before CE loss!", flush=True)
+                    if torch.isinf(medusa_logits).any():
+                        print(f"[NaN DEBUG] Inf in medusa_logits before CE loss!", flush=True)
+                        print(f"[NaN DEBUG]   medusa_logits max: {medusa_logits.max().item()}", flush=True)
+                        print(f"[NaN DEBUG]   medusa_logits min: {medusa_logits.min().item()}", flush=True)
+
                 # Compute per-head losses
                 # Head k predicts token at position t+k+2
                 medusa_losses = []
@@ -739,6 +788,15 @@ class GemmaMedusaModel(nn.Module):
                         ignore_index=-1,
                         reduction=loss_reduction,
                     )
+
+                    # NaN detection per head
+                    if self.training and torch.isnan(head_loss):
+                        print(f"[NaN DEBUG] NaN in head{k}_loss after CE!", flush=True)
+                        print(f"[NaN DEBUG]   head_logits has NaN: {torch.isnan(head_logits).any()}", flush=True)
+                        print(f"[NaN DEBUG]   head_logits has Inf: {torch.isinf(head_logits).any()}", flush=True)
+                        if torch.isinf(head_logits).any():
+                            print(f"[NaN DEBUG]   head_logits max: {head_logits.max().item()}", flush=True)
+
                     medusa_losses.append(head_loss)
 
                 return main_loss, medusa_losses
