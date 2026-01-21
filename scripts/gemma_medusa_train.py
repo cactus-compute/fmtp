@@ -551,26 +551,8 @@ if __name__ == "__main__":
                     use_chunked_loss=args.use_chunked_loss, chunk_size=args.chunk_size
                 )
 
-                # Check for NaN in losses (print from all ranks, not just master)
-                if torch.isnan(main_loss) or any(torch.isnan(hl) for hl in head_losses):
-                    print(f"[rank{ddp_rank}] NaN detected at step {step}, micro_step {micro_step}", flush=True)
-                    print(f"[rank{ddp_rank}]   main_loss: {main_loss.item() if not torch.isnan(main_loss) else 'NaN'}", flush=True)
-                    for k, hl in enumerate(head_losses):
-                        print(f"[rank{ddp_rank}]   head{k}_loss: {hl.item() if not torch.isnan(hl) else 'NaN'}", flush=True)
-                    # Check for NaN/Inf in model weights
-                    for name, param in model.named_parameters():
-                        if param.requires_grad:
-                            if torch.isnan(param).any():
-                                print(f"[rank{ddp_rank}]   NaN in param: {name}", flush=True)
-                            if torch.isinf(param).any():
-                                print(f"[rank{ddp_rank}]   Inf in param: {name}", flush=True)
-                    # Check hidden states if available
-                    print(f"[rank{ddp_rank}]   input shape: {train_inputs.shape}", flush=True)
-                    print(f"[rank{ddp_rank}]   target shape: {train_targets.shape}", flush=True)
-                    raise RuntimeError(f"NaN loss at step {step}")
-
                 # Compute total loss with weighting
-                loss = main_loss.clone()
+                loss = main_loss
                 for k, head_loss in enumerate(head_losses):
                     if args.medusa_loss_scheme == "decay":
                         weight = args.medusa_loss_weight ** (k + 1)
@@ -587,18 +569,6 @@ if __name__ == "__main__":
             # Normalize and backward
             (loss / grad_accum_steps).backward()
 
-            # Check for NaN in gradients after backward (print from all ranks)
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    if torch.isnan(param.grad).any():
-                        print(f"[rank{ddp_rank}] NaN gradient at step {step}, micro_step {micro_step} in: {name}", flush=True)
-                        print(f"[rank{ddp_rank}]   grad norm: {param.grad.norm().item()}", flush=True)
-                        print(f"[rank{ddp_rank}]   weight norm: {param.norm().item()}", flush=True)
-                        raise RuntimeError(f"NaN gradient at step {step}")
-                    if torch.isinf(param.grad).any():
-                        print(f"[rank{ddp_rank}] Inf gradient at step {step}, micro_step {micro_step} in: {name}", flush=True)
-                        raise RuntimeError(f"Inf gradient at step {step}")
-
         # Average over accumulation steps
         total_loss /= grad_accum_steps
         total_main_loss /= grad_accum_steps
@@ -610,43 +580,10 @@ if __name__ == "__main__":
             for group in opt.param_groups:
                 group['lr'] = group['initial_lr'] * lrm
 
-        # Compute gradient norms before optimizer step (for logging)
-        grad_norms = {}
-        total_grad_norm_sq = 0.0
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.grad is not None:
-                grad_norm = param.grad.norm().item()
-                total_grad_norm_sq += grad_norm ** 2
-                # Track per-component gradient norms
-                if 'lora_A' in name:
-                    grad_norms.setdefault('lora_A', []).append(grad_norm)
-                elif 'lora_B' in name:
-                    grad_norms.setdefault('lora_B', []).append(grad_norm)
-                elif 'blocks' in name:
-                    grad_norms.setdefault('resblock', []).append(grad_norm)
-        total_grad_norm = total_grad_norm_sq ** 0.5
-
         # Gradient step
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
-
-        # Compute weight norms after optimizer step (for logging)
-        weight_norms = {}
-        weight_maxes = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                w_norm = param.norm().item()
-                w_max = param.abs().max().item()
-                if 'lora_A' in name:
-                    weight_norms.setdefault('lora_A', []).append(w_norm)
-                    weight_maxes.setdefault('lora_A', []).append(w_max)
-                elif 'lora_B' in name:
-                    weight_norms.setdefault('lora_B', []).append(w_norm)
-                    weight_maxes.setdefault('lora_B', []).append(w_max)
-                elif 'blocks' in name:
-                    weight_norms.setdefault('resblock', []).append(w_norm)
-                    weight_maxes.setdefault('resblock', []).append(w_max)
 
         synchronize()
         t1 = time.time()
@@ -683,9 +620,40 @@ if __name__ == "__main__":
         else:
             eta_str = ""
 
-        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_loss:.6f} | main: {debiased_main_loss:.6f} | gnorm: {total_grad_norm:.2f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_loss:.6f} | main: {debiased_main_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
 
-        if step % 100 == 0:
+        if step % 20 == 0:
+            # Compute gradient and weight norms only when logging
+            grad_norms = {}
+            total_grad_norm_sq = 0.0
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    total_grad_norm_sq += grad_norm ** 2
+                    if 'lora_A' in name:
+                        grad_norms.setdefault('lora_A', []).append(grad_norm)
+                    elif 'lora_B' in name:
+                        grad_norms.setdefault('lora_B', []).append(grad_norm)
+                    elif 'blocks' in name:
+                        grad_norms.setdefault('resblock', []).append(grad_norm)
+            total_grad_norm = total_grad_norm_sq ** 0.5
+
+            weight_norms = {}
+            weight_maxes = {}
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    w_norm = param.norm().item()
+                    w_max = param.abs().max().item()
+                    if 'lora_A' in name:
+                        weight_norms.setdefault('lora_A', []).append(w_norm)
+                        weight_maxes.setdefault('lora_A', []).append(w_max)
+                    elif 'lora_B' in name:
+                        weight_norms.setdefault('lora_B', []).append(w_norm)
+                        weight_maxes.setdefault('lora_B', []).append(w_max)
+                    elif 'blocks' in name:
+                        weight_norms.setdefault('resblock', []).append(w_norm)
+                        weight_maxes.setdefault('resblock', []).append(w_max)
+
             log_data = {
                 "step": step,
                 "total_training_time": total_training_time,
