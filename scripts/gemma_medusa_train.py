@@ -504,7 +504,10 @@ if __name__ == "__main__":
             for eval_step in range(args.eval_steps):
                 (val_inputs, val_targets), _ = next(val_loader)
                 with torch.no_grad(), autocast_ctx:
-                    main_loss, head_losses = model(val_inputs, val_targets, return_medusa=True)
+                    main_loss, head_losses = model(
+                        val_inputs, val_targets, return_medusa=True,
+                        use_chunked_loss=args.use_chunked_loss, chunk_size=args.chunk_size
+                    )
                     total_loss = main_loss.clone()
                     for k, head_loss in enumerate(head_losses):
                         if args.medusa_loss_scheme == "decay":
