@@ -268,10 +268,14 @@ if __name__ == "__main__":
                         help="Chunk size for chunked loss computation (default: 128)")
 
     # Evaluation
-    parser.add_argument("--eval-every", type=int, default=250,
+    parser.add_argument("--eval-every", type=int, default=100,
                         help="Evaluate validation loss every N steps (-1 = disable)")
-    parser.add_argument("--eval-steps", type=int, default=50,
+    parser.add_argument("--eval-steps", type=int, default=10,
                         help="Number of batches for validation evaluation")
+    parser.add_argument("--val-samples", type=int, default=960,
+                        help="Number of samples to split off for validation (default: 960 = 8 batches of 120)")
+    parser.add_argument("--log-every", type=int, default=20,
+                        help="Log detailed metrics (grad norms, weight norms) to wandb every N steps")
     parser.add_argument("--save-every", type=int, default=-1,
                         help="Save checkpoint every N steps (-1 = only at end)")
 
@@ -347,14 +351,28 @@ if __name__ == "__main__":
     else:
         print0("Skipping dataset filtering (--skip-filter)")
 
+    # Split off validation data
     val_data = None
     if args.val_data_path:
+        # Use explicit validation file if provided
         print0(f"Loading validation data from: {args.val_data_path}")
         val_data = load_sharegpt_data(args.val_data_path)
         print0(f"Loaded {len(val_data)} validation conversations")
         if not args.skip_filter:
             val_data, val_skipped = filter_dataset(val_data, tokenizer, args.max_seq_len, min_valid_tokens=1)
             print0(f"Filtered to {len(val_data)} validation conversations (skipped {val_skipped})")
+    elif args.val_samples > 0:
+        # Split off validation samples from training data
+        import random
+        random.seed(42)  # Deterministic split
+        indices = list(range(len(train_data)))
+        random.shuffle(indices)
+        val_indices = indices[:args.val_samples]
+        train_indices = indices[args.val_samples:]
+        val_data = [train_data[i] for i in val_indices]
+        train_data = [train_data[i] for i in train_indices]
+        print0(f"Split off {len(val_data)} validation samples from training data")
+        print0(f"Remaining training samples: {len(train_data)}")
 
     # -----------------------------------------------------------------------------
     # Calculate training schedule
@@ -580,6 +598,25 @@ if __name__ == "__main__":
             for group in opt.param_groups:
                 group['lr'] = group['initial_lr'] * lrm
 
+        # Compute gradient norms BEFORE optimizer step (for logging)
+        if step % args.log_every == 0:
+            grad_norms = {}
+            total_grad_norm_sq = 0.0
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    total_grad_norm_sq += grad_norm ** 2
+                    if 'lora_A' in name:
+                        grad_norms.setdefault('lora_A', []).append(grad_norm)
+                    elif 'lora_B' in name:
+                        grad_norms.setdefault('lora_B', []).append(grad_norm)
+                    elif 'blocks' in name:
+                        grad_norms.setdefault('resblock', []).append(grad_norm)
+            total_grad_norm = total_grad_norm_sq ** 0.5
+        else:
+            grad_norms = {}
+            total_grad_norm = 0.0
+
         # Gradient step
         for opt in optimizers:
             opt.step()
@@ -622,22 +659,8 @@ if __name__ == "__main__":
 
         print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_loss:.6f} | main: {debiased_main_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
 
-        if step % 20 == 0:
-            # Compute gradient and weight norms only when logging
-            grad_norms = {}
-            total_grad_norm_sq = 0.0
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    grad_norm = param.grad.norm().item()
-                    total_grad_norm_sq += grad_norm ** 2
-                    if 'lora_A' in name:
-                        grad_norms.setdefault('lora_A', []).append(grad_norm)
-                    elif 'lora_B' in name:
-                        grad_norms.setdefault('lora_B', []).append(grad_norm)
-                    elif 'blocks' in name:
-                        grad_norms.setdefault('resblock', []).append(grad_norm)
-            total_grad_norm = total_grad_norm_sq ** 0.5
-
+        if step % args.log_every == 0:
+            # Compute weight norms for logging (grad norms already computed above)
             weight_norms = {}
             weight_maxes = {}
             for name, param in model.named_parameters():
