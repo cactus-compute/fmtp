@@ -5,6 +5,7 @@ Contains all Medusa head variants:
 - MedusaResBlock: Residual block with SiLU activation
 - MedusaHead: Full projection head (hidden -> vocab)
 - MedusaLoRAHead: Low-rank adapter head (hidden -> rank -> vocab)
+- MedusaLoRAHeadWithMixer: MedusaLoRAHead with cross-head MLP mixing
 - MedusaDeltaHead: Hidden-space delta head (reuses lm_head)
 - IndependentMedusaHead: Deprecated, use MedusaDeltaHead instead
 """
@@ -75,6 +76,106 @@ class MedusaLoRAHead(nn.Module):
     def get_merged_weight(self, lm_head_weight):
         """Merge LoRA weights for fused CE: W_merged = W_base + scaling * B @ A"""
         return lm_head_weight + self.scaling * (self.lora_B.weight @ self.lora_A.weight)
+
+
+class MedusaLoRAHeadWithMixer(MedusaLoRAHead):
+    """
+    MedusaLoRAHead with cross-head MLP mixing for improved multi-token prediction.
+
+    This extends MedusaLoRAHead to support mixing information across multiple heads.
+    The mixer is a small MLP that operates on the head dimension, allowing head k
+    to leverage information from heads 0..k-1 for better sequential token prediction.
+
+    The mixer is applied to the stacked ResBlock outputs before LoRA projection.
+    Since num_heads is typically 4-5, this adds negligible compute overhead
+    (~128 parameters for 4 heads with mixer_hidden=16).
+
+    Architecture:
+        1. Each head computes ResBlock(hidden_states) independently
+        2. Stack outputs: (num_heads, B, T, hidden_size)
+        3. Mix across heads: MLP(num_heads -> mixer_hidden -> num_heads) + residual
+        4. Each head applies its LoRA projection to its mixed output
+
+    The residual connection ensures the mixer starts as identity (when zero-initialized)
+    and can learn to add cross-head information gradually.
+
+    Note: This class is designed to work with GemmaMedusaModel which handles the
+    stacking and mixing coordination. Individual forward() calls work like the
+    parent class for backward compatibility.
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        vocab_size: int,
+        num_layers: int,
+        lora_rank: int,
+        lora_alpha: int | None = None,
+        zero_init_mlp: bool = False,
+        num_heads: int = 4,
+        mixer_hidden: int = 16,
+    ):
+        super().__init__(
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            num_layers=num_layers,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            zero_init_mlp=zero_init_mlp,
+        )
+        self.num_heads = num_heads
+        self.mixer_hidden = mixer_hidden
+
+        # Cross-head mixer MLP: num_heads -> mixer_hidden -> num_heads
+        # This is shared across all heads and applied after ResBlocks
+        self.mixer_fc1 = nn.Linear(num_heads, mixer_hidden, bias=False)
+        self.mixer_fc2 = nn.Linear(mixer_hidden, num_heads, bias=False)
+
+        # Zero-init fc2 so mixer starts as identity (residual only)
+        nn.init.zeros_(self.mixer_fc2.weight)
+
+    @staticmethod
+    def apply_mixer(
+        stacked_resblock: torch.Tensor,
+        mixer_fc1: nn.Linear,
+        mixer_fc2: nn.Linear,
+        channel_fc: nn.Linear | None = None,
+    ) -> torch.Tensor:
+        """
+        Apply cross-head mixing to stacked ResBlock outputs, followed by channel mixing.
+
+        This follows the MLP-Mixer pattern:
+        1. Head mixing: MLP across the num_heads dimension (token-mixing analog)
+        2. Channel mixing: MLP across the hidden dimension (channel-mixing analog)
+
+        Both use residual connections for stable training.
+
+        Args:
+            stacked_resblock: (num_heads, B, T, hidden_size) - stacked head outputs
+            mixer_fc1: First layer of head mixer MLP
+            mixer_fc2: Second layer of head mixer MLP
+            channel_fc: Channel mixing linear (hidden -> hidden), optional
+
+        Returns:
+            (num_heads, B, T, hidden_size) - mixed head outputs
+        """
+        # Step 1: Head mixing (mix across num_heads dimension)
+        # Permute to (B, T, hidden_size, num_heads) for mixing
+        x_perm = stacked_resblock.permute(1, 2, 3, 0)
+
+        # MLP mixing across heads with residual
+        mixed = mixer_fc1(x_perm)
+        mixed = F.gelu(mixed)
+        mixed = mixer_fc2(mixed)
+
+        # Permute back and add residual
+        mixed = mixed.permute(3, 0, 1, 2)
+        x = stacked_resblock + mixed  # (num_heads, B, T, hidden_size)
+
+        # Step 2: Channel mixing (mix across hidden dimension) - ResBlock style
+        if channel_fc is not None:
+            x = x + F.silu(channel_fc(x))
+
+        return x
 
 
 class IndependentMedusaHead(nn.Module):

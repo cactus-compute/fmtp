@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoConfig
 
 from .config import GemmaConfigWrapper, GemmaMedusaConfig
-from .heads import MedusaLoRAHead, MedusaResBlock
+from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaResBlock
 
 
 @dataclass
@@ -407,6 +407,8 @@ class GemmaMedusaModel(nn.Module):
         dtype=None,
         freeze_base: bool = True,
         zero_init_mlp: bool = False,
+        use_head_mixer: bool = False,
+        mixer_hidden: int = 16,
     ):
         super().__init__()
         self.model_name = model_name
@@ -415,6 +417,8 @@ class GemmaMedusaModel(nn.Module):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha if lora_alpha is not None else lora_rank
         self.zero_init_mlp = zero_init_mlp
+        self.use_head_mixer = use_head_mixer
+        self.mixer_hidden = mixer_hidden
 
         # Determine device and dtype
         if device is None:
@@ -466,6 +470,24 @@ class GemmaMedusaModel(nn.Module):
         ])
         # Move heads to device and dtype
         self.medusa_heads = self.medusa_heads.to(device=device, dtype=dtype)
+
+        # Create cross-head mixer if enabled (single shared module)
+        if use_head_mixer:
+            # Head mixing MLP: num_heads -> mixer_hidden -> num_heads
+            self.head_mixer_fc1 = nn.Linear(medusa_num_heads, mixer_hidden, bias=False)
+            self.head_mixer_fc2 = nn.Linear(mixer_hidden, medusa_num_heads, bias=False)
+            # Channel mixing MLP: hidden_size -> hidden_size (ResBlock style)
+            self.channel_mixer_fc = nn.Linear(hidden_size, hidden_size, bias=False)
+            # Zero-init output layers so mixer starts as identity
+            nn.init.zeros_(self.head_mixer_fc2.weight)
+            nn.init.zeros_(self.channel_mixer_fc.weight)
+            self.head_mixer_fc1 = self.head_mixer_fc1.to(device=device, dtype=dtype)
+            self.head_mixer_fc2 = self.head_mixer_fc2.to(device=device, dtype=dtype)
+            self.channel_mixer_fc = self.channel_mixer_fc.to(device=device, dtype=dtype)
+        else:
+            self.head_mixer_fc1 = None
+            self.head_mixer_fc2 = None
+            self.channel_mixer_fc = None
 
         # Pre-compute stacked weights and scalings for efficient batched forward
         self._cache_stacked_weights()
@@ -628,6 +650,15 @@ class GemmaMedusaModel(nn.Module):
         # Step 2: Stack ResBlock outputs and do batched lora_A projection
         stacked_resblock = torch.stack(resblock_outputs, dim=0)  # (num_heads, B, T, hidden)
 
+        # Step 2.5: Apply cross-head mixer if enabled
+        if self.use_head_mixer and self.head_mixer_fc1 is not None:
+            stacked_resblock = MedusaLoRAHeadWithMixer.apply_mixer(
+                stacked_resblock,
+                self.head_mixer_fc1,
+                self.head_mixer_fc2,
+                self.channel_mixer_fc,
+            )
+
         # During training, stack weights fresh each forward to capture gradient updates
         # During inference, use pre-cached weights for efficiency
         if self.training:
@@ -733,6 +764,15 @@ class GemmaMedusaModel(nn.Module):
                 x = block(x)
             resblock_outputs.append(x)
         stacked_resblock = torch.stack(resblock_outputs, dim=0)  # (num_heads, B, T, hidden)
+
+        # Step 1.5: Apply cross-head mixer if enabled
+        if self.use_head_mixer and self.head_mixer_fc1 is not None:
+            stacked_resblock = MedusaLoRAHeadWithMixer.apply_mixer(
+                stacked_resblock,
+                self.head_mixer_fc1,
+                self.head_mixer_fc2,
+                self.channel_mixer_fc,
+            )
 
         # Step 2: Compute LoRA projections (small memory: num_heads * B * T * rank)
         # Stack weights for batched computation
@@ -1813,6 +1853,15 @@ class GemmaMedusaModel(nn.Module):
             if hasattr(head, 'lora_B'):
                 medusa_proj_params.append(head.lora_B.weight)
 
+        # Add mixer params (single shared module on the model)
+        if self.use_head_mixer and self.head_mixer_fc1 is not None:
+            # Head mixer params go to AdamW (small projection-like params)
+            medusa_proj_params.append(self.head_mixer_fc1.weight)
+            medusa_proj_params.append(self.head_mixer_fc2.weight)
+            # Channel mixer is a matrix param -> Muon
+            if self.channel_mixer_fc is not None:
+                medusa_matrix_params.append(self.channel_mixer_fc.weight)
+
         # Scale LR by 1/sqrt(hidden_size/768) like nanochat does
         dmodel_lr_scale = (hidden_size / 768) ** -0.5
         print0(f"Scaling AdamW LR by 1/sqrt({hidden_size}/768) = {dmodel_lr_scale:.4f}")
@@ -1864,6 +1913,8 @@ def load_gemma_medusa_model(
     dtype=None,
     freeze_base: bool = True,
     zero_init_mlp: bool = False,
+    use_head_mixer: bool = False,
+    mixer_hidden: int = 16,
 ):
     """
     Load a Gemma model with Medusa LoRA heads.
@@ -1878,6 +1929,8 @@ def load_gemma_medusa_model(
         dtype: Data type for model weights
         freeze_base: Whether to freeze base model parameters
         zero_init_mlp: Whether to zero-initialize ResBlock MLP weights
+        use_head_mixer: Whether to use cross-head MLP mixer
+        mixer_hidden: Hidden dimension for the cross-head mixer MLP
 
     Returns:
         GemmaMedusaModel instance
@@ -1892,4 +1945,6 @@ def load_gemma_medusa_model(
         dtype=dtype,
         freeze_base=freeze_base,
         zero_init_mlp=zero_init_mlp,
+        use_head_mixer=use_head_mixer,
+        mixer_hidden=mixer_hidden,
     )

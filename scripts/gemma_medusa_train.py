@@ -217,6 +217,10 @@ if __name__ == "__main__":
                         help="Maximum sequence length")
     parser.add_argument("--zero-init-mtp-mlp", action="store_true",
                         help="Zero-initialize ResBlock MLP weights (ablation)")
+    parser.add_argument("--use-head-mixer", action="store_true",
+                        help="Enable cross-head MLP mixer for improved multi-token prediction")
+    parser.add_argument("--mixer-hidden", type=int, default=16,
+                        help="Hidden dimension for cross-head mixer MLP (default: 16)")
 
     # Medusa loss configuration
     parser.add_argument("--medusa-loss-weight", type=float, default=1.0,
@@ -309,7 +313,8 @@ if __name__ == "__main__":
     # Load model and tokenizer
 
     print0(f"Loading base model: {args.base_model}")
-    print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, lora_rank={args.lora_rank}")
+    mixer_str = f", head_mixer={args.mixer_hidden}" if args.use_head_mixer else ""
+    print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, lora_rank={args.lora_rank}{mixer_str}")
 
     model = load_gemma_medusa_model(
         model_name=args.base_model,
@@ -321,6 +326,8 @@ if __name__ == "__main__":
         dtype=torch.bfloat16,
         freeze_base=True,
         zero_init_mlp=args.zero_init_mtp_mlp,
+        use_head_mixer=args.use_head_mixer,
+        mixer_hidden=args.mixer_hidden,
     )
     tokenizer = GemmaTokenizerWrapper(args.base_model)
 
