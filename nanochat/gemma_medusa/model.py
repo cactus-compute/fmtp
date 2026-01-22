@@ -823,6 +823,7 @@ class GemmaMedusaModel(nn.Module):
 
         return base_logits[0], medusa_logits
 
+    @torch.compiler.disable  # Variable seq lengths cause excessive recompilations
     def _compute_losses_chunked(
         self,
         hidden_states: torch.Tensor,
