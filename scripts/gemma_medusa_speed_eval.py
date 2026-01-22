@@ -1,5 +1,12 @@
 """
-Evaluate Gemma Medusa model on GSM8K with MTP generation speed comparison.
+Evaluate Gemma Medusa model on benchmarks with MTP generation speed comparison.
+
+Supported tasks:
+- gsm8k: Math word problems (generative)
+- arc-easy: ARC-Easy science questions (multiple choice)
+- arc-challenge: ARC-Challenge science questions (multiple choice)
+- mmlu: MMLU multi-task benchmark (multiple choice)
+- humaneval: Code generation benchmark (code execution)
 
 This script compares:
 1. Standard autoregressive generation (HuggingFace generate)
@@ -14,6 +21,7 @@ Example:
         --lora-rank 256 \
         --lora-alpha 512 \
         --zero-init-mtp-mlp \
+        --task gsm8k \
         -x 100
 """
 
@@ -32,6 +40,9 @@ from nanochat.common import print0, autodetect_device_type
 from nanochat.gemma_medusa import GemmaTokenizerWrapper, load_gemma_medusa_model
 
 from tasks.gsm8k import GSM8K, extract_answer as gsm_extract_answer
+from tasks.arc import ARC
+from tasks.mmlu import MMLU
+from tasks.humaneval import HumanEval
 
 
 # Extended answer extraction for Gemma (handles #### and \boxed{} formats)
@@ -64,7 +75,69 @@ def extract_answer_gemma(completion):
     return None
 
 
-def run_mtp_eval(model, tokenizer, task, max_problems, max_new_tokens, temperature, use_fixed_size_tree=False):
+def extract_letter_answer(completion, valid_letters=('A', 'B', 'C', 'D')):
+    """Extract letter answer from completion for multiple choice tasks."""
+    completion = completion.strip()
+    # Check if the completion starts with a valid letter
+    if completion and completion[0].upper() in valid_letters:
+        return completion[0].upper()
+    # Look for a letter anywhere in the completion
+    for char in completion:
+        if char.upper() in valid_letters:
+            return char.upper()
+    return None
+
+
+def load_task(task_name, max_problems=None):
+    """Load a task by name."""
+    task_name = task_name.lower()
+
+    if task_name == 'gsm8k':
+        task = GSM8K(subset="main", split="test")
+        eval_type = 'generative'
+    elif task_name == 'arc-easy':
+        task = ARC(subset="ARC-Easy", split="test")
+        eval_type = 'categorical'
+    elif task_name == 'arc-challenge':
+        task = ARC(subset="ARC-Challenge", split="test")
+        eval_type = 'categorical'
+    elif task_name == 'mmlu':
+        task = MMLU(subset="all", split="test")
+        eval_type = 'categorical'
+    elif task_name == 'humaneval':
+        task = HumanEval()
+        eval_type = 'code'
+    else:
+        raise ValueError(f"Unknown task: {task_name}. Supported: gsm8k, arc-easy, arc-challenge, mmlu, humaneval")
+
+    return task, eval_type
+
+
+def evaluate_response(conversation, completion_text, eval_type, task=None):
+    """Evaluate a model response based on task type."""
+    if eval_type == 'generative':
+        # GSM8K-style: extract numbers and compare
+        assistant_message = conversation['messages'][-1]
+        if isinstance(assistant_message['content'], list):
+            last_text_part = assistant_message['content'][-1]['text']
+        else:
+            last_text_part = assistant_message['content']
+        ref_answer = gsm_extract_answer(last_text_part)
+        pred_answer = extract_answer_gemma(completion_text)
+        return pred_answer == ref_answer, pred_answer, ref_answer
+    elif eval_type == 'code':
+        # HumanEval-style: execute code and check tests pass
+        correct = task.evaluate(conversation, completion_text)
+        return correct, None, None
+    else:
+        # Categorical: extract letter and compare
+        valid_letters = conversation.get('letters', ('A', 'B', 'C', 'D'))
+        ref_answer = conversation['messages'][-1]['content']
+        pred_answer = extract_letter_answer(completion_text, valid_letters)
+        return pred_answer == ref_answer, pred_answer, ref_answer
+
+
+def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens, temperature, use_fixed_size_tree=False):
     """Run evaluation using MTP speculative decoding."""
     num_problems = min(len(task), max_problems) if max_problems else len(task)
 
@@ -74,7 +147,6 @@ def run_mtp_eval(model, tokenizer, task, max_problems, max_new_tokens, temperatu
     num_passed = 0
 
     eos_token_id = tokenizer.hf_tokenizer.eos_token_id
-    end_of_turn_ids = tokenizer.hf_tokenizer.encode("<end_of_turn>", add_special_tokens=False)
 
     for i in range(num_problems):
         conversation = task[i]
@@ -106,13 +178,8 @@ def run_mtp_eval(model, tokenizer, task, max_problems, max_new_tokens, temperatu
             completion_text = completion_text.split("<end_of_turn>")[0]
 
         # Evaluate
-        assistant_message = conversation['messages'][-1]
-        last_text_part = assistant_message['content'][-1]['text']
-        ref_num = gsm_extract_answer(last_text_part)
-        pred_num = extract_answer_gemma(completion_text)
-
-        correct = int(pred_num == ref_num)
-        num_passed += correct
+        correct, _, _ = evaluate_response(conversation, completion_text, eval_type, task=task)
+        num_passed += int(correct)
 
         # Stats
         gen_tokens = stats.tokens_generated
@@ -141,7 +208,7 @@ def run_mtp_eval(model, tokenizer, task, max_problems, max_new_tokens, temperatu
     }
 
 
-def run_standard_eval(model, tokenizer, task, max_problems, max_new_tokens, temperature):
+def run_standard_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens, temperature):
     """Run evaluation using standard autoregressive generation."""
     num_problems = min(len(task), max_problems) if max_problems else len(task)
 
@@ -181,13 +248,8 @@ def run_standard_eval(model, tokenizer, task, max_problems, max_new_tokens, temp
             completion_text = completion_text.split("<end_of_turn>")[0]
 
         # Evaluate
-        assistant_message = conversation['messages'][-1]
-        last_text_part = assistant_message['content'][-1]['text']
-        ref_num = gsm_extract_answer(last_text_part)
-        pred_num = extract_answer_gemma(completion_text)
-
-        correct = int(pred_num == ref_num)
-        num_passed += correct
+        correct, _, _ = evaluate_response(conversation, completion_text, eval_type, task=task)
+        num_passed += int(correct)
 
         # Stats
         gen_tokens = len(completion_ids)
@@ -224,9 +286,13 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint', type=str, default=None, required=True)
     parser.add_argument('--zero-init-mtp-mlp', action='store_true')
     parser.add_argument('-x', '--max-problems', type=int, default=100)
-    parser.add_argument('--max-new-tokens', type=int, default=512)
+    parser.add_argument('--max-new-tokens', type=int, default=None,
+                        help='Max tokens to generate (default: 512 for generative, 16 for categorical)')
     parser.add_argument('-t', '--temperature', type=float, default=0.0)
     parser.add_argument('-o', '--output', type=str, default=None)
+    parser.add_argument('--task', type=str, default='gsm8k',
+                        choices=['gsm8k', 'arc-easy', 'arc-challenge', 'mmlu', 'humaneval'],
+                        help='Evaluation task (default: gsm8k)')
     parser.add_argument('--skip-standard', action='store_true', help='Skip standard generation baseline')
     parser.add_argument('--inference-num-heads', type=int, default=None,
                         help='Override number of heads to use during inference (for ablation testing)')
@@ -281,10 +347,17 @@ if __name__ == "__main__":
 
     tokenizer = GemmaTokenizerWrapper(args.model_name)
 
-    # Load GSM8K task
-    task = GSM8K(subset="main", split="test")
-    print0(f"GSM8K test set: {len(task)} problems")
+    # Load task
+    task, eval_type = load_task(args.task)
+    print0(f"{args.task.upper()} test set: {len(task)} problems")
     print0(f"Evaluating on {args.max_problems} problems")
+
+    # Set default max_new_tokens based on task type
+    if args.max_new_tokens is None:
+        if eval_type == 'categorical':
+            args.max_new_tokens = 16
+        else:  # generative or code
+            args.max_new_tokens = 512
 
     results = {}
 
@@ -295,7 +368,7 @@ if __name__ == "__main__":
         print0("="*50)
         with torch.amp.autocast('cuda', dtype=dtype):
             results['standard'] = run_standard_eval(
-                model, tokenizer, task, args.max_problems, args.max_new_tokens, args.temperature
+                model, tokenizer, task, eval_type, args.max_problems, args.max_new_tokens, args.temperature
             )
         print0(f"Standard: {100*results['standard']['accuracy']:.2f}% accuracy, "
                f"{results['standard']['tokens_per_second']:.1f} tok/s")
@@ -308,7 +381,7 @@ if __name__ == "__main__":
     print0("="*50)
     with torch.amp.autocast('cuda', dtype=dtype):
         results['mtp'] = run_mtp_eval(
-            model, tokenizer, task, args.max_problems, args.max_new_tokens, args.temperature,
+            model, tokenizer, task, eval_type, args.max_problems, args.max_new_tokens, args.temperature,
             use_fixed_size_tree=args.fixed_tree_size
         )
     print0(f"MTP: {100*results['mtp']['accuracy']:.2f}% accuracy, "
@@ -334,6 +407,7 @@ if __name__ == "__main__":
     # Save results
     output_data = {
         'timestamp': datetime.now().isoformat(),
+        'task': args.task,
         'model_name': args.model_name,
         'checkpoint': args.checkpoint,
         'config': {
@@ -351,7 +425,7 @@ if __name__ == "__main__":
 
     if args.output is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        args.output = f"gsm8k_mtp_eval_{timestamp}.json"
+        args.output = f"{args.task}_mtp_eval_{timestamp}.json"
 
     with open(args.output, 'w') as f:
         json.dump(output_data, f, indent=2)
