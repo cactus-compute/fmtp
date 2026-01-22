@@ -64,7 +64,7 @@ def extract_answer_gemma(completion):
     return None
 
 
-def run_mtp_eval(model, tokenizer, task, max_problems, max_new_tokens, temperature):
+def run_mtp_eval(model, tokenizer, task, max_problems, max_new_tokens, temperature, use_fixed_size_tree=False):
     """Run evaluation using MTP speculative decoding."""
     num_problems = min(len(task), max_problems) if max_problems else len(task)
 
@@ -91,6 +91,7 @@ def run_mtp_eval(model, tokenizer, task, max_problems, max_new_tokens, temperatu
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             eos_token_id=eos_token_id,
+            use_fixed_size_tree=use_fixed_size_tree,
         )
 
         torch.cuda.synchronize()
@@ -229,6 +230,8 @@ if __name__ == "__main__":
     parser.add_argument('--skip-standard', action='store_true', help='Skip standard generation baseline')
     parser.add_argument('--inference-num-heads', type=int, default=None,
                         help='Override number of heads to use during inference (for ablation testing)')
+    parser.add_argument('--fixed-tree-size', action='store_true',
+                        help='Use fixed 79-node tree for fair ablation comparison across head counts')
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -294,11 +297,13 @@ if __name__ == "__main__":
     # Run MTP generation
     effective_heads = args.inference_num_heads if args.inference_num_heads else args.medusa_num_heads
     print0("\n" + "="*50)
-    print0(f"Running MTP Speculative Decoding (heads={effective_heads}, topk=10, sparse=False)")
+    tree_info = "fixed=79" if args.fixed_tree_size else "topk=10"
+    print0(f"Running MTP Speculative Decoding (heads={effective_heads}, {tree_info}, sparse=False)")
     print0("="*50)
     with torch.amp.autocast('cuda', dtype=dtype):
         results['mtp'] = run_mtp_eval(
-            model, tokenizer, task, args.max_problems, args.max_new_tokens, args.temperature
+            model, tokenizer, task, args.max_problems, args.max_new_tokens, args.temperature,
+            use_fixed_size_tree=args.fixed_tree_size
         )
     print0(f"MTP: {100*results['mtp']['accuracy']:.2f}% accuracy, "
            f"{results['mtp']['tokens_per_second']:.1f} tok/s, "

@@ -174,6 +174,90 @@ def get_sparse_tree_choices(num_heads: int) -> List[Tuple[int, ...]]:
     return choices
 
 
+def get_fixed_size_tree_choices(num_heads: int, target_size: int = 79) -> List[Tuple[int, ...]]:
+    """
+    Generate OPTIMAL tree choices that result in exactly target_size nodes (including root).
+
+    For ablation testing with controlled tree size, using optimal exploration patterns:
+    - 4 heads: use default tree (10 d1 + 25 d2 + 27 d3 + 16 d4 = 78 + root = 79)
+    - 3 heads: optimal 79-node tree (10 d1 + 25 d2 + 27 d3 + 16 depth-3 extended = 78)
+    - 2 heads: optimal 79-node tree (10 d1 + 68 d2 = 78)
+    - 1 head: 78 depth-1 candidates (top-78)
+
+    This allows fair comparison of head count with constant tree/batch size,
+    while using optimal exploration patterns for each head configuration.
+    """
+    num_candidates = target_size - 1  # subtract 1 for root (78 candidates)
+    choices = []
+
+    if num_heads == 1:
+        # All candidates are depth-1: top-78 from head 1
+        # This is optimal for 1 head - explore the 78 most likely next tokens
+        for i in range(num_candidates):
+            choices.append((i,))
+
+    elif num_heads == 2:
+        # Optimal 2-head tree: balance width at depth-1 vs depth-2 exploration
+        # Use same structure as default 2-head but extended to 78 candidates:
+        # - 10 depth-1 candidates (top-10 from head 1)
+        # - 68 depth-2 candidates (explore head 2 given head 1 predictions)
+        # This gives good exploration of both immediate and 2-step predictions
+
+        # Add depth-1: top 10 (same as default)
+        for i in range(10):
+            choices.append((i,))
+
+        # Add depth-2: need 68 more to reach 78 total
+        # Use roughly 8x8=64 + extra 4 from top row = 68
+        # Structure: top 9 from head1, each with top 7-8 from head2
+        remaining = num_candidates - 10  # 68
+        count = 0
+        for i in range(10):
+            width = 8 if i < 8 else 2  # First 8 rows get 8 columns, last 2 get 2 each
+            for j in range(width):
+                choices.append((i, j))
+                count += 1
+                if count >= remaining:
+                    break
+            if count >= remaining:
+                break
+
+    elif num_heads == 3:
+        # Optimal 3-head tree: use default structure extended to 79 nodes
+        # Default 3-head: 10 d1 + 25 d2 + 27 d3 = 62, need 16 more
+        # Add more depth-3 paths to reach 78 total
+
+        # Add depth-1: top 10 (same as default)
+        for i in range(10):
+            choices.append((i,))
+
+        # Add depth-2: 5x5 = 25 (same as default)
+        for i in range(5):
+            for j in range(5):
+                choices.append((i, j))
+
+        # Add depth-3: 3x3x3 = 27 (same as default) + 16 more = 43 total
+        # Use 4x4x3 = 48, take first 43
+        count = 0
+        for i in range(4):
+            for j in range(4):
+                for k in range(3):
+                    choices.append((i, j, k))
+                    count += 1
+                    if count >= 43:
+                        break
+                if count >= 43:
+                    break
+            if count >= 43:
+                break
+
+    else:  # num_heads >= 4
+        # Use standard tree which is already 79 nodes (optimal structure)
+        return get_default_tree_choices(num_heads)
+
+    return choices
+
+
 class GemmaModelWrapper(nn.Module):
     """Wraps HuggingFace Gemma to match nanochat model interface."""
 
@@ -727,6 +811,11 @@ class GemmaMedusaModel(nn.Module):
 
         medusa_logits = base_logits[1:] + lora_deltas  # (num_heads, B, T, vocab)
 
+        # For ablation testing: slice to only use first N heads during inference
+        effective_heads = self.medusa_num_heads
+        if effective_heads < num_heads:
+            medusa_logits = medusa_logits[:effective_heads]
+
         return base_logits[0], medusa_logits
 
     def _compute_losses_chunked(
@@ -1023,6 +1112,7 @@ class GemmaMedusaModel(nn.Module):
         self,
         topk: int = 10,
         use_sparse_tree: bool = False,
+        use_fixed_size_tree: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Get tree attention buffers, using cache if config matches.
@@ -1030,17 +1120,22 @@ class GemmaMedusaModel(nn.Module):
         Args:
             topk: Number of top predictions from each head
             use_sparse_tree: Use smaller tree for faster but less accurate speculation
+            use_fixed_size_tree: Use fixed 79-node tree for fair ablation comparison
 
         Returns:
             Dictionary of tree buffers
         """
-        config = (topk, use_sparse_tree)
+        config = (topk, use_sparse_tree, use_fixed_size_tree)
         if self._tree_buffers_cache is None or self._tree_buffers_config != config:
-            if use_sparse_tree:
+            if use_fixed_size_tree:
+                choices = get_fixed_size_tree_choices(self.medusa_num_heads, target_size=79)
+            elif use_sparse_tree:
                 choices = get_sparse_tree_choices(self.medusa_num_heads)
             else:
                 choices = get_default_tree_choices(self.medusa_num_heads, topk)
-            self._tree_buffers_cache = generate_tree_buffers(choices, self._device, topk)
+            # For fixed-size tree with 1 head, we need higher topk
+            effective_topk = max(topk, len(choices)) if use_fixed_size_tree else topk
+            self._tree_buffers_cache = generate_tree_buffers(choices, self._device, effective_topk)
             self._tree_buffers_config = config
         return self._tree_buffers_cache
 
@@ -1078,8 +1173,15 @@ class GemmaMedusaModel(nn.Module):
             probs = F.softmax(main_logits[0] / temperature, dim=-1)
             base_token = torch.multinomial(probs, num_samples=1)[0]
 
-        # Get top-k from each Medusa head: (num_heads, topk)
-        medusa_topk = torch.topk(medusa_logits[:, 0, :], topk, dim=-1).indices
+        # Determine required topk from tree_indices (for fixed-size tree ablations)
+        # tree_indices maps to positions in flat_candidates = [base, head0_k0..k(topk-1), head1_k0..., ...]
+        # Position i maps to: 0 = base, 1..topk = head0, topk+1..2*topk = head1, etc.
+        max_tree_idx = tree_indices.max().item()
+        num_heads = medusa_logits.shape[0]
+        required_topk = max(topk, (max_tree_idx + num_heads - 1) // num_heads)  # ceiling division
+
+        # Get top-k from each Medusa head: (num_heads, required_topk)
+        medusa_topk = torch.topk(medusa_logits[:, 0, :], required_topk, dim=-1).indices
 
         # Build flat candidate array: [base_token, head0_topk, head1_topk, ...]
         flat_candidates = torch.cat([base_token.unsqueeze(0), medusa_topk.view(-1)])
@@ -1504,6 +1606,7 @@ class GemmaMedusaModel(nn.Module):
         temperature: float = 0.0,
         topk: int = 10,
         use_sparse_tree: bool = False,
+        use_fixed_size_tree: bool = False,
         posterior_threshold: float = 0.09,
         posterior_alpha: float = 0.3,
         eos_token_id: Optional[int] = None,
@@ -1522,6 +1625,7 @@ class GemmaMedusaModel(nn.Module):
             temperature: Sampling temperature (0.0 = greedy)
             topk: Number of top-k predictions per Medusa head
             use_sparse_tree: Use smaller tree for faster speculation
+            use_fixed_size_tree: Use fixed 79-node tree for fair ablation comparison
             posterior_threshold: Typical acceptance hard threshold
             posterior_alpha: Typical acceptance entropy factor
             eos_token_id: EOS token ID for stopping (None = no early stop)
@@ -1537,7 +1641,7 @@ class GemmaMedusaModel(nn.Module):
         is_cuda = self._device.type == "cuda"
 
         # Get cached tree buffers
-        buffers = self._get_tree_buffers(topk, use_sparse_tree)
+        buffers = self._get_tree_buffers(topk, use_sparse_tree, use_fixed_size_tree)
         retrieve_indices = buffers["retrieve_indices"]
         max_speculation = retrieve_indices.shape[1] - 1
 
@@ -1645,20 +1749,32 @@ class GemmaMedusaModel(nn.Module):
                         # The KV tensor has shape (B, heads, min(total_len, sw), head_dim)
                         total_len_with_tree = current_seq_len + tree_len
 
-                        if total_len_with_tree <= sw:
+                        # Check actual cache size to determine if tree tokens fit
+                        cache_size = layer.keys.shape[2]
+                        expected_tree_end = cache_len_before_tree + tree_len
+
+                        if expected_tree_end <= cache_size:
                             # No wrapping - simple case
                             # Extract accepted positions from tree part
                             accepted_kv_indices = [cache_len_before_tree + pos for pos in accepted_tree_positions]
 
-                            # Build new cache: original + accepted
-                            original_keys = layer.keys[:, :, :cache_len_before_tree, :]
-                            original_values = layer.values[:, :, :cache_len_before_tree, :]
+                            # Bounds check
+                            max_idx = max(accepted_kv_indices) if accepted_kv_indices else 0
+                            if max_idx >= cache_size:
+                                # Edge case: tree tokens don't fully fit, use fallback
+                                layer.keys = layer.keys[:, :, :cache_len_before_tree, :]
+                                layer.values = layer.values[:, :, :cache_len_before_tree, :]
+                                need_fallback = True
+                            else:
+                                # Build new cache: original + accepted
+                                original_keys = layer.keys[:, :, :cache_len_before_tree, :]
+                                original_values = layer.values[:, :, :cache_len_before_tree, :]
 
-                            accepted_keys = layer.keys[:, :, accepted_kv_indices, :]
-                            accepted_values = layer.values[:, :, accepted_kv_indices, :]
+                                accepted_keys = layer.keys[:, :, accepted_kv_indices, :]
+                                accepted_values = layer.values[:, :, accepted_kv_indices, :]
 
-                            layer.keys = torch.cat([original_keys, accepted_keys], dim=2)
-                            layer.values = torch.cat([original_values, accepted_values], dim=2)
+                                layer.keys = torch.cat([original_keys, accepted_keys], dim=2)
+                                layer.values = torch.cat([original_values, accepted_values], dim=2)
                         else:
                             # Wrapping case - need fallback for this layer
                             # Truncate back to original and mark for fallback
@@ -1671,6 +1787,16 @@ class GemmaMedusaModel(nn.Module):
                         # Regular (non-sliding window) layer - simple extraction
                         # Tree tokens are at positions current_seq_len to current_seq_len + tree_len - 1
                         accepted_kv_indices = [current_seq_len + pos for pos in accepted_tree_positions]
+
+                        # Debug: check bounds
+                        cache_size = layer.keys.shape[2]
+                        max_idx = max(accepted_kv_indices) if accepted_kv_indices else 0
+                        if max_idx >= cache_size:
+                            raise RuntimeError(
+                                f"KV cache index out of bounds: max_idx={max_idx}, cache_size={cache_size}, "
+                                f"current_seq_len={current_seq_len}, tree_len={tree_len}, "
+                                f"accepted_tree_positions={accepted_tree_positions}"
+                            )
 
                         # Build new cache: original + accepted
                         original_keys = layer.keys[:, :, :current_seq_len, :]
