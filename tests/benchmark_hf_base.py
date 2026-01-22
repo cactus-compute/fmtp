@@ -13,7 +13,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=dtype,
+        dtype=dtype,
         trust_remote_code=True,
     ).to(device)
     model.eval()

@@ -523,20 +523,20 @@ class GemmaMedusaModel(nn.Module):
             try:
                 self.base_model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                     device_map=device,
                     trust_remote_code=True,
                 )
             except ValueError:
                 self.base_model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                     trust_remote_code=True,
                 ).to(device)
         else:
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=dtype,
+                dtype=dtype,
                 trust_remote_code=True,
             ).to(device)
 
