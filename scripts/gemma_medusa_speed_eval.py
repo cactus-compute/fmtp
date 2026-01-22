@@ -232,6 +232,10 @@ if __name__ == "__main__":
                         help='Override number of heads to use during inference (for ablation testing)')
     parser.add_argument('--fixed-tree-size', action='store_true',
                         help='Use fixed 79-node tree for fair ablation comparison across head counts')
+    parser.add_argument('--use-head-mixer', action='store_true',
+                        help='Use cross-head MLP mixer (for mixer checkpoint)')
+    parser.add_argument('--mixer-hidden', type=int, default=16,
+                        help='Hidden dimension for the cross-head mixer MLP')
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,6 +254,8 @@ if __name__ == "__main__":
         device=device,
         dtype=dtype,
         zero_init_mlp=args.zero_init_mtp_mlp,
+        use_head_mixer=args.use_head_mixer,
+        mixer_hidden=args.mixer_hidden,
     )
 
     # Load checkpoint
