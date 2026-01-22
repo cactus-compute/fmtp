@@ -890,7 +890,7 @@ class GemmaMedusaModel(nn.Module):
         # to ensure all DDP ranks have identical computation graphs. CE with ignore_index=-1
         # handles chunks with no valid targets correctly (returns 0).
         main_chunk_losses = []
-        total_valid = (targets != -1).sum().item()
+        total_valid = (targets != -1).sum()  # Keep as tensor to avoid graph break
 
         for t_start in range(0, T, chunk_size):
             t_end = min(t_start + chunk_size, T)
@@ -930,7 +930,7 @@ class GemmaMedusaModel(nn.Module):
 
             # Count valid targets for this head (shifted targets)
             head_targets = targets[:, shift:]
-            head_valid = (head_targets != -1).sum().item()
+            head_valid = (head_targets != -1).sum()  # Keep as tensor to avoid graph break
 
             for t_start in range(0, T_eff, chunk_size):
                 t_end = min(t_start + chunk_size, T_eff)
