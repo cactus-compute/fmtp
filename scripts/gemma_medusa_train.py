@@ -203,24 +203,28 @@ if __name__ == "__main__":
                         help="cuda|cpu|mps (empty = autodetect)")
 
     # Model configuration
-    parser.add_argument("--base-model", type=str, default="google/gemma-3-1b-it",
+    parser.add_argument("--base-model", type=str, default="google/gemma-3-270m-it",
                         help="HuggingFace base model name")
     parser.add_argument("--medusa-num-heads", type=int, default=4,
                         help="Number of Medusa prediction heads")
-    parser.add_argument("--medusa-num-layers", type=int, default=1,
+    parser.add_argument("--medusa-num-layers", type=int, default=2,
                         help="Number of ResBlock layers per head")
-    parser.add_argument("--lora-rank", type=int, default=64,
+    parser.add_argument("--lora-rank", type=int, default=256,
                         help="LoRA rank for Medusa heads")
-    parser.add_argument("--lora-alpha", type=int, default=None,
-                        help="LoRA alpha scaling (default: same as rank)")
-    parser.add_argument("--max-seq-len", type=int, default=2048,
+    parser.add_argument("--lora-alpha", type=int, default=512,
+                        help="LoRA alpha scaling")
+    parser.add_argument("--max-seq-len", type=int, default=1024,
                         help="Maximum sequence length")
-    parser.add_argument("--zero-init-mtp-mlp", action="store_true",
-                        help="Zero-initialize ResBlock MLP weights (ablation)")
+    parser.add_argument("--zero-init-mtp-mlp", action="store_true", default=True,
+                        help="Zero-initialize ResBlock MLP weights")
     parser.add_argument("--use-head-mixer", action="store_true",
                         help="Enable cross-head MLP mixer for improved multi-token prediction")
     parser.add_argument("--mixer-hidden", type=int, default=16,
                         help="Hidden dimension for cross-head mixer MLP (default: 16)")
+
+    # Performance optimization
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile for potential speedup (experimental)")
 
     # Medusa loss configuration
     parser.add_argument("--medusa-loss-weight", type=float, default=1.0,
@@ -230,31 +234,31 @@ if __name__ == "__main__":
                         help="Weighting scheme: constant (all heads same) or decay (weight^k)")
 
     # Training horizon
-    parser.add_argument("--num-iterations", type=int, default=-1,
+    parser.add_argument("--num-iterations", type=int, default=1030,
                         help="Explicit number of optimization steps (-1 = use num_epochs)")
     parser.add_argument("--num-epochs", type=int, default=1,
                         help="Number of training epochs (used if num_iterations=-1)")
 
     # Optimization
     parser.add_argument("--device-batch-size", type=int, default=4,
-                        help="Per-device batch size")
-    parser.add_argument("--total-batch-size", type=int, default=32,
+                        help="Per-device batch size (4 works for A100-40GB with seq_len=1024)")
+    parser.add_argument("--total-batch-size", type=int, default=96,
                         help="Total batch size (examples) for gradient accumulation")
-    parser.add_argument("--matrix-lr", type=float, default=0.02,
+    parser.add_argument("--matrix-lr", type=float, default=0.01,
                         help="Learning rate for matrix params (Muon)")
-    parser.add_argument("--proj-lr", type=float, default=0.004,
+    parser.add_argument("--proj-lr", type=float, default=0.001,
                         help="Learning rate for projection params (Adam)")
     parser.add_argument("--weight-decay", type=float, default=0.2,
                         help="Weight decay for Muon optimizer (ResBlock params)")
-    parser.add_argument("--adam-weight-decay", type=float, default=0.0,
+    parser.add_argument("--adam-weight-decay", type=float, default=0.01,
                         help="Weight decay for AdamW optimizer (LoRA params)")
     parser.add_argument("--adam-beta1", type=float, default=0.8,
                         help="Adam beta1 for projection params")
     parser.add_argument("--adam-beta2", type=float, default=0.95,
                         help="Adam beta2 for projection params")
-    parser.add_argument("--warmup-ratio", type=float, default=0.0,
+    parser.add_argument("--warmup-ratio", type=float, default=0.05,
                         help="Ratio of iterations for LR warmup")
-    parser.add_argument("--warmdown-ratio", type=float, default=0.4,
+    parser.add_argument("--warmdown-ratio", type=float, default=0.95,
                         help="Ratio of iterations for LR warmdown")
     parser.add_argument("--final-lr-frac", type=float, default=0.0,
                         help="Final LR as fraction of initial LR")
@@ -266,7 +270,7 @@ if __name__ == "__main__":
                         help="Path to validation data (optional)")
     parser.add_argument("--skip-filter", action="store_true",
                         help="Skip dataset filtering (use if data is pre-filtered)")
-    parser.add_argument("--use-chunked-loss", action="store_true",
+    parser.add_argument("--use-chunked-loss", action="store_true", default=True,
                         help="Compute loss in chunks to reduce memory (allows larger batch sizes)")
     parser.add_argument("--chunk-size", type=int, default=128,
                         help="Chunk size for chunked loss computation (default: 128)")
@@ -280,7 +284,7 @@ if __name__ == "__main__":
                         help="Number of samples to split off for validation (default: 960 = 8 batches of 120)")
     parser.add_argument("--log-every", type=int, default=20,
                         help="Log detailed metrics (grad norms, weight norms) to wandb every N steps")
-    parser.add_argument("--save-every", type=int, default=-1,
+    parser.add_argument("--save-every", type=int, default=500,
                         help="Save checkpoint every N steps (-1 = only at end)")
 
     # Output
@@ -340,6 +344,11 @@ if __name__ == "__main__":
     print0(f"Vocab size: {tokenizer.get_vocab_size()}")
     if args.use_chunked_loss:
         print0(f"Using chunked loss (chunk_size={args.chunk_size}) for memory efficiency")
+
+    # Optional torch.compile
+    if args.compile:
+        print0("Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     # -----------------------------------------------------------------------------
     # Load data

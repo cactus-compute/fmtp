@@ -8,10 +8,15 @@ Tree attention generation:
 - Supports speculative decoding with tree-structured candidate verification
 - forward_mtp: Single forward pass with tree attention for candidate verification
 - generate_mtp: Full generation loop with Medusa speculation
+
+Memory optimization:
+- use_chunked_loss: Critical for fitting larger batches - processes loss in chunks
+- Gradient checkpointing: Optional, trades compute for memory
 """
 
 from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -518,20 +523,20 @@ class GemmaMedusaModel(nn.Module):
             try:
                 self.base_model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    dtype=dtype,
+                    torch_dtype=dtype,
                     device_map=device,
                     trust_remote_code=True,
                 )
             except ValueError:
                 self.base_model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    dtype=dtype,
+                    torch_dtype=dtype,
                     trust_remote_code=True,
                 ).to(device)
         else:
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                dtype=dtype,
+                torch_dtype=dtype,
                 trust_remote_code=True,
             ).to(device)
 
