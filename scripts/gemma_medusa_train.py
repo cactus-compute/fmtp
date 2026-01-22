@@ -347,8 +347,8 @@ if __name__ == "__main__":
 
     # Optional torch.compile
     if args.compile:
-        print0("Compiling model with torch.compile...")
-        model = torch.compile(model)
+        print0("Compiling model with torch.compile (dynamic=True for variable seq lengths)...")
+        model = torch.compile(model, dynamic=True)
 
     # -----------------------------------------------------------------------------
     # Load data
