@@ -387,6 +387,12 @@ if __name__ == "__main__":
                         help='Number of ResBlock layers per Medusa head (default: 1)')
     parser.add_argument('--lora-rank', type=int, default=64,
                         help='LoRA rank for Medusa heads (default: 64)')
+    parser.add_argument('--lora-alpha', type=int, default=None,
+                        help='LoRA alpha (default: same as rank)')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to checkpoint directory to load trained Medusa heads')
+    parser.add_argument('--zero-init-mtp-mlp', action='store_true',
+                        help='Zero-initialize ResBlock MLP weights (must match training config)')
     args = parser.parse_args()
 
     # Initialize compute
@@ -398,16 +404,32 @@ if __name__ == "__main__":
     # Load Gemma model and tokenizer
     print0(f"Loading model: {args.model_name}")
     if args.medusa:
-        print0(f"Using GemmaMedusaModel with {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, rank={args.lora_rank}")
+        lora_alpha = args.lora_alpha if args.lora_alpha is not None else args.lora_rank
+        print0(f"Using GemmaMedusaModel with {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, rank={args.lora_rank}, alpha={lora_alpha}")
         model = load_gemma_medusa_model(
             args.model_name,
             medusa_num_heads=args.medusa_num_heads,
             medusa_num_layers=args.medusa_num_layers,
             lora_rank=args.lora_rank,
+            lora_alpha=lora_alpha,
             device=device,
             dtype=ptdtype,
+            zero_init_mlp=args.zero_init_mtp_mlp,
         )
         print0(f"Medusa parameters: {model.get_medusa_param_count():,}")
+
+        # Load checkpoint if provided
+        if args.checkpoint:
+            checkpoint_path = os.path.join(args.checkpoint, "final", "medusa_heads.pt")
+            if not os.path.exists(checkpoint_path):
+                checkpoint_path = os.path.join(args.checkpoint, "medusa_heads.pt")
+            if os.path.exists(checkpoint_path):
+                print0(f"Loading Medusa heads from: {checkpoint_path}")
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                model.medusa_heads.load_state_dict(checkpoint['medusa_heads'])
+                print0("Medusa heads loaded successfully")
+            else:
+                print0(f"WARNING: Checkpoint not found at {args.checkpoint}")
     else:
         model = load_gemma_model(args.model_name, device=device, dtype=ptdtype)
     tokenizer = GemmaTokenizerWrapper(args.model_name)

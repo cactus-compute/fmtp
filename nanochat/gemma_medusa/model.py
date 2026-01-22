@@ -575,6 +575,7 @@ class GemmaMedusaModel(nn.Module):
         input_ids: torch.Tensor,
         past_key_values: Optional[Tuple] = None,
         position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Tuple]:
         """
         Get hidden states with KV cache support.
@@ -583,6 +584,8 @@ class GemmaMedusaModel(nn.Module):
             input_ids: (B, T) input token IDs (or just new tokens if using cache)
             past_key_values: Cached key-value states from previous forward pass
             position_ids: Optional position IDs for RoPE (required when using cache)
+            attention_mask: Optional attention mask for custom attention patterns
+                           Shape: (B, 1, T, T+cache_len) for tree attention
 
         Returns:
             hidden_states: (B, T, hidden_size) or (B, new_tokens, hidden_size)
@@ -592,6 +595,7 @@ class GemmaMedusaModel(nn.Module):
             input_ids=input_ids,
             past_key_values=past_key_values,
             position_ids=position_ids,
+            attention_mask=attention_mask,
             use_cache=True,
             output_hidden_states=False,
             return_dict=True,
@@ -1138,7 +1142,7 @@ class GemmaMedusaModel(nn.Module):
         buffers: Dict[str, torch.Tensor],
         past_key_values: Tuple,
         base_seq_len: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple, torch.Tensor]:
         """
         Forward pass with tree attention for verifying MTP candidates, using KV cache.
 
@@ -1156,22 +1160,38 @@ class GemmaMedusaModel(nn.Module):
             retrieve_indices: (num_candidates, max_depth) For candidate extraction
             valid_mask: (num_candidates, max_depth) Which positions are valid
             new_past_key_values: Updated KV cache (for potential reuse)
+            tree_hidden_states: (tree_len, hidden_size) Hidden states at tree positions
         """
         retrieve_indices = buffers["retrieve_indices"]
         tree_position_ids = buffers["tree_position_ids"]
+        tree_attn_mask = buffers["tree_attn_mask"]  # (1, 1, tree_len, tree_len)
 
         # Prepare inputs - only process tree tokens (KV cache has prompt)
         tree_input = tree_candidates.unsqueeze(0)  # (1, tree_len)
+        tree_len = tree_candidates.shape[0]
 
         # Position IDs: base_seq_len + tree position offsets
         # tree_position_ids contains depth-based offsets (0, 1, 1, 1, 2, 2, ...)
         position_ids = base_seq_len + tree_position_ids.unsqueeze(0)  # (1, tree_len)
 
-        # Forward pass with cache - only processes tree tokens
+        # Build full attention mask: [attend to all cached, then tree attention pattern]
+        # Shape: (1, 1, tree_len, base_seq_len + tree_len)
+        cache_attn = torch.ones(1, 1, tree_len, base_seq_len, device=self._device, dtype=tree_attn_mask.dtype)
+        full_attn_mask = torch.cat([cache_attn, tree_attn_mask], dim=-1)
+
+        # Convert to HuggingFace format: 0 = attend, -inf = don't attend
+        hf_attn_mask = torch.where(
+            full_attn_mask > 0.5,
+            torch.zeros_like(full_attn_mask),
+            torch.full_like(full_attn_mask, float('-inf'))
+        )
+
+        # Forward pass with cache and tree attention mask
         hidden_states, new_past_key_values = self._get_hidden_states_with_cache(
             tree_input,
             past_key_values=past_key_values,
             position_ids=position_ids,
+            attention_mask=hf_attn_mask,
         )
 
         # Compute logits (only for tree positions)
@@ -1181,7 +1201,10 @@ class GemmaMedusaModel(nn.Module):
         tree_logits = logits[0]
         valid_mask = retrieve_indices >= 0
 
-        return tree_logits, retrieve_indices, valid_mask, new_past_key_values
+        # Return hidden states for reuse in Medusa head computation
+        tree_hidden_states = hidden_states[0]  # (tree_len, hidden_size)
+
+        return tree_logits, retrieve_indices, valid_mask, new_past_key_values, tree_hidden_states
 
     @torch.inference_mode()
     def _evaluate_candidates_greedy_fast(
@@ -1558,13 +1581,15 @@ class GemmaMedusaModel(nn.Module):
             )
 
             # Verify candidates with tree attention using KV cache
+            # The tree verification extends the KV cache with tree tokens.
+            # After acceptance, we keep only the accepted path's KV entries (no extra forward pass!)
             if is_cuda:
                 with torch.amp.autocast('cuda', dtype=dtype):
-                    tree_logits, ret_indices, valid_mask, _ = self.forward_mtp_with_cache(
+                    tree_logits, ret_indices, valid_mask, _, tree_hidden_states = self.forward_mtp_with_cache(
                         tree_candidates, buffers, past_key_values, current_seq_len
                     )
             else:
-                tree_logits, ret_indices, valid_mask, _ = self.forward_mtp_with_cache(
+                tree_logits, ret_indices, valid_mask, _, tree_hidden_states = self.forward_mtp_with_cache(
                     tree_candidates, buffers, past_key_values, current_seq_len
                 )
 
@@ -1597,6 +1622,66 @@ class GemmaMedusaModel(nn.Module):
                 if num_generated + len(tokens_to_add) >= max_new_tokens:
                     break
 
+            # Get the tree positions for the accepted path (needed for KV cache extraction)
+            # ret_indices[best_candidate, 0:num_accepted] gives tree positions for accepted tokens
+            num_accepted = len(tokens_to_add)
+            accepted_tree_positions = ret_indices[best_candidate, :num_accepted].tolist()
+
+            # CRITICAL OPTIMIZATION: Extract only accepted path's KV entries from tree cache
+            # The cache currently has: [original_cache | tree_tokens]
+            # We need: [original_cache | accepted_tree_positions]
+            # This avoids a redundant forward pass!
+            tree_len = tree_candidates.shape[0]
+            need_fallback = False  # Track if any layer needs fallback
+
+            for layer in past_key_values.layers:
+                if hasattr(layer, 'keys') and layer.keys is not None:
+                    if hasattr(layer, 'sliding_window') and layer.sliding_window is not None:
+                        # Sliding window layer
+                        sw = layer.sliding_window
+                        cache_len_before_tree = min(current_seq_len, sw)
+
+                        # For sliding window, we need to be careful about wrapping
+                        # The KV tensor has shape (B, heads, min(total_len, sw), head_dim)
+                        total_len_with_tree = current_seq_len + tree_len
+
+                        if total_len_with_tree <= sw:
+                            # No wrapping - simple case
+                            # Extract accepted positions from tree part
+                            accepted_kv_indices = [cache_len_before_tree + pos for pos in accepted_tree_positions]
+
+                            # Build new cache: original + accepted
+                            original_keys = layer.keys[:, :, :cache_len_before_tree, :]
+                            original_values = layer.values[:, :, :cache_len_before_tree, :]
+
+                            accepted_keys = layer.keys[:, :, accepted_kv_indices, :]
+                            accepted_values = layer.values[:, :, accepted_kv_indices, :]
+
+                            layer.keys = torch.cat([original_keys, accepted_keys], dim=2)
+                            layer.values = torch.cat([original_values, accepted_values], dim=2)
+                        else:
+                            # Wrapping case - need fallback for this layer
+                            # Truncate back to original and mark for fallback
+                            layer.keys = layer.keys[:, :, :cache_len_before_tree, :]
+                            layer.values = layer.values[:, :, :cache_len_before_tree, :]
+                            need_fallback = True
+
+                        layer.cumulative_length = current_seq_len + num_accepted
+                    else:
+                        # Regular (non-sliding window) layer - simple extraction
+                        # Tree tokens are at positions current_seq_len to current_seq_len + tree_len - 1
+                        accepted_kv_indices = [current_seq_len + pos for pos in accepted_tree_positions]
+
+                        # Build new cache: original + accepted
+                        original_keys = layer.keys[:, :, :current_seq_len, :]
+                        original_values = layer.values[:, :, :current_seq_len, :]
+
+                        accepted_keys = layer.keys[:, :, accepted_kv_indices, :]
+                        accepted_values = layer.values[:, :, accepted_kv_indices, :]
+
+                        layer.keys = torch.cat([original_keys, accepted_keys], dim=2)
+                        layer.values = torch.cat([original_values, accepted_values], dim=2)
+
             # Update sequence with accepted tokens
             current_tokens.extend(tokens_to_add)
             num_generated += len(tokens_to_add)
@@ -1605,40 +1690,31 @@ class GemmaMedusaModel(nn.Module):
             if should_stop or num_generated >= max_new_tokens:
                 break
 
-            # Update KV cache and get new logits for accepted tokens
-            # Only process the newly accepted tokens
-            new_tokens_tensor = torch.tensor([tokens_to_add], dtype=torch.long, device=self._device)
-            # Position IDs for the new tokens
-            new_position_ids = torch.arange(
-                current_seq_len - len(tokens_to_add),
-                current_seq_len,
-                dtype=torch.long,
-                device=self._device
-            ).unsqueeze(0)
+            # OPTIMIZATION: Reuse hidden state from tree verification for Medusa heads
+            # With proper tree attention masking, the hidden state at the last accepted
+            # position is computed with the correct causal context (only ancestors).
+            # We use this directly for Medusa heads - NO transformer forward pass needed!
+            last_accepted_tree_idx = int(ret_indices[best_candidate, accept_length].item())
 
+            # Extract hidden state at the last accepted position
+            # tree_hidden_states is (tree_len, hidden_size)
+            last_hidden = tree_hidden_states[last_accepted_tree_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, hidden)
+
+            # Compute main logits and Medusa heads from this hidden state
             if is_cuda:
                 with torch.amp.autocast('cuda', dtype=dtype):
-                    hidden_states, past_key_values = self._get_hidden_states_with_cache(
-                        new_tokens_tensor,
-                        past_key_values=past_key_values,
-                        position_ids=new_position_ids,
-                    )
                     main_logits, medusa_logits = self._compute_logits(
-                        hidden_states, return_medusa=True, last_only=True
+                        last_hidden, return_medusa=True
                     )
             else:
-                hidden_states, past_key_values = self._get_hidden_states_with_cache(
-                    new_tokens_tensor,
-                    past_key_values=past_key_values,
-                    position_ids=new_position_ids,
-                )
                 main_logits, medusa_logits = self._compute_logits(
-                    hidden_states, return_medusa=True, last_only=True
+                    last_hidden, return_medusa=True
                 )
 
             assert medusa_logits is not None
-            last_main = main_logits[:, 0, :]
-            last_medusa = medusa_logits[:, :, 0, :]
+            # main_logits is (1, 1, vocab), medusa_logits is (num_heads, 1, 1, vocab)
+            last_main = main_logits[0]  # (1, vocab)
+            last_medusa = medusa_logits[:, 0, :, :]  # (num_heads, 1, vocab)
 
         stats.tokens_generated = num_generated
         return current_tokens, stats
