@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-01-23T19:08:22.713133",
+  "task": "arc-challenge",
+  "model_name": "google/gemma-3-270m-it",
+  "checkpoint": "/home/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_mixer",
+  "config": {
+    "medusa_num_heads": 4,
+    "inference_num_heads": 4,
+    "medusa_num_layers": 1,
+    "lora_rank": 64,
+    "lora_alpha": 64,
+    "max_problems": 200,
+    "max_new_tokens": 16,
+    "temperature": 0.0,
+    "use_fixed_size_tree": false,
+    "use_heuristic_tree": false
+  },
+  "results": {
+    "mtp": {
+      "accuracy": 0.265,
+      "tokens": 3200,
+      "time_seconds": 62.71182787581347,
+      "tokens_per_second": 51.02705675134957,
+      "forward_passes": 1620,
+      "mean_accepted_length": 1.9753086419753085,
+      "num_correct": 53,
+      "num_total": 200
+    }
+  }
+}

@@ -27,30 +27,197 @@ from .config import GemmaConfigWrapper, GemmaMedusaConfig
 from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaResBlock
 
 
-# Cache for loaded optimal tree choices
-_OPTIMAL_TREE_CACHE: Dict[int, List[Tuple[int, ...]]] = {}
+# Cache for loaded optimal tree choices (keyed by checkpoint path or num_heads)
+_OPTIMAL_TREE_CACHE: Dict[str, List[Tuple[int, ...]]] = {}
 
 
-def _get_optimal_tree_path(num_heads: int) -> str:
-    """Get path to optimal tree JSON file for given number of heads."""
+def _get_node_expectation(
+    accuracies: Dict[int, Dict[int, float]],
+    node: Tuple[int, ...],
+    topk: int
+) -> float:
+    """
+    Compute expected acceptance probability for a node path.
+
+    Node is a tuple like (0,), (0, 1), (2, 0, 3) representing:
+    - First element: which top-k prediction from head 0 (depth 0)
+    - Second element: which top-k prediction from head 1 (depth 1)
+    - etc.
+
+    Expected acceptance = product of recall@(rank+1) for each position.
+    """
+    expectation = 1.0
+    for depth, rank in enumerate(node):
+        # rank is 0-indexed, so rank=0 means top-1, rank=1 means top-2, etc.
+        k = min(rank + 1, topk)
+        recall_at_k = accuracies[depth].get(k, 0.0)
+        expectation *= recall_at_k
+    return expectation
+
+
+def _explore_tree_greedy(
+    accuracies: Dict[int, Dict[int, float]],
+    max_depth: int,
+    max_child: List[int],
+    num_iterations: int,
+    topk: int,
+) -> List[Tuple[int, ...]]:
+    """
+    Greedy tree exploration algorithm from Medusa paper.
+
+    Args:
+        accuracies: head_idx -> k -> recall rate
+        max_depth: maximum tree depth (= num_heads)
+        max_child: max children per depth level
+        num_iterations: number of nodes to add (tree_size - 1)
+        topk: max k value to consider
+
+    Returns:
+        List of accepted node tuples representing the tree
+    """
+    explored_nodes = {}
+    accept_nodes = [tuple([0])]  # Start with root: top-1 from head 0
+    explored_nodes[tuple([0])] = _get_node_expectation(accuracies, (0,), topk)
+
+    for _ in range(num_iterations):
+        # Find all neighbor nodes
+        neighbors = []
+        for node in accept_nodes:
+            # Option 1: Increment last element (try next top-k at same depth)
+            if node[-1] < max_child[len(node) - 1] - 1:
+                neighbor = list(node)
+                neighbor[-1] = neighbor[-1] + 1
+                neighbors.append(tuple(neighbor))
+
+            # Option 2: Extend to next depth (add child from next head)
+            if len(node) < max_depth:
+                neighbor = list(node)
+                neighbor.append(0)
+                neighbors.append(tuple(neighbor))
+
+        # Find best neighbor not already accepted
+        best_neighbor = None
+        best_expectation = 0
+
+        for neighbor in neighbors:
+            if neighbor in accept_nodes:
+                continue
+
+            if neighbor in explored_nodes:
+                expectation = explored_nodes[neighbor]
+            else:
+                expectation = _get_node_expectation(accuracies, neighbor, topk)
+                explored_nodes[neighbor] = expectation
+
+            if expectation > best_expectation:
+                best_neighbor = neighbor
+                best_expectation = expectation
+
+        if best_neighbor is None:
+            break
+
+        accept_nodes.append(best_neighbor)
+
+    # Sort by length (depth) then by values
+    return sorted(accept_nodes, key=lambda x: (len(x), x))
+
+
+def generate_optimal_tree_from_head_acc(
+    head_acc_path: str,
+    num_heads: int,
+    tree_size: int = 79,
+    topk: int = 64,
+) -> Optional[List[Tuple[int, ...]]]:
+    """
+    Generate optimal tree choices from a head_acc.json file.
+
+    Args:
+        head_acc_path: Path to head_acc.json file from checkpoint
+        num_heads: Number of Medusa heads to use
+        tree_size: Target tree size (default 79)
+        topk: Max top-k to consider per head (default 64)
+
+    Returns:
+        List of tree node tuples, or None if file doesn't exist/is invalid
+    """
+    if not os.path.exists(head_acc_path):
+        return None
+
+    try:
+        with open(head_acc_path) as f:
+            data = json.load(f)
+
+        recall = data.get("recall", {})
+
+        # Convert recall data to format expected by tree generation
+        # recall format: {"head_0": {"1": 0.65, "2": 0.72, ...}, ...}
+        accuracies: Dict[int, Dict[int, float]] = {}
+        for h in range(num_heads):
+            head_key = f"head_{h}"
+            if head_key in recall:
+                accuracies[h] = {int(k): v for k, v in recall[head_key].items()}
+            else:
+                accuracies[h] = {}
+
+        # Generate tree using greedy algorithm
+        max_child = [topk] * num_heads
+        tree_choices = _explore_tree_greedy(
+            accuracies=accuracies,
+            max_depth=num_heads,
+            max_child=max_child,
+            num_iterations=tree_size - 1,  # -1 because we start with root
+            topk=topk,
+        )
+
+        return tree_choices
+
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def load_optimal_tree_choices(num_heads: int, checkpoint_path: Optional[str] = None) -> Optional[List[Tuple[int, ...]]]:
+    """
+    Load or generate optimal tree choices.
+
+    Priority order:
+    1. If checkpoint_path provided, try to load/generate from <checkpoint>/head_acc.json
+    2. Fall back to pre-computed trees in results/medusa/optimal_tree_Nheads.json
+
+    Args:
+        num_heads: Number of Medusa heads
+        checkpoint_path: Optional path to checkpoint directory
+
+    Returns:
+        List of tree node tuples, or None if not available
+    """
+    # Try checkpoint's head_acc.json first
+    if checkpoint_path:
+        # Normalize checkpoint path (handle final/ subdirectory)
+        if checkpoint_path.endswith("/final"):
+            base_checkpoint = os.path.dirname(checkpoint_path)
+        else:
+            base_checkpoint = checkpoint_path
+
+        head_acc_path = os.path.join(base_checkpoint, "head_acc.json")
+        cache_key = f"{head_acc_path}:{num_heads}"
+
+        if cache_key in _OPTIMAL_TREE_CACHE:
+            return _OPTIMAL_TREE_CACHE[cache_key]
+
+        tree_choices = generate_optimal_tree_from_head_acc(head_acc_path, num_heads)
+        if tree_choices is not None:
+            _OPTIMAL_TREE_CACHE[cache_key] = tree_choices
+            return tree_choices
+
+    # Fall back to pre-computed trees
+    cache_key = f"precomputed:{num_heads}"
+    if cache_key in _OPTIMAL_TREE_CACHE:
+        return _OPTIMAL_TREE_CACHE[cache_key]
+
     # Find the results/medusa directory relative to this file
     module_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(module_dir, "results", "medusa", f"optimal_tree_{num_heads}head{'s' if num_heads > 1 else ''}.json")
+    tree_path = os.path.join(module_dir, "results", "medusa", f"optimal_tree_{num_heads}head{'s' if num_heads > 1 else ''}.json")
 
-
-def load_optimal_tree_choices(num_heads: int) -> Optional[List[Tuple[int, ...]]]:
-    """
-    Load calibrated optimal tree choices from results/medusa/optimal_tree_Nheads.json.
-
-    These trees were generated by measuring head recall@k on training data and using
-    the greedy tree exploration algorithm from the Medusa paper.
-
-    Returns None if the optimal tree file doesn't exist.
-    """
-    if num_heads in _OPTIMAL_TREE_CACHE:
-        return _OPTIMAL_TREE_CACHE[num_heads]
-
-    tree_path = _get_optimal_tree_path(num_heads)
     if not os.path.exists(tree_path):
         return None
 
@@ -59,7 +226,7 @@ def load_optimal_tree_choices(num_heads: int) -> Optional[List[Tuple[int, ...]]]
             data = json.load(f)
         # Convert lists back to tuples
         choices = [tuple(node) for node in data["tree_choices"]]
-        _OPTIMAL_TREE_CACHE[num_heads] = choices
+        _OPTIMAL_TREE_CACHE[cache_key] = choices
         return choices
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
@@ -218,25 +385,32 @@ def get_sparse_tree_choices(num_heads: int) -> List[Tuple[int, ...]]:
     return choices
 
 
-def get_fixed_size_tree_choices(num_heads: int, target_size: int = 79, use_heuristic: bool = False) -> List[Tuple[int, ...]]:
+def get_fixed_size_tree_choices(
+    num_heads: int,
+    target_size: int = 79,
+    use_heuristic: bool = False,
+    checkpoint_path: Optional[str] = None,
+) -> List[Tuple[int, ...]]:
     """
     Generate tree choices that result in exactly target_size nodes (including root).
 
-    By default, uses calibrated optimal trees from results/medusa/ which were generated
-    by measuring head recall@k on training data. Falls back to heuristic trees if
-    optimal trees are unavailable.
+    By default, uses calibrated optimal trees. Priority order:
+    1. If checkpoint_path provided, generate from <checkpoint>/head_acc.json
+    2. Fall back to pre-computed trees in results/medusa/
+    3. Fall back to heuristic trees if no optimal tree available
 
     Args:
         num_heads: Number of Medusa heads
         target_size: Target tree size (default 79)
         use_heuristic: If True, use heuristic trees instead of calibrated optimal trees
+        checkpoint_path: Optional path to checkpoint directory with head_acc.json
 
     Returns:
         List of tree node tuples representing the tree structure
     """
     # Try to load calibrated optimal tree unless explicitly using heuristic
     if not use_heuristic:
-        optimal_choices = load_optimal_tree_choices(num_heads)
+        optimal_choices = load_optimal_tree_choices(num_heads, checkpoint_path)
         if optimal_choices is not None:
             return optimal_choices
 
@@ -577,6 +751,7 @@ class GemmaMedusaModel(nn.Module):
 
         self._device = device
         self._dtype = dtype
+        self._checkpoint_path: Optional[str] = None  # Set when loading checkpoint
 
         # Load base model
         if device.type == "cuda":
@@ -1193,10 +1368,15 @@ class GemmaMedusaModel(nn.Module):
         Returns:
             Dictionary of tree buffers
         """
-        config = (topk, use_sparse_tree, use_fixed_size_tree, use_heuristic_tree)
+        config = (topk, use_sparse_tree, use_fixed_size_tree, use_heuristic_tree, self._checkpoint_path)
         if self._tree_buffers_cache is None or self._tree_buffers_config != config:
             if use_fixed_size_tree:
-                choices = get_fixed_size_tree_choices(self.medusa_num_heads, target_size=79, use_heuristic=use_heuristic_tree)
+                choices = get_fixed_size_tree_choices(
+                    self.medusa_num_heads,
+                    target_size=79,
+                    use_heuristic=use_heuristic_tree,
+                    checkpoint_path=self._checkpoint_path,
+                )
             elif use_sparse_tree:
                 choices = get_sparse_tree_choices(self.medusa_num_heads)
             else:

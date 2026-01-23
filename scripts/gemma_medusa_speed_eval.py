@@ -334,6 +334,7 @@ if __name__ == "__main__":
     print0(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.medusa_heads.load_state_dict(checkpoint['medusa_heads'])
+    model._checkpoint_path = args.checkpoint  # Store for optimal tree generation from head_acc.json
     model.eval()
     print0(f"Medusa parameters: {model.get_medusa_param_count():,}")
 

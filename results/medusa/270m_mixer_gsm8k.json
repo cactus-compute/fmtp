@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-01-23T19:47:26.104519",
+  "task": "gsm8k",
+  "model_name": "google/gemma-3-270m-it",
+  "checkpoint": "/home/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_mixer",
+  "config": {
+    "medusa_num_heads": 4,
+    "inference_num_heads": 4,
+    "medusa_num_layers": 1,
+    "lora_rank": 64,
+    "lora_alpha": 64,
+    "max_problems": 200,
+    "max_new_tokens": 512,
+    "temperature": 0.0,
+    "use_fixed_size_tree": false,
+    "use_heuristic_tree": false
+  },
+  "results": {
+    "mtp": {
+      "accuracy": 0.1,
+      "tokens": 102400,
+      "time_seconds": 2406.443881562911,
+      "tokens_per_second": 42.55241553087636,
+      "forward_passes": 61399,
+      "mean_accepted_length": 1.6677796055310348,
+      "num_correct": 20,
+      "num_total": 200
+    }
+  }
+}
