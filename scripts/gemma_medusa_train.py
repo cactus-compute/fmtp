@@ -396,7 +396,7 @@ if __name__ == "__main__":
                         help="Enable MLP-Mixer style cross-head mixing")
     parser.add_argument("--mlp-mixer-hidden", type=int, default=16,
                         help="Hidden dimension for MLP mixer (default: 16)")
-    parser.add_argument("--use-attn-mixer", action="store_true",
+    parser.add_argument("--use-attn", action="store_true",
                         help="Enable attention-based cross-head mixing (single transformer block)")
 
     # Performance optimization
@@ -496,15 +496,15 @@ if __name__ == "__main__":
     print0(f"Loading base model: {args.base_model}")
     if args.use_mlp_mixer:
         mixer_str = f", mlp_mixer(hidden={args.mlp_mixer_hidden})"
-    elif args.use_attn_mixer:
-        mixer_str = ", attn_mixer"
+    elif args.use_attn:
+        mixer_str = ", attn"
     else:
         mixer_str = ""
     print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, lora_rank={args.lora_rank}{mixer_str}")
 
     # Determine mixer type for model
-    use_head_mixer = args.use_mlp_mixer or args.use_attn_mixer
-    mixer_type = "attention" if args.use_attn_mixer else "mlp"
+    use_head_mixer = args.use_mlp_mixer or args.use_attn
+    mixer_type = "attention" if args.use_attn else "mlp"
 
     model = load_gemma_medusa_model(
         model_name=args.base_model,
@@ -979,7 +979,7 @@ if __name__ == "__main__":
                     "lora_rank": args.lora_rank,
                     "lora_alpha": args.lora_alpha,
                     "use_mlp_mixer": args.use_mlp_mixer,
-                    "use_attn_mixer": args.use_attn_mixer,
+                    "use_attn": args.use_attn,
                     "mlp_mixer_hidden": args.mlp_mixer_hidden if args.use_mlp_mixer else None,
                 },
                 "total_predictions": total_counts,
