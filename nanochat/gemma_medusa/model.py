@@ -2362,17 +2362,23 @@ class GemmaMedusaModel(nn.Module):
                 mlp = self.head_attention.block.mlp
                 medusa_proj_params.append(mlp.c_fc.weight)
                 medusa_proj_params.append(mlp.c_proj.weight)
-                # Add learnable position embeddings
-                medusa_proj_params.append(self.head_attention.pos_emb)
+                # Note: pos_emb is handled separately below (too small to shard)
             # Channel mixer is a matrix param -> Muon (used by both MLP and attention)
             if self.channel_mixer_fc is not None:
                 medusa_matrix_params.append(self.channel_mixer_fc.weight)
+
+        # Collect small params that can't be sharded in DDP (first dim < world_size)
+        # These go to a separate non-distributed AdamW
+        small_params = []
+        if self.use_head_mixer and self.mixer_type == "attention" and self.head_attention is not None:
+            # pos_emb has shape (num_heads, hidden_size) which is too small to shard
+            small_params.append(self.head_attention.pos_emb)
 
         # Scale LR by 1/sqrt(hidden_size/768) like nanochat does
         dmodel_lr_scale = (hidden_size / 768) ** -0.5
         print0(f"Scaling AdamW LR by 1/sqrt({hidden_size}/768) = {dmodel_lr_scale:.4f}")
 
-        # AdamW for projection params
+        # AdamW for projection params (distributed if DDP)
         adam_groups = []
         if medusa_proj_params:
             adam_groups.append(dict(params=medusa_proj_params, lr=proj_lr * dmodel_lr_scale))
@@ -2386,6 +2392,15 @@ class GemmaMedusaModel(nn.Module):
             # Dummy optimizer if no AdamW params
             adamw_optimizer = torch.optim.AdamW([torch.zeros(1, device=self._device)], lr=1e-10)
 
+        # Separate non-distributed AdamW for small params that can't be sharded
+        if small_params:
+            small_adamw_optimizer = torch.optim.AdamW(
+                [dict(params=small_params, lr=proj_lr * dmodel_lr_scale)],
+                **adamw_kwargs
+            )
+        else:
+            small_adamw_optimizer = None
+
         # Muon for matrix params
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
         MuonFactory = DistMuon if ddp else Muon
@@ -2397,6 +2412,8 @@ class GemmaMedusaModel(nn.Module):
             muon_optimizer = torch.optim.SGD([torch.zeros(1, device=self._device)], lr=1e-10)
 
         optimizers = [adamw_optimizer, muon_optimizer]
+        if small_adamw_optimizer is not None:
+            optimizers.append(small_adamw_optimizer)
 
         # Store initial LR for scheduling
         for opt in optimizers:
@@ -2405,6 +2422,8 @@ class GemmaMedusaModel(nn.Module):
 
         print0(f"Medusa matrix params (Muon): {sum(p.numel() for p in medusa_matrix_params):,}")
         print0(f"Medusa proj params (AdamW): {sum(p.numel() for p in medusa_proj_params):,}")
+        if small_params:
+            print0(f"Small params (non-distributed AdamW): {sum(p.numel() for p in small_params):,}")
 
         return optimizers
 
