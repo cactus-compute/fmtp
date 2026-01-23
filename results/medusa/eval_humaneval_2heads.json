@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-01-23T00:46:32.344927",
+  "task": "humaneval",
+  "model_name": "google/gemma-3-270m-it",
+  "checkpoint": "checkpoints/gemma_medusa_final",
+  "config": {
+    "medusa_num_heads": 4,
+    "inference_num_heads": 2,
+    "medusa_num_layers": 2,
+    "lora_rank": 256,
+    "lora_alpha": 512,
+    "max_problems": 100,
+    "max_new_tokens": 512,
+    "temperature": 0.0,
+    "use_fixed_size_tree": true,
+    "use_heuristic_tree": false
+  },
+  "results": {
+    "mtp": {
+      "accuracy": 0.1,
+      "tokens": 51200,
+      "time_seconds": 1260.4952050420106,
+      "tokens_per_second": 40.61895657769961,
+      "forward_passes": 32766,
+      "mean_accepted_length": 1.562595373252762,
+      "num_correct": 10,
+      "num_total": 100
+    }
+  }
+}

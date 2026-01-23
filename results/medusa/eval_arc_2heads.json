@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-01-23T00:24:00.712389",
+  "task": "arc-challenge",
+  "model_name": "google/gemma-3-270m-it",
+  "checkpoint": "checkpoints/gemma_medusa_final",
+  "config": {
+    "medusa_num_heads": 4,
+    "inference_num_heads": 2,
+    "medusa_num_layers": 2,
+    "lora_rank": 256,
+    "lora_alpha": 512,
+    "max_problems": 100,
+    "max_new_tokens": 16,
+    "temperature": 0.0,
+    "use_fixed_size_tree": true,
+    "use_heuristic_tree": false
+  },
+  "results": {
+    "mtp": {
+      "accuracy": 0.26,
+      "tokens": 1600,
+      "time_seconds": 47.22541472905141,
+      "tokens_per_second": 33.88006244476105,
+      "forward_passes": 1243,
+      "mean_accepted_length": 1.2872083668543846,
+      "num_correct": 26,
+      "num_total": 100
+    }
+  }
+}
