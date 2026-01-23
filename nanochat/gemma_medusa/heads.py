@@ -178,6 +178,83 @@ class MedusaLoRAHeadWithMixer(MedusaLoRAHead):
         return x
 
 
+class MedusaHeadAttention(nn.Module):
+    """
+    Cross-head attention block for Medusa heads.
+
+    Wraps nanochat/gpt.py Block to operate across heads:
+    - Input: (num_heads, B, T, hidden_size)
+    - Reshape to (B*T, num_heads, hidden_size) treating heads as sequence
+    - Apply attention block with QK norm, RoPE, ReLU² MLP
+    - Reshape back to (num_heads, B, T, hidden_size)
+
+    Supports both causal and bidirectional attention via the causal parameter.
+    """
+    def __init__(self, num_heads: int, hidden_size: int, n_attn_head: int = 1, causal: bool = False):
+        super().__init__()
+        from dataclasses import dataclass
+        from nanochat.gpt import Block
+
+        self.num_heads = num_heads
+        self.hidden_size = hidden_size
+
+        # Create a minimal config for the Block
+        @dataclass
+        class MixerConfig:
+            n_head: int = n_attn_head
+            n_kv_head: int = n_attn_head
+            n_embd: int = hidden_size
+
+        self.block = Block(MixerConfig(), layer_idx=0, causal=causal)
+
+        # Zero-init output projections so block starts as identity
+        nn.init.zeros_(self.block.attn.c_proj.weight)
+        nn.init.zeros_(self.block.mlp.c_proj.weight)
+
+        # Learnable position embeddings for head indices
+        self.pos_emb = nn.Parameter(torch.zeros(num_heads, hidden_size))
+
+        # RoPE disabled - using learnable position embeddings instead
+        # Keeping RoPE code commented out in case we want to experiment with it later
+        # head_dim = hidden_size // n_attn_head
+        # pos = torch.arange(num_heads)
+        # dim = torch.arange(0, head_dim, 2)
+        # freqs = 1.0 / (100 ** (dim / head_dim))  # base=100 for short sequences
+        # angles = pos.unsqueeze(1) * freqs.unsqueeze(0)
+        # cos = torch.cos(angles).repeat(1, 2).unsqueeze(0).unsqueeze(2)  # (1, num_heads, 1, head_dim)
+        # sin = torch.sin(angles).repeat(1, 2).unsqueeze(0).unsqueeze(2)
+
+        # Identity RoPE (no rotation) since we use learnable position embeddings
+        # Note: apply_rotary_emb expects cos/sin with half the head_dim (rotates pairs)
+        head_dim = hidden_size // n_attn_head
+        self.register_buffer('cos', torch.ones(1, num_heads, 1, head_dim // 2), persistent=False)
+        self.register_buffer('sin', torch.zeros(1, num_heads, 1, head_dim // 2), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply cross-head attention block.
+
+        Args:
+            x: (num_heads, B, T, hidden_size)
+
+        Returns:
+            (num_heads, B, T, hidden_size)
+        """
+        num_heads, B, T, hidden_size = x.shape
+
+        # Reshape: (num_heads, B, T, hidden) -> (B*T, num_heads, hidden)
+        x_flat = x.permute(1, 2, 0, 3).reshape(B * T, num_heads, hidden_size)
+
+        # Add learnable position embeddings
+        x_flat = x_flat + self.pos_emb  # (B*T, num_heads, hidden) + (num_heads, hidden)
+
+        # Apply block (cos/sin are identity since we use learnable position embeddings)
+        x_flat = self.block(x_flat, (self.cos, self.sin), window_size=(-1, -1), kv_cache=None)
+
+        # Reshape back: (B*T, num_heads, hidden) -> (num_heads, B, T, hidden)
+        return x_flat.reshape(B, T, num_heads, hidden_size).permute(2, 0, 1, 3)
+
+
 class IndependentMedusaHead(nn.Module):
     """
     DEPRECATED: Use MedusaDeltaHead instead for better performance.

@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoConfig
 
 from .config import GemmaConfigWrapper, GemmaMedusaConfig
-from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaResBlock
+from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaHeadAttention, MedusaResBlock
 
 
 # Cache for loaded optimal tree choices (keyed by checkpoint path or num_heads)
@@ -732,6 +732,8 @@ class GemmaMedusaModel(nn.Module):
         zero_init_mlp: bool = False,
         use_head_mixer: bool = False,
         mixer_hidden: int = 16,
+        mixer_type: str = "mlp",  # "mlp" or "attention"
+        attention_head_dim: int | None = None,  # head_dim for attention mixer (default: min(64, hidden_size))
     ):
         super().__init__()
         self.model_name = model_name
@@ -742,6 +744,8 @@ class GemmaMedusaModel(nn.Module):
         self.zero_init_mlp = zero_init_mlp
         self.use_head_mixer = use_head_mixer
         self.mixer_hidden = mixer_hidden
+        self.mixer_type = mixer_type
+        self.attention_head_dim = attention_head_dim
 
         # Determine device and dtype
         if device is None:
@@ -797,21 +801,40 @@ class GemmaMedusaModel(nn.Module):
 
         # Create cross-head mixer if enabled (single shared module)
         if use_head_mixer:
-            # Head mixing MLP: num_heads -> mixer_hidden -> num_heads
-            self.head_mixer_fc1 = nn.Linear(medusa_num_heads, mixer_hidden, bias=False)
-            self.head_mixer_fc2 = nn.Linear(mixer_hidden, medusa_num_heads, bias=False)
-            # Channel mixing MLP: hidden_size -> hidden_size (ResBlock style)
-            self.channel_mixer_fc = nn.Linear(hidden_size, hidden_size, bias=False)
-            # Zero-init output layers so mixer starts as identity
-            nn.init.zeros_(self.head_mixer_fc2.weight)
-            nn.init.zeros_(self.channel_mixer_fc.weight)
-            self.head_mixer_fc1 = self.head_mixer_fc1.to(device=device, dtype=dtype)
-            self.head_mixer_fc2 = self.head_mixer_fc2.to(device=device, dtype=dtype)
-            self.channel_mixer_fc = self.channel_mixer_fc.to(device=device, dtype=dtype)
+            if mixer_type == "mlp":
+                # Head mixing MLP: num_heads -> mixer_hidden -> num_heads
+                self.head_mixer_fc1 = nn.Linear(medusa_num_heads, mixer_hidden, bias=False)
+                self.head_mixer_fc2 = nn.Linear(mixer_hidden, medusa_num_heads, bias=False)
+                # Channel mixing MLP: hidden_size -> hidden_size (ResBlock style)
+                self.channel_mixer_fc = nn.Linear(hidden_size, hidden_size, bias=False)
+                # Zero-init output layers so mixer starts as identity
+                nn.init.zeros_(self.head_mixer_fc2.weight)
+                nn.init.zeros_(self.channel_mixer_fc.weight)
+                self.head_mixer_fc1 = self.head_mixer_fc1.to(device=device, dtype=dtype)
+                self.head_mixer_fc2 = self.head_mixer_fc2.to(device=device, dtype=dtype)
+                self.channel_mixer_fc = self.channel_mixer_fc.to(device=device, dtype=dtype)
+                self.head_attention = None
+            elif mixer_type == "attention":
+                # Cross-head attention mixer
+                self.head_attention = MedusaHeadAttention(
+                    num_heads=medusa_num_heads,
+                    hidden_size=hidden_size,
+                    head_dim=attention_head_dim,
+                ).to(device=device, dtype=dtype)
+                # Channel mixing MLP still used after attention (ResBlock style)
+                self.channel_mixer_fc = nn.Linear(hidden_size, hidden_size, bias=False)
+                nn.init.zeros_(self.channel_mixer_fc.weight)
+                self.channel_mixer_fc = self.channel_mixer_fc.to(device=device, dtype=dtype)
+                # Not used for attention mixer
+                self.head_mixer_fc1 = None
+                self.head_mixer_fc2 = None
+            else:
+                raise ValueError(f"Unknown mixer_type: {mixer_type}. Must be 'mlp' or 'attention'.")
         else:
             self.head_mixer_fc1 = None
             self.head_mixer_fc2 = None
             self.channel_mixer_fc = None
+            self.head_attention = None
 
         # Pre-compute stacked weights and scalings for efficient batched forward
         self._cache_stacked_weights()
@@ -979,13 +1002,20 @@ class GemmaMedusaModel(nn.Module):
         stacked_resblock = torch.stack(resblock_outputs, dim=0)  # (num_heads, B, T, hidden)
 
         # Step 2.5: Apply cross-head mixer if enabled
-        if self.use_head_mixer and self.head_mixer_fc1 is not None:
-            stacked_resblock = MedusaLoRAHeadWithMixer.apply_mixer(
-                stacked_resblock,
-                self.head_mixer_fc1,
-                self.head_mixer_fc2,
-                self.channel_mixer_fc,
-            )
+        if self.use_head_mixer:
+            if self.mixer_type == "mlp" and self.head_mixer_fc1 is not None and self.head_mixer_fc2 is not None:
+                stacked_resblock = MedusaLoRAHeadWithMixer.apply_mixer(
+                    stacked_resblock,
+                    self.head_mixer_fc1,
+                    self.head_mixer_fc2,
+                    self.channel_mixer_fc,
+                )
+            elif self.mixer_type == "attention" and self.head_attention is not None:
+                # Apply cross-head attention
+                stacked_resblock = self.head_attention(stacked_resblock)
+                # Apply channel mixing (ResBlock style) after attention
+                if self.channel_mixer_fc is not None:
+                    stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
         # During training, stack weights fresh each forward to capture gradient updates
         # During inference, use pre-cached weights for efficiency
@@ -1100,13 +1130,20 @@ class GemmaMedusaModel(nn.Module):
         stacked_resblock = torch.stack(resblock_outputs, dim=0)  # (num_heads, B, T, hidden)
 
         # Step 1.5: Apply cross-head mixer if enabled
-        if self.use_head_mixer and self.head_mixer_fc1 is not None:
-            stacked_resblock = MedusaLoRAHeadWithMixer.apply_mixer(
-                stacked_resblock,
-                self.head_mixer_fc1,
-                self.head_mixer_fc2,
-                self.channel_mixer_fc,
-            )
+        if self.use_head_mixer:
+            if self.mixer_type == "mlp" and self.head_mixer_fc1 is not None and self.head_mixer_fc2 is not None:
+                stacked_resblock = MedusaLoRAHeadWithMixer.apply_mixer(
+                    stacked_resblock,
+                    self.head_mixer_fc1,
+                    self.head_mixer_fc2,
+                    self.channel_mixer_fc,
+                )
+            elif self.mixer_type == "attention" and self.head_attention is not None:
+                # Apply cross-head attention
+                stacked_resblock = self.head_attention(stacked_resblock)
+                # Apply channel mixing (ResBlock style) after attention
+                if self.channel_mixer_fc is not None:
+                    stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
         # Step 2: Compute LoRA projections (small memory: num_heads * B * T * rank)
         # Stack weights for batched computation
@@ -2308,11 +2345,19 @@ class GemmaMedusaModel(nn.Module):
                 medusa_proj_params.append(head.lora_B.weight)
 
         # Add mixer params (single shared module on the model)
-        if self.use_head_mixer and self.head_mixer_fc1 is not None:
-            # Head mixer params go to AdamW (small projection-like params)
-            medusa_proj_params.append(self.head_mixer_fc1.weight)
-            medusa_proj_params.append(self.head_mixer_fc2.weight)
-            # Channel mixer is a matrix param -> Muon
+        if self.use_head_mixer:
+            if self.mixer_type == "mlp" and self.head_mixer_fc1 is not None:
+                # Head mixer params go to AdamW (small projection-like params)
+                medusa_proj_params.append(self.head_mixer_fc1.weight)
+                if self.head_mixer_fc2 is not None:
+                    medusa_proj_params.append(self.head_mixer_fc2.weight)
+            elif self.mixer_type == "attention" and self.head_attention is not None:
+                # Attention mixer Q, K, V, out projections go to AdamW
+                medusa_proj_params.append(self.head_attention.q_proj.weight)
+                medusa_proj_params.append(self.head_attention.k_proj.weight)
+                medusa_proj_params.append(self.head_attention.v_proj.weight)
+                medusa_proj_params.append(self.head_attention.out_proj.weight)
+            # Channel mixer is a matrix param -> Muon (used by both MLP and attention)
             if self.channel_mixer_fc is not None:
                 medusa_matrix_params.append(self.channel_mixer_fc.weight)
 
@@ -2369,6 +2414,8 @@ def load_gemma_medusa_model(
     zero_init_mlp: bool = False,
     use_head_mixer: bool = False,
     mixer_hidden: int = 16,
+    mixer_type: str = "mlp",
+    attention_head_dim: int | None = None,
 ):
     """
     Load a Gemma model with Medusa LoRA heads.
@@ -2383,8 +2430,10 @@ def load_gemma_medusa_model(
         dtype: Data type for model weights
         freeze_base: Whether to freeze base model parameters
         zero_init_mlp: Whether to zero-initialize ResBlock MLP weights
-        use_head_mixer: Whether to use cross-head MLP mixer
-        mixer_hidden: Hidden dimension for the cross-head mixer MLP
+        use_head_mixer: Whether to use cross-head mixer
+        mixer_hidden: Hidden dimension for the cross-head MLP mixer
+        mixer_type: Type of mixer ("mlp" or "attention")
+        attention_head_dim: Head dimension for attention mixer (default: min(64, hidden_size))
 
     Returns:
         GemmaMedusaModel instance
@@ -2401,4 +2450,6 @@ def load_gemma_medusa_model(
         zero_init_mlp=zero_init_mlp,
         use_head_mixer=use_head_mixer,
         mixer_hidden=mixer_hidden,
+        mixer_type=mixer_type,
+        attention_head_dim=attention_head_dim,
     )

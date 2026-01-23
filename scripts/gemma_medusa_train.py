@@ -392,10 +392,12 @@ if __name__ == "__main__":
                         help="Maximum sequence length")
     parser.add_argument("--zero-init-mtp-mlp", action="store_true", default=True,
                         help="Zero-initialize ResBlock MLP weights")
-    parser.add_argument("--use-head-mixer", action="store_true",
-                        help="Enable cross-head MLP mixer for improved multi-token prediction")
-    parser.add_argument("--mixer-hidden", type=int, default=16,
-                        help="Hidden dimension for cross-head mixer MLP (default: 16)")
+    parser.add_argument("--use-mlp-mixer", action="store_true",
+                        help="Enable MLP-Mixer style cross-head mixing")
+    parser.add_argument("--mlp-mixer-hidden", type=int, default=16,
+                        help="Hidden dimension for MLP mixer (default: 16)")
+    parser.add_argument("--use-attn-mixer", action="store_true",
+                        help="Enable attention-based cross-head mixing (single transformer block)")
 
     # Performance optimization
     parser.add_argument("--compile", action="store_true",
@@ -492,8 +494,17 @@ if __name__ == "__main__":
     # Load model and tokenizer
 
     print0(f"Loading base model: {args.base_model}")
-    mixer_str = f", head_mixer={args.mixer_hidden}" if args.use_head_mixer else ""
+    if args.use_mlp_mixer:
+        mixer_str = f", mlp_mixer(hidden={args.mlp_mixer_hidden})"
+    elif args.use_attn_mixer:
+        mixer_str = ", attn_mixer"
+    else:
+        mixer_str = ""
     print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, lora_rank={args.lora_rank}{mixer_str}")
+
+    # Determine mixer type for model
+    use_head_mixer = args.use_mlp_mixer or args.use_attn_mixer
+    mixer_type = "attention" if args.use_attn_mixer else "mlp"
 
     model = load_gemma_medusa_model(
         model_name=args.base_model,
@@ -505,8 +516,9 @@ if __name__ == "__main__":
         dtype=torch.bfloat16,
         freeze_base=True,
         zero_init_mlp=args.zero_init_mtp_mlp,
-        use_head_mixer=args.use_head_mixer,
-        mixer_hidden=args.mixer_hidden,
+        use_head_mixer=use_head_mixer,
+        mixer_hidden=args.mlp_mixer_hidden,
+        mixer_type=mixer_type,
     )
     tokenizer = GemmaTokenizerWrapper(args.base_model)
 
@@ -966,8 +978,9 @@ if __name__ == "__main__":
                     "medusa_num_layers": args.medusa_num_layers,
                     "lora_rank": args.lora_rank,
                     "lora_alpha": args.lora_alpha,
-                    "use_head_mixer": args.use_head_mixer,
-                    "mixer_hidden": args.mixer_hidden if args.use_head_mixer else None,
+                    "use_mlp_mixer": args.use_mlp_mixer,
+                    "use_attn_mixer": args.use_attn_mixer,
+                    "mlp_mixer_hidden": args.mlp_mixer_hidden if args.use_mlp_mixer else None,
                 },
                 "total_predictions": total_counts,
                 "recall": recall_rates,

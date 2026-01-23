@@ -14,7 +14,7 @@ from .model import (
     load_gemma_model,
     load_gemma_medusa_model,
 )
-from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaResBlock, MedusaHead, MedusaDeltaHead, IndependentMedusaHead
+from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaHeadAttention, MedusaResBlock, MedusaHead, MedusaDeltaHead, IndependentMedusaHead
 
 __all__ = [
     # Config
@@ -31,6 +31,7 @@ __all__ = [
     # Heads
     "MedusaLoRAHead",
     "MedusaLoRAHeadWithMixer",
+    "MedusaHeadAttention",
     "MedusaResBlock",
     "MedusaHead",
     "MedusaDeltaHead",
