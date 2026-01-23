@@ -203,7 +203,7 @@ def main():
     parser.add_argument("--topk", type=int, default=100,
                         help="Maximum k to measure recall at")
     parser.add_argument("-o", "--output", type=str, default=None,
-                        help="Output JSON path (default: <checkpoint>/head_acc_wildchat.json)")
+                        help="Output JSON path (default: <checkpoint>/head_acc.json)")
     parser.add_argument("--val-samples", type=int, default=960,
                         help="Number of validation samples (matches training default)")
     parser.add_argument("--medusa-num-heads", type=int, default=4,
@@ -341,7 +341,7 @@ def main():
         # Save results - default to checkpoint directory if not specified
         output_path = args.output
         if output_path is None:
-            output_path = os.path.join(args.checkpoint, "head_acc_wildchat.json")
+            output_path = os.path.join(args.checkpoint, "head_acc.json")
         else:
             output_dir = os.path.dirname(os.path.abspath(output_path))
             if output_dir:
