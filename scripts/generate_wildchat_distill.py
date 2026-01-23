@@ -156,7 +156,7 @@ def estimate_tokens(text: str) -> int:
 def process_wildchat_sample(
     sample: dict,
     idx: int,
-    api_bases: list[str],
+    clients: list[openai.OpenAI],
     model_name: str,
     multi_turn: bool,
     temperature: float,
@@ -164,9 +164,8 @@ def process_wildchat_sample(
     min_output_tokens: int = 64,
 ) -> Optional[dict]:
     """Process a single WildChat sample and generate model responses."""
-    # Load balance across servers
-    api_base = api_bases[idx % len(api_bases)]
-    client = openai.OpenAI(api_key="EMPTY", base_url=api_base)
+    # Load balance across clients
+    client = clients[idx % len(clients)]
 
     # WildChat format: list of {"role": "user"/"assistant", "content": "..."}
     conversation = sample.get("conversation", [])
@@ -244,9 +243,9 @@ def main():
         return
     print(f"Found {len(api_bases)} server(s)")
 
-    # Get model name from first server
-    client = openai.OpenAI(api_key="EMPTY", base_url=api_bases[0])
-    model_name = client.models.list().data[0].id
+    # Create reusable clients (one per server, shared across threads)
+    clients = [openai.OpenAI(api_key="EMPTY", base_url=api_base) for api_base in api_bases]
+    model_name = clients[0].models.list().data[0].id
     print(f"Using model: {model_name}")
 
     # Download WildChat dataset
@@ -300,7 +299,7 @@ def main():
                     process_wildchat_sample,
                     sample,
                     idx + start_idx,
-                    api_bases,
+                    clients,
                     model_name,
                     args.multi_turn,
                     args.temperature,
