@@ -202,8 +202,8 @@ def main():
                         help="Maximum tokens per sample")
     parser.add_argument("--topk", type=int, default=100,
                         help="Maximum k to measure recall at")
-    parser.add_argument("-o", "--output", type=str, required=True,
-                        help="Output JSON path")
+    parser.add_argument("-o", "--output", type=str, default=None,
+                        help="Output JSON path (default: <checkpoint>/head_acc_wildchat.json)")
     parser.add_argument("--val-samples", type=int, default=960,
                         help="Number of validation samples (matches training default)")
     parser.add_argument("--medusa-num-heads", type=int, default=4,
@@ -338,13 +338,17 @@ def main():
             "recall": recall_rates,
         }
 
-        # Save results
-        output_dir = os.path.dirname(os.path.abspath(args.output))
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        with open(args.output, "w") as f:
+        # Save results - default to checkpoint directory if not specified
+        output_path = args.output
+        if output_path is None:
+            output_path = os.path.join(args.checkpoint, "head_acc_wildchat.json")
+        else:
+            output_dir = os.path.dirname(os.path.abspath(output_path))
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+        with open(output_path, "w") as f:
             json.dump(output, f, indent=2)
-        print(f"\nResults saved to: {args.output}")
+        print(f"\nResults saved to: {output_path}")
 
         # Print summary
         print("\nRecall Summary (top-1 / top-10 / top-100):")
