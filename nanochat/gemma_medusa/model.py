@@ -2351,11 +2351,19 @@ class GemmaMedusaModel(nn.Module):
                 if self.head_mixer_fc2 is not None:
                     medusa_proj_params.append(self.head_mixer_fc2.weight)
             elif self.mixer_type == "attention" and self.head_attention is not None:
-                # Attention mixer Q, K, V, out projections go to AdamW
-                medusa_proj_params.append(self.head_attention.q_proj.weight)
-                medusa_proj_params.append(self.head_attention.k_proj.weight)
-                medusa_proj_params.append(self.head_attention.v_proj.weight)
-                medusa_proj_params.append(self.head_attention.out_proj.weight)
+                # Attention mixer params go to AdamW
+                # MedusaHeadAttention wraps a nanochat Block with attention in block.attn
+                attn = self.head_attention.block.attn
+                medusa_proj_params.append(attn.c_q.weight)
+                medusa_proj_params.append(attn.c_k.weight)
+                medusa_proj_params.append(attn.c_v.weight)
+                medusa_proj_params.append(attn.c_proj.weight)
+                # Also add MLP params from the block
+                mlp = self.head_attention.block.mlp
+                medusa_proj_params.append(mlp.c_fc.weight)
+                medusa_proj_params.append(mlp.c_proj.weight)
+                # Add learnable position embeddings
+                medusa_proj_params.append(self.head_attention.pos_emb)
             # Channel mixer is a matrix param -> Muon (used by both MLP and attention)
             if self.channel_mixer_fc is not None:
                 medusa_matrix_params.append(self.channel_mixer_fc.weight)
