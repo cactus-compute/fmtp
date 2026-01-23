@@ -148,6 +148,11 @@ def validate_message(content: str, max_chars: int = 8000) -> bool:
     return True
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough estimate of token count (chars / 4 is a reasonable approximation)."""
+    return len(text) // 4 + 1
+
+
 def process_wildchat_sample(
     sample: dict,
     idx: int,
@@ -155,7 +160,8 @@ def process_wildchat_sample(
     model_name: str,
     multi_turn: bool,
     temperature: float,
-    max_tokens: int,
+    max_seq_len: int,
+    min_output_tokens: int = 64,
 ) -> Optional[dict]:
     """Process a single WildChat sample and generate model responses."""
     # Load balance across servers
@@ -178,7 +184,11 @@ def process_wildchat_sample(
 
     try:
         if multi_turn:
-            # Generate full conversation with all user turns
+            # For multi-turn, estimate total input and compute remaining budget
+            total_input_tokens = sum(estimate_tokens(msg) for msg in user_messages)
+            max_tokens = max_seq_len - total_input_tokens - 50  # 50 token buffer for formatting
+            if max_tokens < min_output_tokens:
+                return None  # Input too long
             output = generate_multi_turn(
                 client, model_name, user_messages, temperature, max_tokens
             )
@@ -186,6 +196,10 @@ def process_wildchat_sample(
                 return {"messages": output}
         else:
             # Single turn: just use first user message
+            input_tokens = estimate_tokens(user_messages[0])
+            max_tokens = max_seq_len - input_tokens - 50  # 50 token buffer for formatting
+            if max_tokens < min_output_tokens:
+                return None  # Input too long
             response = generate_single_turn(
                 client, model_name, user_messages[0], None, temperature, max_tokens
             )
@@ -212,7 +226,7 @@ def main():
     parser.add_argument("--num-samples", type=int, default=10000, help="Number of WildChat samples to process")
     parser.add_argument("--num-threads", type=int, default=64, help="Number of concurrent threads")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
-    parser.add_argument("--max-tokens", type=int, default=2048, help="Max tokens per response")
+    parser.add_argument("--max-seq-len", type=int, default=2048, help="Max total sequence length (input + output)")
     parser.add_argument("--multi-turn", action="store_true", help="Generate full multi-turn conversations")
     parser.add_argument("--base-port", type=int, default=8000, help="Base port for vLLM servers")
     parser.add_argument("--dataset", type=str, default="allenai/WildChat-1M",
@@ -290,7 +304,7 @@ def main():
                     model_name,
                     args.multi_turn,
                     args.temperature,
-                    args.max_tokens,
+                    args.max_seq_len,
                 ): idx
                 for idx, sample in enumerate(samples)
             }
