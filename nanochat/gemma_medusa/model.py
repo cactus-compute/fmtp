@@ -819,7 +819,6 @@ class GemmaMedusaModel(nn.Module):
                 self.head_attention = MedusaHeadAttention(
                     num_heads=medusa_num_heads,
                     hidden_size=hidden_size,
-                    head_dim=attention_head_dim,
                 ).to(device=device, dtype=dtype)
                 # Channel mixing MLP still used after attention (ResBlock style)
                 self.channel_mixer_fc = nn.Linear(hidden_size, hidden_size, bias=False)

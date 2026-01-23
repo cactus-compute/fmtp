@@ -190,7 +190,10 @@ class MedusaHeadAttention(nn.Module):
 
     Supports both causal and bidirectional attention via the causal parameter.
     """
-    def __init__(self, num_heads: int, hidden_size: int, n_attn_head: int = 1, causal: bool = False):
+    def __init__(self, num_heads: int, hidden_size: int, n_attn_head: int | None = None, causal: bool = False):
+        # Default: use 4 attention heads with head_dim=hidden_size/4 (matches Gemma 270M's ratio)
+        if n_attn_head is None:
+            n_attn_head = 4
         super().__init__()
         from dataclasses import dataclass
         from nanochat.gpt import Block
