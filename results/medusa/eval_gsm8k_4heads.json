@@ -1,0 +1,37 @@
+{
+  "timestamp": "2026-01-22T08:34:38.252941",
+  "task": "gsm8k",
+  "model_name": "google/gemma-3-270m-it",
+  "checkpoint": "checkpoints/gemma_medusa_final",
+  "config": {
+    "medusa_num_heads": 4,
+    "inference_num_heads": 4,
+    "medusa_num_layers": 2,
+    "lora_rank": 256,
+    "lora_alpha": 512,
+    "max_problems": 100,
+    "max_new_tokens": 512,
+    "temperature": 0.0
+  },
+  "results": {
+    "standard": {
+      "accuracy": 0.12,
+      "tokens": 51200,
+      "time_seconds": 1426.4391966860057,
+      "tokens_per_second": 35.89357339517247,
+      "forward_passes": 51200,
+      "num_correct": 12,
+      "num_total": 100
+    },
+    "mtp": {
+      "accuracy": 0.11,
+      "tokens": 51200,
+      "time_seconds": 1058.3159123409641,
+      "tokens_per_second": 48.37874910786051,
+      "forward_passes": 29129,
+      "mean_accepted_length": 1.7576985135088743,
+      "num_correct": 11,
+      "num_total": 100
+    }
+  }
+}

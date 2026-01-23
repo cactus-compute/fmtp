@@ -137,7 +137,7 @@ def evaluate_response(conversation, completion_text, eval_type, task=None):
         return pred_answer == ref_answer, pred_answer, ref_answer
 
 
-def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens, temperature, use_fixed_size_tree=False):
+def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens, temperature, use_fixed_size_tree=False, use_heuristic_tree=False):
     """Run evaluation using MTP speculative decoding."""
     num_problems = min(len(task), max_problems) if max_problems else len(task)
 
@@ -164,6 +164,7 @@ def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens
             temperature=temperature,
             eos_token_id=eos_token_id,
             use_fixed_size_tree=use_fixed_size_tree,
+            use_heuristic_tree=use_heuristic_tree,
         )
 
         torch.cuda.synchronize()
@@ -298,6 +299,8 @@ if __name__ == "__main__":
                         help='Override number of heads to use during inference (for ablation testing)')
     parser.add_argument('--fixed-tree-size', action='store_true',
                         help='Use fixed 79-node tree for fair ablation comparison across head counts')
+    parser.add_argument('--use-heuristic-tree', action='store_true',
+                        help='Use heuristic tree instead of calibrated optimal tree (default: use optimal)')
     parser.add_argument('--use-head-mixer', action='store_true',
                         help='Use cross-head MLP mixer (for mixer checkpoint)')
     parser.add_argument('--mixer-hidden', type=int, default=16,
@@ -377,12 +380,14 @@ if __name__ == "__main__":
     effective_heads = args.inference_num_heads if args.inference_num_heads else args.medusa_num_heads
     print0("\n" + "="*50)
     tree_info = "fixed=79" if args.fixed_tree_size else "topk=10"
-    print0(f"Running MTP Speculative Decoding (heads={effective_heads}, {tree_info}, sparse=False)")
+    tree_type = "heuristic" if args.use_heuristic_tree else "optimal"
+    print0(f"Running MTP Speculative Decoding (heads={effective_heads}, {tree_info}, tree={tree_type})")
     print0("="*50)
     with torch.amp.autocast('cuda', dtype=dtype):
         results['mtp'] = run_mtp_eval(
             model, tokenizer, task, eval_type, args.max_problems, args.max_new_tokens, args.temperature,
-            use_fixed_size_tree=args.fixed_tree_size
+            use_fixed_size_tree=args.fixed_tree_size,
+            use_heuristic_tree=args.use_heuristic_tree,
         )
     print0(f"MTP: {100*results['mtp']['accuracy']:.2f}% accuracy, "
            f"{results['mtp']['tokens_per_second']:.1f} tok/s, "
@@ -419,6 +424,8 @@ if __name__ == "__main__":
             'max_problems': args.max_problems,
             'max_new_tokens': args.max_new_tokens,
             'temperature': args.temperature,
+            'use_fixed_size_tree': args.fixed_tree_size,
+            'use_heuristic_tree': args.use_heuristic_tree,
         },
         'results': results,
     }
