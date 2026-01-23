@@ -396,6 +396,8 @@ if __name__ == "__main__":
                         help="Enable MLP-Mixer style cross-head mixing")
     parser.add_argument("--mlp-mixer-hidden", type=int, default=16,
                         help="Hidden dimension for MLP mixer (default: 16)")
+    parser.add_argument("--mixer-num-layers", type=int, default=1,
+                        help="Number of MLP mixer layers to stack (default: 1)")
     parser.add_argument("--use-attn", action="store_true",
                         help="Enable attention-based cross-head mixing (single transformer block)")
     parser.add_argument("--causal-attn", action="store_true",
@@ -497,7 +499,7 @@ if __name__ == "__main__":
 
     print0(f"Loading base model: {args.base_model}")
     if args.use_mlp_mixer:
-        mixer_str = f", mlp_mixer(hidden={args.mlp_mixer_hidden})"
+        mixer_str = f", mlp_mixer(hidden={args.mlp_mixer_hidden}, layers={args.mixer_num_layers})"
     elif args.use_attn:
         mixer_str = ", attn" + ("-causal" if args.causal_attn else "")
     else:
@@ -520,6 +522,7 @@ if __name__ == "__main__":
         zero_init_mlp=args.zero_init_mtp_mlp,
         use_head_mixer=use_head_mixer,
         mixer_hidden=args.mlp_mixer_hidden,
+        mixer_num_layers=args.mixer_num_layers,
         mixer_type=mixer_type,
         causal_attn=args.causal_attn,
     )
@@ -985,6 +988,7 @@ if __name__ == "__main__":
                     "use_attn": args.use_attn,
                     "causal_attn": args.causal_attn if args.use_attn else None,
                     "mlp_mixer_hidden": args.mlp_mixer_hidden if args.use_mlp_mixer else None,
+                    "mixer_num_layers": args.mixer_num_layers if args.use_mlp_mixer else None,
                 },
                 "total_predictions": total_counts,
                 "recall": recall_rates,
