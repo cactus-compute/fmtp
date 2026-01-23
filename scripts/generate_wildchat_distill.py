@@ -149,8 +149,8 @@ def validate_message(content: str, max_chars: int = 8000) -> bool:
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough estimate of token count (chars / 4 is a reasonable approximation)."""
-    return len(text) // 4 + 1
+    """Conservative estimate of token count (~3 chars/token for mixed content)."""
+    return len(text) // 3 + 1
 
 
 def process_wildchat_sample(
