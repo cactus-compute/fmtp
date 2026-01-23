@@ -41,7 +41,7 @@ from typing import Optional
 import openai
 from datasets import load_dataset
 from tqdm import tqdm
-from tenacity import retry, stop_after_attempt, wait_random_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
 
 
 def discover_api_servers(base_port: int = 8000, max_servers: int = 10) -> list[str]:
@@ -60,7 +60,16 @@ def discover_api_servers(base_port: int = 8000, max_servers: int = 10) -> list[s
     return api_bases
 
 
-@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(3))
+def should_retry(exception):
+    """Don't retry on BadRequestError - the input is invalid."""
+    return not isinstance(exception, openai.BadRequestError)
+
+
+@retry(
+    wait=wait_random_exponential(min=1, max=60),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception(should_retry),
+)
 def generate_single_turn(
     client: openai.OpenAI,
     model_name: str,
@@ -88,7 +97,11 @@ def generate_single_turn(
     return response.choices[0].message.content.strip()
 
 
-@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(3))
+@retry(
+    wait=wait_random_exponential(min=1, max=60),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception(should_retry),
+)
 def generate_multi_turn(
     client: openai.OpenAI,
     model_name: str,
@@ -125,6 +138,16 @@ def generate_multi_turn(
     return output_messages if output_messages else None
 
 
+def validate_message(content: str, max_chars: int = 8000) -> bool:
+    """Check if a message is valid for the model."""
+    if not content or not content.strip():
+        return False
+    # Skip very long messages (likely to exceed context)
+    if len(content) > max_chars:
+        return False
+    return True
+
+
 def process_wildchat_sample(
     sample: dict,
     idx: int,
@@ -144,10 +167,10 @@ def process_wildchat_sample(
     if not conversation:
         return None
 
-    # Extract user messages
+    # Extract and validate user messages
     user_messages = [
         turn["content"] for turn in conversation
-        if turn.get("role") == "user" and turn.get("content")
+        if turn.get("role") == "user" and validate_message(turn.get("content", ""))
     ]
 
     if not user_messages:
@@ -173,8 +196,12 @@ def process_wildchat_sample(
                         {"role": "assistant", "content": response},
                     ]
                 }
+    except openai.BadRequestError as e:
+        # Log the actual error message for debugging (but don't spam)
+        if idx < 10:  # Only log first few to diagnose
+            print(f"BadRequest sample {idx}: {e.message[:200] if hasattr(e, 'message') else str(e)[:200]}")
     except Exception as e:
-        print(f"Error processing sample {idx}: {e}")
+        print(f"Error processing sample {idx}: {type(e).__name__}: {e}")
 
     return None
 
