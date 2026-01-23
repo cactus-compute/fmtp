@@ -9,7 +9,15 @@ This script:
 
 Usage:
     # First, start a vLLM server with your model:
-    python -m vllm.entrypoints.openai.api_server --model google/gemma-3-270m-it --port 8000
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+        uv run vllm serve google/gemma-3-270m-it \
+        --host 0.0.0.0 --port 8000 \
+        --dtype auto \
+        --data-parallel-size 8 \
+        --tensor-parallel-size 1 \
+        --gpu-memory-utilization 0.90 \
+        --enable-prefix-caching \
+        --max-model-len 2048
 
     # Then run this script:
     python -m scripts.generate_wildchat_distill \
@@ -224,6 +232,9 @@ def main():
         print(f"Filtered to {len(samples)} {args.language} samples")
     else:
         samples = list(ds)[:args.num_samples]
+
+    # Create output directory if needed
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     # Resume support: check existing output
     start_idx = 0
