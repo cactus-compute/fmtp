@@ -190,6 +190,181 @@ def medusa_data_generator(dataset, tokenizer, batch_size, max_seq_len, device, d
 
 
 # -----------------------------------------------------------------------------
+# Head accuracy evaluation
+
+def compute_head_recall(
+    model,
+    tokenizer,
+    conversations: list,
+    sample_indices: list,
+    max_steps: int,
+    topk: int,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+):
+    """
+    Compute recall@k for each Medusa head across the given sample indices.
+
+    Returns:
+        recall_counts: dict mapping head_idx -> k -> count of hits
+        total_counts: dict mapping head_idx -> total predictions
+    """
+    num_heads = model.medusa_num_heads
+
+    # recall_counts[head_idx][k] = number of times correct token was in top-k
+    recall_counts = {h: {k: 0 for k in range(1, topk + 1)} for h in range(num_heads)}
+    total_counts = {h: 0 for h in range(num_heads)}
+
+    for sample_idx in sample_indices:
+        conversation = conversations[sample_idx]
+
+        # Render the prompt (without the assistant's response)
+        prompt_ids = tokenizer.render_for_completion(conversation)
+
+        # Get the ground truth completion tokens (full conversation)
+        full_ids, _ = tokenizer.render_conversation(conversation)
+        completion_ids = full_ids[len(prompt_ids):]
+
+        if len(completion_ids) == 0:
+            continue
+
+        # Limit to max_steps
+        num_steps = min(max_steps, len(completion_ids))
+
+        # Process step by step
+        input_ids = torch.tensor([prompt_ids], device=device)
+
+        for step in range(num_steps):
+            # Forward pass with medusa logits
+            with torch.no_grad():
+                main_logits, medusa_logits = model.forward(
+                    input_ids, return_medusa=True, last_only=True
+                )
+
+            # For each head, check if the correct future token is in top-k
+            for head_idx in range(num_heads):
+                future_pos = step + head_idx + 1
+
+                if future_pos >= len(completion_ids):
+                    continue
+
+                target_token = completion_ids[future_pos]
+
+                # Get head's top-k predictions
+                head_logits = medusa_logits[head_idx, 0, 0, :]
+                top_indices = head_logits.topk(topk, dim=-1).indices
+
+                # Check recall at each k
+                for k in range(1, topk + 1):
+                    if target_token in top_indices[:k]:
+                        recall_counts[head_idx][k] += 1
+
+                total_counts[head_idx] += 1
+
+            # Autoregressive step: add the actual next token
+            next_token = completion_ids[step]
+            input_ids = torch.cat([
+                input_ids,
+                torch.tensor([[next_token]], device=device)
+            ], dim=1)
+
+    return recall_counts, total_counts
+
+
+def reduce_head_recall_counts(recall_counts, total_counts, num_heads, topk, device):
+    """Reduce recall counts across all ranks."""
+    if not dist.is_initialized():
+        return recall_counts, total_counts
+
+    # Flatten recall_counts to tensor for all_reduce
+    recall_tensor = torch.zeros(num_heads, topk, dtype=torch.long, device=device)
+    for h in range(num_heads):
+        for k in range(1, topk + 1):
+            recall_tensor[h, k - 1] = recall_counts[h][k]
+
+    # Flatten total_counts
+    total_tensor = torch.zeros(num_heads, dtype=torch.long, device=device)
+    for h in range(num_heads):
+        total_tensor[h] = total_counts[h]
+
+    # All-reduce (sum across all ranks)
+    dist.all_reduce(recall_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+
+    # Convert back to dict
+    reduced_recall = {h: {k: recall_tensor[h, k - 1].item() for k in range(1, topk + 1)} for h in range(num_heads)}
+    reduced_total = {h: total_tensor[h].item() for h in range(num_heads)}
+
+    return reduced_recall, reduced_total
+
+
+def run_head_accuracy_eval(
+    model,
+    tokenizer,
+    val_data,
+    device,
+    ddp_rank,
+    ddp_world_size,
+    num_heads,
+    max_samples=200,
+    max_steps=50,
+    topk=100,
+):
+    """
+    Run head accuracy evaluation on validation data.
+
+    Returns:
+        recall_rates: dict mapping head_idx -> k -> recall rate
+    """
+    model.eval()
+
+    # Determine sample indices for this rank
+    num_samples = min(max_samples, len(val_data))
+    all_indices = list(range(num_samples))
+
+    # Shard indices across ranks
+    indices_per_rank = len(all_indices) // ddp_world_size
+    start_idx = ddp_rank * indices_per_rank
+    end_idx = start_idx + indices_per_rank if ddp_rank < ddp_world_size - 1 else len(all_indices)
+    my_indices = all_indices[start_idx:end_idx]
+
+    # Compute recall on this rank's shard
+    recall_counts, total_counts = compute_head_recall(
+        model=model,
+        tokenizer=tokenizer,
+        conversations=val_data,
+        sample_indices=my_indices,
+        max_steps=max_steps,
+        topk=topk,
+        device=device,
+        rank=ddp_rank,
+        world_size=ddp_world_size,
+    )
+
+    # Reduce counts across all ranks
+    recall_counts, total_counts = reduce_head_recall_counts(
+        recall_counts, total_counts, num_heads, topk, device
+    )
+
+    # Convert counts to recall rates
+    recall_rates = {}
+    for head_idx in range(num_heads):
+        total = total_counts[head_idx]
+        if total > 0:
+            recall_rates[f"head_{head_idx}"] = {
+                str(k): recall_counts[head_idx][k] / total
+                for k in range(1, topk + 1)
+            }
+        else:
+            recall_rates[f"head_{head_idx}"] = {
+                str(k): 0.0 for k in range(1, topk + 1)
+            }
+
+    return recall_rates, total_counts
+
+
+# -----------------------------------------------------------------------------
 # Main training script
 
 if __name__ == "__main__":
@@ -748,6 +923,71 @@ if __name__ == "__main__":
         with open(os.path.join(args.output_dir, "final_loss.json"), 'w') as f:
             json.dump(final_loss_data, f, indent=2)
         print0(f"Saved final loss to {os.path.join(args.output_dir, 'final_loss.json')}")
+
+    # -----------------------------------------------------------------------------
+    # Head accuracy evaluation on validation data
+
+    if val_data is not None:
+        print0("\n" + "=" * 50)
+        print0("Running head accuracy evaluation on validation data...")
+        print0("=" * 50)
+
+        with torch.no_grad(), autocast_ctx:
+            recall_rates, total_counts = run_head_accuracy_eval(
+                model=model,
+                tokenizer=tokenizer,
+                val_data=val_data,
+                device=device,
+                ddp_rank=ddp_rank,
+                ddp_world_size=ddp_world_size,
+                num_heads=args.medusa_num_heads,
+                max_samples=min(200, len(val_data)),
+                max_steps=50,
+                topk=100,
+            )
+
+        # Print and save results (only on master process)
+        if master_process:
+            print0("\nHead Recall Summary (top-1 / top-10 / top-100):")
+            for head_idx in range(args.medusa_num_heads):
+                r1 = recall_rates[f"head_{head_idx}"]["1"]
+                r10 = recall_rates[f"head_{head_idx}"]["10"]
+                r100 = recall_rates[f"head_{head_idx}"]["100"]
+                print0(f"  Head {head_idx}: {r1:.3f} / {r10:.3f} / {r100:.3f}")
+
+            # Save head accuracy results
+            head_acc_data = {
+                "checkpoint": args.output_dir,
+                "model_name": args.base_model,
+                "num_samples": min(200, len(val_data)),
+                "max_steps": 50,
+                "config": {
+                    "medusa_num_heads": args.medusa_num_heads,
+                    "medusa_num_layers": args.medusa_num_layers,
+                    "lora_rank": args.lora_rank,
+                    "lora_alpha": args.lora_alpha,
+                    "use_head_mixer": args.use_head_mixer,
+                    "mixer_hidden": args.mixer_hidden if args.use_head_mixer else None,
+                },
+                "total_predictions": total_counts,
+                "recall": recall_rates,
+            }
+            head_acc_path = os.path.join(args.output_dir, "head_acc.json")
+            with open(head_acc_path, 'w') as f:
+                json.dump(head_acc_data, f, indent=2)
+            print0(f"\nSaved head accuracy to {head_acc_path}")
+
+            # Log to wandb
+            wandb_run.log({
+                "head_acc/head0_top1": recall_rates["head_0"]["1"],
+                "head_acc/head0_top10": recall_rates["head_0"]["10"],
+                "head_acc/head1_top1": recall_rates["head_1"]["1"] if args.medusa_num_heads > 1 else 0,
+                "head_acc/head1_top10": recall_rates["head_1"]["10"] if args.medusa_num_heads > 1 else 0,
+                "head_acc/head2_top1": recall_rates["head_2"]["1"] if args.medusa_num_heads > 2 else 0,
+                "head_acc/head2_top10": recall_rates["head_2"]["10"] if args.medusa_num_heads > 2 else 0,
+                "head_acc/head3_top1": recall_rates["head_3"]["1"] if args.medusa_num_heads > 3 else 0,
+                "head_acc/head3_top10": recall_rates["head_3"]["10"] if args.medusa_num_heads > 3 else 0,
+            })
 
     # Summary
     print0("\n" + "=" * 50)
