@@ -734,6 +734,7 @@ class GemmaMedusaModel(nn.Module):
         mixer_hidden: int = 16,
         mixer_type: str = "mlp",  # "mlp" or "attention"
         attention_head_dim: int | None = None,  # head_dim for attention mixer (default: min(64, hidden_size))
+        causal_attn: bool = False,  # Use causal attention for attention mixer (default: bidirectional)
     ):
         super().__init__()
         self.model_name = model_name
@@ -746,6 +747,7 @@ class GemmaMedusaModel(nn.Module):
         self.mixer_hidden = mixer_hidden
         self.mixer_type = mixer_type
         self.attention_head_dim = attention_head_dim
+        self.causal_attn = causal_attn
 
         # Determine device and dtype
         if device is None:
@@ -819,6 +821,7 @@ class GemmaMedusaModel(nn.Module):
                 self.head_attention = MedusaHeadAttention(
                     num_heads=medusa_num_heads,
                     hidden_size=hidden_size,
+                    causal=causal_attn,
                 ).to(device=device, dtype=dtype)
                 # Channel mixing MLP still used after attention (ResBlock style)
                 self.channel_mixer_fc = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -2442,6 +2445,7 @@ def load_gemma_medusa_model(
     mixer_hidden: int = 16,
     mixer_type: str = "mlp",
     attention_head_dim: int | None = None,
+    causal_attn: bool = False,
 ):
     """
     Load a Gemma model with Medusa LoRA heads.
@@ -2460,6 +2464,7 @@ def load_gemma_medusa_model(
         mixer_hidden: Hidden dimension for the cross-head MLP mixer
         mixer_type: Type of mixer ("mlp" or "attention")
         attention_head_dim: Head dimension for attention mixer (default: min(64, hidden_size))
+        causal_attn: Use causal attention for attention mixer (default: bidirectional)
 
     Returns:
         GemmaMedusaModel instance
@@ -2478,4 +2483,5 @@ def load_gemma_medusa_model(
         mixer_hidden=mixer_hidden,
         mixer_type=mixer_type,
         attention_head_dim=attention_head_dim,
+        causal_attn=causal_attn,
     )

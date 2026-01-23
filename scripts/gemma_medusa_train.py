@@ -398,6 +398,8 @@ if __name__ == "__main__":
                         help="Hidden dimension for MLP mixer (default: 16)")
     parser.add_argument("--use-attn", action="store_true",
                         help="Enable attention-based cross-head mixing (single transformer block)")
+    parser.add_argument("--causal-attn", action="store_true",
+                        help="Use causal attention for --use-attn (default: bidirectional)")
 
     # Performance optimization
     parser.add_argument("--compile", action="store_true",
@@ -497,7 +499,7 @@ if __name__ == "__main__":
     if args.use_mlp_mixer:
         mixer_str = f", mlp_mixer(hidden={args.mlp_mixer_hidden})"
     elif args.use_attn:
-        mixer_str = ", attn"
+        mixer_str = ", attn" + ("-causal" if args.causal_attn else "")
     else:
         mixer_str = ""
     print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, lora_rank={args.lora_rank}{mixer_str}")
@@ -519,6 +521,7 @@ if __name__ == "__main__":
         use_head_mixer=use_head_mixer,
         mixer_hidden=args.mlp_mixer_hidden,
         mixer_type=mixer_type,
+        causal_attn=args.causal_attn,
     )
     tokenizer = GemmaTokenizerWrapper(args.base_model)
 
@@ -980,6 +983,7 @@ if __name__ == "__main__":
                     "lora_alpha": args.lora_alpha,
                     "use_mlp_mixer": args.use_mlp_mixer,
                     "use_attn": args.use_attn,
+                    "causal_attn": args.causal_attn if args.use_attn else None,
                     "mlp_mixer_hidden": args.mlp_mixer_hidden if args.use_mlp_mixer else None,
                 },
                 "total_predictions": total_counts,
