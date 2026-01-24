@@ -658,6 +658,15 @@ if __name__ == "__main__":
             print0(f"Resuming from: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=device)
             model.medusa_heads.load_state_dict(checkpoint['medusa_heads'])
+            # Load mixer/attention weights if present
+            if 'head_attention' in checkpoint and model.head_attention is not None:
+                model.head_attention.load_state_dict(checkpoint['head_attention'])
+                print0("Loaded head_attention weights")
+            if 'head_mixer_fc1' in checkpoint and model.head_mixer_fc1 is not None:
+                model.head_mixer_fc1.load_state_dict(checkpoint['head_mixer_fc1'])
+                model.head_mixer_fc2.load_state_dict(checkpoint['head_mixer_fc2'])
+                model.channel_mixer_fc.load_state_dict(checkpoint['channel_mixer_fc'])
+                print0("Loaded head_mixer weights")
             # Load optimizer states if available
             if 'optimizers' in checkpoint:
                 for opt, state in zip(optimizers, checkpoint['optimizers']):
@@ -762,6 +771,13 @@ if __name__ == "__main__":
                 'optimizers': [opt.state_dict() for opt in optimizers],
                 'config': user_config,
             }
+            # Save mixer/attention weights if present
+            if model.head_attention is not None:
+                checkpoint['head_attention'] = model.head_attention.state_dict()
+            if model.head_mixer_fc1 is not None:
+                checkpoint['head_mixer_fc1'] = model.head_mixer_fc1.state_dict()
+                checkpoint['head_mixer_fc2'] = model.head_mixer_fc2.state_dict()
+                checkpoint['channel_mixer_fc'] = model.channel_mixer_fc.state_dict()
             torch.save(checkpoint, os.path.join(checkpoint_dir, "medusa_heads.pt"))
             print0(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -932,6 +948,13 @@ if __name__ == "__main__":
             'optimizers': [opt.state_dict() for opt in optimizers],
             'config': user_config,
         }
+        # Save mixer/attention weights if present
+        if model.head_attention is not None:
+            checkpoint['head_attention'] = model.head_attention.state_dict()
+        if model.head_mixer_fc1 is not None:
+            checkpoint['head_mixer_fc1'] = model.head_mixer_fc1.state_dict()
+            checkpoint['head_mixer_fc2'] = model.head_mixer_fc2.state_dict()
+            checkpoint['channel_mixer_fc'] = model.channel_mixer_fc.state_dict()
         torch.save(checkpoint, os.path.join(final_checkpoint_dir, "medusa_heads.pt"))
         print0(f"\nSaved final checkpoint to {final_checkpoint_dir}")
 

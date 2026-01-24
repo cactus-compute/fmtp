@@ -345,6 +345,15 @@ if __name__ == "__main__":
     print0(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.medusa_heads.load_state_dict(checkpoint['medusa_heads'])
+    # Load mixer/attention weights if present
+    if 'head_attention' in checkpoint and model.head_attention is not None:
+        model.head_attention.load_state_dict(checkpoint['head_attention'])
+        print0("Loaded head_attention weights")
+    if 'head_mixer_fc1' in checkpoint and model.head_mixer_fc1 is not None:
+        model.head_mixer_fc1.load_state_dict(checkpoint['head_mixer_fc1'])
+        model.head_mixer_fc2.load_state_dict(checkpoint['head_mixer_fc2'])
+        model.channel_mixer_fc.load_state_dict(checkpoint['channel_mixer_fc'])
+        print0("Loaded head_mixer weights")
     model._checkpoint_path = args.checkpoint  # Store for optimal tree generation from head_acc.json
     model.eval()
     print0(f"Medusa parameters: {model.get_medusa_param_count():,}")
