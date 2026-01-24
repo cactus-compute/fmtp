@@ -376,9 +376,15 @@ class MultiLayerFusion(nn.Module):
 
     Architecture:
         Input: (B, T, num_layers * hidden_size) - concatenated layer outputs
+               (B, T, hidden_size) - final layer hidden states (for residual)
         -> Linear down-projection
         -> RMSNorm
+        -> Add residual from final hidden states
         Output: (B, T, hidden_size) - fused representation
+
+    The residual ensures stable early training by starting from the final
+    hidden state (what heads normally train on) and learning to add useful
+    information from intermediate layers.
 
     Args:
         hidden_size: Hidden dimension of the model
@@ -395,14 +401,19 @@ class MultiLayerFusion(nn.Module):
         self.down_proj = nn.Linear(num_fused_layers * hidden_size, hidden_size, bias=False)
         self.norm = nn.RMSNorm(hidden_size)
 
-    def forward(self, multi_layer_hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        multi_layer_hidden: torch.Tensor,
+        final_hidden: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Fuse multi-layer hidden states into single hidden representation.
 
         Args:
             multi_layer_hidden: (B, T, num_fused_layers * hidden_size) concatenated hidden states
+            final_hidden: (B, T, hidden_size) final layer hidden states for residual
 
         Returns:
             (B, T, hidden_size) fused hidden states
         """
-        return self.norm(self.down_proj(multi_layer_hidden))
+        return final_hidden + self.norm(self.down_proj(multi_layer_hidden))

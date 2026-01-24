@@ -1058,7 +1058,7 @@ class GemmaMedusaModel(nn.Module):
 
         # Apply multi-layer fusion if enabled (shared preprocessing for all heads)
         if self.use_multi_layer and multi_layer_hidden is not None and self.multi_layer_fusion is not None:
-            head_input = self.multi_layer_fusion(multi_layer_hidden)  # (B, T, hidden_size)
+            head_input = self.multi_layer_fusion(multi_layer_hidden, hidden_states)  # (B, T, hidden_size)
         else:
             head_input = hidden_states
 
@@ -1204,7 +1204,7 @@ class GemmaMedusaModel(nn.Module):
 
         # Apply multi-layer fusion if enabled (shared preprocessing for all heads)
         if self.use_multi_layer and multi_layer_hidden is not None and self.multi_layer_fusion is not None:
-            head_input = self.multi_layer_fusion(multi_layer_hidden)  # (B, T, hidden_size)
+            head_input = self.multi_layer_fusion(multi_layer_hidden, hidden_states)  # (B, T, hidden_size)
         else:
             head_input = hidden_states
 
