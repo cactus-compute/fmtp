@@ -400,6 +400,9 @@ class MultiLayerFusion(nn.Module):
         # Output: (B, T, hidden_size)
         self.down_proj = nn.Linear(num_fused_layers * hidden_size, hidden_size, bias=False)
 
+        # Learnable scale initialized to zero - fusion starts as identity (final_hidden only)
+        self.scale = nn.Parameter(torch.zeros(1))
+
     def forward(
         self,
         multi_layer_hidden: torch.Tensor,
@@ -415,4 +418,4 @@ class MultiLayerFusion(nn.Module):
         Returns:
             (B, T, hidden_size) fused hidden states with residual from final layer
         """
-        return final_hidden + F.silu(self.down_proj(multi_layer_hidden))
+        return final_hidden + self.scale * F.silu(self.down_proj(multi_layer_hidden))
