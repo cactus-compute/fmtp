@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from tqdm import tqdm
-from collections import defaultdict
+import random
 
 from transformers import AutoTokenizer
 
@@ -45,10 +45,10 @@ def parse_args():
         help="Base model for tokenizer",
     )
     parser.add_argument(
-        "--num-samples",
+        "--num-positions",
         type=int,
-        default=10000,
-        help="Number of samples to evaluate",
+        default=50000,
+        help="Number of positions to evaluate",
     )
     parser.add_argument(
         "--context-window",
@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=256,
+        default=512,
         help="Batch size for evaluation",
     )
     return parser.parse_args()
@@ -101,13 +101,13 @@ def load_model(model_path: str, vocab_size: int, device: str):
     return model
 
 
-def load_data(data_path: str, tokenizer, num_samples: int, context_window: int):
-    """Load and tokenize evaluation data."""
-    samples = []
+def extract_positions(data_path: str, tokenizer, num_positions: int, context_window: int):
+    """Extract evaluation positions from data."""
+    positions = []  # List of (context, target_1, target_2, target_3)
 
     with open(data_path) as f:
-        for i, line in enumerate(f):
-            if len(samples) >= num_samples:
+        for line in f:
+            if len(positions) >= num_positions * 2:  # Get extra to sample from
                 break
 
             data = json.loads(line)
@@ -123,23 +123,29 @@ def load_data(data_path: str, tokenizer, num_samples: int, context_window: int):
             # Tokenize
             tokens = tokenizer.encode(text, add_special_tokens=False)
 
-            # Need at least context_window + 3 tokens for evaluation
-            if len(tokens) >= context_window + 3:
-                samples.append(tokens)
+            # Extract positions - sample every 10th position to avoid redundancy
+            for pos in range(context_window, len(tokens) - 3, 10):
+                context = tokens[pos - context_window:pos]
+                target_1 = tokens[pos]
+                target_2 = tokens[pos + 1]
+                target_3 = tokens[pos + 2]
+                positions.append((context, target_1, target_2, target_3))
 
-    return samples
+    # Randomly sample
+    random.shuffle(positions)
+    return positions[:num_positions]
 
 
-def evaluate_branch_accuracy(
+@torch.no_grad()
+def evaluate_branch_accuracy_batched(
     model,
-    samples: list,
-    context_window: int,
+    positions: list,
     device: str,
-    batch_size: int = 256,
+    batch_size: int = 512,
     k_values: list = [1, 10, 50, 80, 100],
 ):
     """
-    Evaluate branch prediction accuracy.
+    Evaluate branch prediction accuracy with batching.
 
     For each position:
     - Get top-k predictions for next token (depth 1)
@@ -155,6 +161,7 @@ def evaluate_branch_accuracy(
     # Metrics for different k values and depths
     metrics = {
         k: {
+            "depth1_correct": 0,
             "depth2_correct": 0,
             "depth3_correct": 0,
             "total": 0,
@@ -162,75 +169,75 @@ def evaluate_branch_accuracy(
         for k in k_values
     }
 
-    total_positions = 0
+    max_k = max(k_values)
 
-    with torch.no_grad():
-        for tokens in tqdm(samples, desc="Evaluating"):
-            # Slide through the sequence
-            for pos in range(context_window, len(tokens) - 3):
-                context = tokens[pos - context_window:pos]
-                target_1 = tokens[pos]      # Next token
-                target_2 = tokens[pos + 1]  # Token after that
-                target_3 = tokens[pos + 2]  # Third token
+    # Process in batches
+    num_batches = (len(positions) + batch_size - 1) // batch_size
 
-                # Get predictions for depth 1
-                context_tensor = torch.tensor([context], device=device)
-                logits_1 = model(context_tensor)  # [1, vocab_size]
+    for batch_idx in tqdm(range(num_batches), desc="Evaluating"):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(positions))
+        batch_positions = positions[batch_start:batch_end]
 
-                for k in k_values:
-                    # Get top-k predictions for depth 1
-                    top_k_1 = torch.topk(logits_1[0], k=k).indices.tolist()
+        # Prepare batch tensors
+        contexts = torch.tensor([p[0] for p in batch_positions], device=device)
+        targets_1 = torch.tensor([p[1] for p in batch_positions], device=device)
+        targets_2 = torch.tensor([p[2] for p in batch_positions], device=device)
+        targets_3 = torch.tensor([p[3] for p in batch_positions], device=device)
 
-                    # Check if target_1 is in top-k
-                    if target_1 not in top_k_1:
-                        # Can't get correct 2-gram or 3-gram if first token is wrong
-                        metrics[k]["total"] += 1
-                        continue
+        B = contexts.shape[0]
 
-                    # For depth 2: check all k candidates from depth 1
-                    # Build context for each candidate
-                    depth2_found = False
-                    depth3_found = False
+        # Depth 1: predict first token
+        logits_1 = model(contexts)  # [B, vocab_size]
+        top_k_1_all = torch.topk(logits_1, k=max_k, dim=-1).indices  # [B, max_k]
 
-                    # Check if we can find the 2-gram (target_1, target_2)
-                    # We need target_1 in top-k (checked above) AND target_2 in top-k given target_1
-                    new_context = context[1:] + [target_1]  # Shift context, add target_1
-                    context_tensor_2 = torch.tensor([new_context], device=device)
-                    logits_2 = model(context_tensor_2)
-                    top_k_2 = torch.topk(logits_2[0], k=k).indices.tolist()
+        for k in k_values:
+            top_k_1 = top_k_1_all[:, :k]  # [B, k]
 
-                    if target_2 in top_k_2:
-                        depth2_found = True
+            # Check depth 1 accuracy
+            depth1_correct = (top_k_1 == targets_1.unsqueeze(1)).any(dim=1)  # [B]
+            metrics[k]["depth1_correct"] += depth1_correct.sum().item()
+            metrics[k]["total"] += B
 
-                        # For depth 3: check if target_3 is reachable
-                        new_context_3 = new_context[1:] + [target_2]
-                        context_tensor_3 = torch.tensor([new_context_3], device=device)
-                        logits_3 = model(context_tensor_3)
-                        top_k_3 = torch.topk(logits_3[0], k=k).indices.tolist()
+            # For depth 2: we need target_1 to be in top-k to continue
+            # Create new contexts: shift by 1, append target_1
+            new_contexts = torch.cat([contexts[:, 1:], targets_1.unsqueeze(1)], dim=1)  # [B, context_window]
 
-                        if target_3 in top_k_3:
-                            depth3_found = True
+            # Get predictions for depth 2
+            logits_2 = model(new_contexts)  # [B, vocab_size]
+            top_k_2 = torch.topk(logits_2, k=k, dim=-1).indices  # [B, k]
 
-                    if depth2_found:
-                        metrics[k]["depth2_correct"] += 1
-                    if depth3_found:
-                        metrics[k]["depth3_correct"] += 1
-                    metrics[k]["total"] += 1
+            # Depth 2 is correct if: target_1 in top_k_1 AND target_2 in top_k_2
+            depth2_t2_correct = (top_k_2 == targets_2.unsqueeze(1)).any(dim=1)  # [B]
+            depth2_correct = depth1_correct & depth2_t2_correct
+            metrics[k]["depth2_correct"] += depth2_correct.sum().item()
 
-                total_positions += 1
+            # For depth 3: shift again, append target_2
+            new_contexts_3 = torch.cat([new_contexts[:, 1:], targets_2.unsqueeze(1)], dim=1)
+
+            # Get predictions for depth 3
+            logits_3 = model(new_contexts_3)  # [B, vocab_size]
+            top_k_3 = torch.topk(logits_3, k=k, dim=-1).indices  # [B, k]
+
+            # Depth 3 is correct if: depth_2 correct AND target_3 in top_k_3
+            depth3_t3_correct = (top_k_3 == targets_3.unsqueeze(1)).any(dim=1)  # [B]
+            depth3_correct = depth2_correct & depth3_t3_correct
+            metrics[k]["depth3_correct"] += depth3_correct.sum().item()
 
     # Compute final metrics
     results = {}
     for k in k_values:
         total = metrics[k]["total"]
         if total > 0:
+            results[f"token1_recall@{k}"] = metrics[k]["depth1_correct"] / total
             results[f"branch2_recall@{k}"] = metrics[k]["depth2_correct"] / total
             results[f"branch3_recall@{k}"] = metrics[k]["depth3_correct"] / total
         else:
+            results[f"token1_recall@{k}"] = 0.0
             results[f"branch2_recall@{k}"] = 0.0
             results[f"branch3_recall@{k}"] = 0.0
 
-    results["total_positions"] = total_positions
+    results["total_positions"] = len(positions)
     return results
 
 
@@ -245,15 +252,14 @@ def main():
     print(f"Loading model from: {args.model_path}")
     model = load_model(args.model_path, vocab_size, args.device)
 
-    print(f"Loading data from: {args.data_path}")
-    samples = load_data(args.data_path, tokenizer, args.num_samples, args.context_window)
-    print(f"Loaded {len(samples)} samples")
+    print(f"Extracting positions from: {args.data_path}")
+    positions = extract_positions(args.data_path, tokenizer, args.num_positions, args.context_window)
+    print(f"Extracted {len(positions)} positions for evaluation")
 
     print("\nEvaluating branch accuracy...")
-    results = evaluate_branch_accuracy(
+    results = evaluate_branch_accuracy_batched(
         model=model,
-        samples=samples,
-        context_window=args.context_window,
+        positions=positions,
         device=args.device,
         batch_size=args.batch_size,
         k_values=[1, 10, 50, 80, 100],
@@ -263,12 +269,17 @@ def main():
     print("Branch Prediction Accuracy Results")
     print("=" * 60)
 
-    print("\n2-Token Branch Recall (can we predict both t+1 and t+2?):")
+    print("\nSingle Token Recall (can we predict t+1?):")
+    for k in [1, 10, 50, 80, 100]:
+        key = f"token1_recall@{k}"
+        print(f"  Recall@{k}: {results[key]:.4f} ({results[key]*100:.2f}%)")
+
+    print("\n2-Token Branch Recall (can we predict t+1 AND t+2?):")
     for k in [1, 10, 50, 80, 100]:
         key = f"branch2_recall@{k}"
         print(f"  Recall@{k}: {results[key]:.4f} ({results[key]*100:.2f}%)")
 
-    print("\n3-Token Branch Recall (can we predict t+1, t+2, and t+3?):")
+    print("\n3-Token Branch Recall (can we predict t+1, t+2, AND t+3?):")
     for k in [1, 10, 50, 80, 100]:
         key = f"branch3_recall@{k}"
         print(f"  Recall@{k}: {results[key]:.4f} ({results[key]*100:.2f}%)")
