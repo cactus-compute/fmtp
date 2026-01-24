@@ -376,15 +376,9 @@ class MultiLayerFusion(nn.Module):
 
     Architecture:
         Input: (B, T, num_layers * hidden_size) - concatenated layer outputs
-               (B, T, hidden_size) - final layer hidden states (for residual)
         -> Linear down-projection
-        -> SiLU activation
-        -> Add residual from final hidden states
+        -> RMSNorm
         Output: (B, T, hidden_size) - fused representation
-
-    The residual connection ensures the model can always fall back to the
-    original final layer representation while learning to incorporate
-    information from intermediate layers.
 
     Args:
         hidden_size: Hidden dimension of the model
@@ -398,26 +392,17 @@ class MultiLayerFusion(nn.Module):
         # Down-projection from concatenated multi-layer hidden states to original size
         # Input: (B, T, num_fused_layers * hidden_size)
         # Output: (B, T, hidden_size)
-        # Zero-init so fusion starts as identity (final_hidden only)
         self.down_proj = nn.Linear(num_fused_layers * hidden_size, hidden_size, bias=False)
+        self.norm = nn.RMSNorm(hidden_size)
 
-        # Learnable scale initialized to zero - fusion starts as identity (final_hidden only)
-        self.scale = 1  # nn.Parameter(torch.ones(1) * .01)
-        nn.init.zeros_(self.down_proj.weight)
-
-    def forward(
-        self,
-        multi_layer_hidden: torch.Tensor,
-        final_hidden: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, multi_layer_hidden: torch.Tensor) -> torch.Tensor:
         """
         Fuse multi-layer hidden states into single hidden representation.
 
         Args:
             multi_layer_hidden: (B, T, num_fused_layers * hidden_size) concatenated hidden states
-            final_hidden: (B, T, hidden_size) final layer hidden states for residual
 
         Returns:
-            (B, T, hidden_size) fused hidden states with residual from final layer
+            (B, T, hidden_size) fused hidden states
         """
-        return final_hidden + F.silu(self.down_proj(multi_layer_hidden))
+        return self.norm(self.down_proj(multi_layer_hidden))
