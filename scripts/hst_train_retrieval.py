@@ -15,30 +15,49 @@ Two-phase training:
    - Lower learning rate (1e-5)
 
 Usage:
-    # Phase 1: Pretrain on FineWeb-Edu
-    uv run python -m scripts.hst_train_retrieval --phase 1 --tokens 1000000000
+    # Single GPU training
+    uv run python -m scripts.hst_train_retrieval --phase 1 --tokens 100000000
 
-    # Phase 2: Fine-tune on WildChat
-    uv run python -m scripts.hst_train_retrieval --phase 2 --samples 100000
-
-    # Single GPU training with lower batch size
-    uv run python -m scripts.hst_train_retrieval --phase 1 --batch-size 256
+    # Multi-GPU training with torchrun
+    uv run torchrun --standalone --nproc_per_node=8 -m scripts.hst_train_retrieval --phase 1 --tokens 100000000
 
     # Use local parquet files from ~/.cache/nanochat/base_data/
-    uv run python -m scripts.hst_train_retrieval --phase 1 --use-local-parquet --tokens 50000000
+    uv run torchrun --standalone --nproc_per_node=8 -m scripts.hst_train_retrieval --phase 1 --use-local-parquet --tokens 100000000
 """
 
 import argparse
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data.distributed import DistributedSampler
 from pathlib import Path
 from tqdm import tqdm
 import time
 import json
 
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
+
+
+def setup_distributed():
+    """Initialize distributed training if available."""
+    if "RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    return 0, 1, 0
+
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def parse_args():
@@ -241,6 +260,7 @@ class LocalParquetDataset(IterableDataset):
     Dataset that reads from local parquet files.
 
     Uses parquet files from ~/.cache/nanochat/base_data/ or a custom path.
+    Supports distributed training by sharding files across ranks.
     """
 
     def __init__(
@@ -249,20 +269,28 @@ class LocalParquetDataset(IterableDataset):
         context_window: int = 4,
         max_tokens: int = 1_000_000_000,
         data_path: str = None,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.tokenizer = tokenizer
         self.context_window = context_window
         self.max_tokens = max_tokens
+        self.rank = rank
+        self.world_size = world_size
 
         if data_path is None:
             self.data_dir = Path.home() / ".cache" / "nanochat" / "base_data"
         else:
             self.data_dir = Path(data_path)
 
-        self.parquet_files = sorted(self.data_dir.glob("shard_*.parquet"))
-        if not self.parquet_files:
+        all_parquet_files = sorted(self.data_dir.glob("shard_*.parquet"))
+        if not all_parquet_files:
             raise FileNotFoundError(f"No parquet files found in {self.data_dir}")
-        print(f"Found {len(self.parquet_files)} parquet files")
+
+        # Shard files across ranks
+        self.parquet_files = [f for i, f in enumerate(all_parquet_files) if i % world_size == rank]
+        if rank == 0:
+            print(f"Found {len(all_parquet_files)} total parquet files, {len(self.parquet_files)} for this rank")
 
     def __iter__(self):
         import pandas as pd
@@ -468,42 +496,67 @@ def evaluate(
 def main():
     args = parse_args()
 
+    # Set up distributed training
+    rank, world_size, local_rank = setup_distributed()
+    is_main = rank == 0
+
     # Set default learning rate based on phase
     if args.lr is None:
         args.lr = 1e-4 if args.phase == 1 else 1e-5
+
+    # Set device
+    if world_size > 1:
+        args.device = f"cuda:{local_rank}"
+    elif args.device == "cuda" and torch.cuda.is_available():
+        args.device = "cuda:0"
 
     # Set up output directory
     if args.output_dir is None:
         args.output_dir = Path.home() / ".cache" / "nanochat" / "hst_retrieval"
     else:
         args.output_dir = Path(args.output_dir)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Phase {args.phase} training")
-    print(f"Device: {args.device}")
-    print(f"Output directory: {args.output_dir}")
+    if is_main:
+        print(f"Phase {args.phase} training")
+        print(f"Device: {args.device}")
+        print(f"World size: {world_size}")
+        print(f"Output directory: {args.output_dir}")
 
     # Load tokenizer only (no need for full base model!)
-    print(f"Loading tokenizer: {args.base_model}")
+    if is_main:
+        print(f"Loading tokenizer: {args.base_model}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     vocab_size = tokenizer.vocab_size
-    print(f"Vocabulary size: {vocab_size}")
+    if is_main:
+        print(f"Vocabulary size: {vocab_size}")
 
     # Create retrieval module (has its own learned embeddings)
     module = create_retrieval_module(args, vocab_size)
     module = module.to(args.device)
 
+    # Wrap in DDP if distributed
+    if world_size > 1:
+        module = DDP(module, device_ids=[local_rank])
+
     # Log model info
-    num_params = sum(p.numel() for p in module.parameters())
-    trainable_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
-    print(f"Model parameters: {num_params:,} total, {trainable_params:,} trainable")
+    raw_module = module.module if hasattr(module, 'module') else module
+    num_params = sum(p.numel() for p in raw_module.parameters())
+    trainable_params = sum(p.numel() for p in raw_module.parameters() if p.requires_grad)
+    if is_main:
+        print(f"Model parameters: {num_params:,} total, {trainable_params:,} trainable")
 
     if args.resume:
-        print(f"Resuming from: {args.resume}")
-        module.load_state_dict(torch.load(args.resume, weights_only=True))
+        if is_main:
+            print(f"Resuming from: {args.resume}")
+        raw_module.load_state_dict(torch.load(args.resume, weights_only=True))
 
     if args.compile:
         module = torch.compile(module)
+
+    # Adjust tokens per GPU for distributed training
+    tokens_per_gpu = args.tokens // world_size
 
     # Create dataset
     if args.phase == 1:
@@ -511,14 +564,16 @@ def main():
             dataset = LocalParquetDataset(
                 tokenizer=tokenizer,
                 context_window=args.context_window,
-                max_tokens=args.tokens,
+                max_tokens=tokens_per_gpu,
                 data_path=args.data_path,
+                rank=rank,
+                world_size=world_size,
             )
         else:
             dataset = FineWebEduDataset(
                 tokenizer=tokenizer,
                 context_window=args.context_window,
-                max_tokens=args.tokens,
+                max_tokens=tokens_per_gpu,
             )
     else:
         if args.data_path is None:
@@ -527,47 +582,50 @@ def main():
             data_path=args.data_path,
             tokenizer=tokenizer,
             context_window=args.context_window,
-            max_samples=args.samples,
+            max_samples=args.samples // world_size,
         )
 
     # Note: Using num_workers=0 for IterableDataset to avoid duplicate data issues
-    # With IterableDataset and multiple workers, each worker iterates independently
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         num_workers=0,
-        pin_memory=args.device == "cuda",
+        pin_memory=True,
     )
 
-    # Create a separate eval dataset (use a subset of the same source)
-    if args.phase == 1:
-        if args.use_local_parquet:
-            eval_dataset = LocalParquetDataset(
-                tokenizer=tokenizer,
-                context_window=args.context_window,
-                max_tokens=min(args.tokens, 50000),  # Use subset for eval
-                data_path=args.data_path,
-            )
+    # Create a separate eval dataset (only on main process)
+    eval_dataloader = None
+    if is_main:
+        if args.phase == 1:
+            if args.use_local_parquet:
+                eval_dataset = LocalParquetDataset(
+                    tokenizer=tokenizer,
+                    context_window=args.context_window,
+                    max_tokens=min(args.tokens, 50000),
+                    data_path=args.data_path,
+                    rank=0,
+                    world_size=1,  # eval only on single process
+                )
+            else:
+                eval_dataset = FineWebEduDataset(
+                    tokenizer=tokenizer,
+                    context_window=args.context_window,
+                    max_tokens=50000,
+                )
         else:
-            eval_dataset = FineWebEduDataset(
+            eval_dataset = WildChatDataset(
+                data_path=args.data_path,
                 tokenizer=tokenizer,
                 context_window=args.context_window,
-                max_tokens=50000,  # Small eval set
+                max_samples=min(args.samples, 10000),
             )
-    else:
-        eval_dataset = WildChatDataset(
-            data_path=args.data_path,
-            tokenizer=tokenizer,
-            context_window=args.context_window,
-            max_samples=min(args.samples, 10000),  # Use subset for eval
-        )
 
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        batch_size=args.batch_size,
-        num_workers=0,
-        pin_memory=args.device == "cuda",
-    )
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=args.batch_size,
+            num_workers=0,
+            pin_memory=True,
+        )
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -577,7 +635,7 @@ def main():
     )
 
     # Learning rate scheduler with warmup
-    total_steps = args.tokens // args.batch_size if args.phase == 1 else args.samples // args.batch_size
+    total_steps = tokens_per_gpu // args.batch_size
 
     def lr_lambda(step):
         if step < args.warmup_steps:
@@ -587,19 +645,21 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Mixed precision
-    scaler = torch.amp.GradScaler("cuda") if args.device == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda") if "cuda" in args.device else None
 
     # Training loop
-    print(f"Starting training...")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Learning rate: {args.lr}")
+    if is_main:
+        print(f"Starting training...")
+        print(f"Batch size per GPU: {args.batch_size}")
+        print(f"Effective batch size: {args.batch_size * world_size}")
+        print(f"Learning rate: {args.lr}")
 
     module.train()
     step = 0
     total_loss = 0.0
     start_time = time.time()
 
-    pbar = tqdm(dataloader, desc="Training")
+    pbar = tqdm(dataloader, desc="Training", disable=not is_main)
     for batch in pbar:
         loss = train_step(
             module=module,
@@ -615,38 +675,43 @@ def main():
         step += 1
 
         # Update progress bar
-        if step % 10 == 0:
+        if step % 10 == 0 and is_main:
             avg_loss = total_loss / step
             pbar.set_postfix({"loss": f"{avg_loss:.4f}", "lr": f"{scheduler.get_last_lr()[0]:.2e}"})
 
-        # Evaluate
-        if step % args.eval_every == 0:
-            metrics = evaluate(module, eval_dataloader, args.device)
+        # Evaluate (only on main)
+        if step % args.eval_every == 0 and is_main:
+            eval_module = raw_module  # Use unwrapped module for eval
+            metrics = evaluate(eval_module, eval_dataloader, args.device)
             print(f"\nStep {step}: {metrics}")
 
             # Check target metric
             if metrics["recall@10"] > 0.5:
                 print("Target Recall@10 > 50% achieved!")
 
-        # Save checkpoint
-        if step % args.save_every == 0:
+        # Save checkpoint (only on main)
+        if step % args.save_every == 0 and is_main:
             ckpt_path = args.output_dir / f"retrieval_phase{args.phase}_step{step}.pt"
-            torch.save(module.state_dict(), ckpt_path)
+            torch.save(raw_module.state_dict(), ckpt_path)
             print(f"\nSaved checkpoint: {ckpt_path}")
 
-    # Final save
-    final_path = args.output_dir / f"retrieval_phase{args.phase}_final.pt"
-    torch.save(module.state_dict(), final_path)
-    print(f"Saved final model: {final_path}")
+    # Final save (only on main)
+    if is_main:
+        final_path = args.output_dir / f"retrieval_phase{args.phase}_final.pt"
+        torch.save(raw_module.state_dict(), final_path)
+        print(f"Saved final model: {final_path}")
 
-    # Final evaluation
-    print("\nFinal evaluation:")
-    metrics = evaluate(module, eval_dataloader, args.device, max_batches=500)
-    print(metrics)
+        # Final evaluation
+        print("\nFinal evaluation:")
+        metrics = evaluate(raw_module, eval_dataloader, args.device, max_batches=500)
+        print(metrics)
 
-    elapsed = time.time() - start_time
-    print(f"\nTraining completed in {elapsed / 3600:.2f} hours")
-    print(f"Total steps: {step}")
+        elapsed = time.time() - start_time
+        print(f"\nTraining completed in {elapsed / 3600:.2f} hours")
+        print(f"Total steps: {step}")
+
+    # Clean up distributed
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
