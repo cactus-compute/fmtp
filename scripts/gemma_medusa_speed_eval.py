@@ -305,6 +305,10 @@ if __name__ == "__main__":
                         help='Use cross-head MLP mixer (for mixer checkpoint)')
     parser.add_argument('--mixer-hidden', type=int, default=16,
                         help='Hidden dimension for the cross-head mixer MLP')
+    parser.add_argument('--attn-num-layers', type=int, default=0,
+                        help='Number of attention blocks for cross-head mixing (0 = disabled)')
+    parser.add_argument('--use-multi-layer', action='store_true',
+                        help='Use multi-layer hidden state fusion')
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -313,6 +317,10 @@ if __name__ == "__main__":
     print0(f"Loading model: {args.model_name}")
     lora_alpha = args.lora_alpha if args.lora_alpha is not None else args.lora_rank
     print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, rank={args.lora_rank}, alpha={lora_alpha}")
+
+    # Determine if we need head mixer (either MLP or attention)
+    use_head_mixer = args.use_head_mixer or args.attn_num_layers > 0
+    mixer_type = "attention" if args.attn_num_layers > 0 else "mlp"
 
     model = load_gemma_medusa_model(
         model_name=args.model_name,
@@ -323,8 +331,11 @@ if __name__ == "__main__":
         device=device,
         dtype=dtype,
         zero_init_mlp=args.zero_init_mtp_mlp,
-        use_head_mixer=args.use_head_mixer,
+        use_head_mixer=use_head_mixer,
         mixer_hidden=args.mixer_hidden,
+        mixer_type=mixer_type,
+        attn_num_layers=args.attn_num_layers,
+        use_multi_layer=args.use_multi_layer,
     )
 
     # Load checkpoint
