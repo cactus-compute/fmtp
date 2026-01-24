@@ -401,7 +401,7 @@ class MultiLayerFusion(nn.Module):
         self.down_proj = nn.Linear(num_fused_layers * hidden_size, hidden_size, bias=False)
 
         # Learnable scale initialized to zero - fusion starts as identity (final_hidden only)
-        self.scale = nn.Parameter(torch.zeros(1))
+        self.scale = nn.Parameter(torch.ones(1) * .01)
 
     def forward(
         self,
