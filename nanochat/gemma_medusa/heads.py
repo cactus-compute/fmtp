@@ -355,15 +355,11 @@ def compute_multi_layer_indices(n_layers: int) -> list[int]:
         List of 3 layer indices in ascending order
     """
     # N-1 is the index of the last layer (0-indexed)
-    # assert n_layers >= 6
-    # first_idx = 2
-    # middle_idx = n_layers // 2
-    # last_idx = n_layers - 1
-
+    assert n_layers >= 6
+    first_idx = 2
+    middle_idx = n_layers // 2
     last_idx = n_layers - 1
-    middle_idx = n_layers - 2
-    first_idx = n_layers - 3
-    
+
     return [first_idx, middle_idx, last_idx]
 
 class MultiLayerFusion(nn.Module):
