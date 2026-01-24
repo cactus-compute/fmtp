@@ -2054,7 +2054,8 @@ class GemmaMedusaModel(nn.Module):
             main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa=True, last_only=True)
 
         assert medusa_logits is not None
-        stats.forward_passes += 1
+        # Note: Don't count initial prompt processing as a forward pass for mean_accepted_length
+        # We only count speculation verification passes so the metric reflects speculation quality
 
         # Track current sequence length for position IDs
         current_seq_len = len(current_tokens)
