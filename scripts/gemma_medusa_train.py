@@ -398,10 +398,10 @@ if __name__ == "__main__":
                         help="Hidden dimension for MLP mixer (default: 16)")
     parser.add_argument("--mixer-num-layers", type=int, default=1,
                         help="Number of MLP mixer layers to stack (default: 1)")
-    parser.add_argument("--use-attn", action="store_true",
-                        help="Enable attention-based cross-head mixing (single transformer block)")
+    parser.add_argument("--attn-num-layers", type=int, default=0,
+                        help="Number of attention blocks for cross-head mixing (0 = disabled)")
     parser.add_argument("--causal-attn", action="store_true",
-                        help="Use causal attention for --use-attn (default: bidirectional)")
+                        help="Use causal attention for --attn-num-layers (default: bidirectional)")
 
     # Performance optimization
     parser.add_argument("--compile", action="store_true",
@@ -500,15 +500,15 @@ if __name__ == "__main__":
     print0(f"Loading base model: {args.base_model}")
     if args.use_mlp_mixer:
         mixer_str = f", mlp_mixer(hidden={args.mlp_mixer_hidden}, layers={args.mixer_num_layers})"
-    elif args.use_attn:
-        mixer_str = ", attn" + ("-causal" if args.causal_attn else "")
+    elif args.attn_num_layers > 0:
+        mixer_str = f", attn(layers={args.attn_num_layers}" + (",causal" if args.causal_attn else "") + ")"
     else:
         mixer_str = ""
     print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, lora_rank={args.lora_rank}{mixer_str}")
 
     # Determine mixer type for model
-    use_head_mixer = args.use_mlp_mixer or args.use_attn
-    mixer_type = "attention" if args.use_attn else "mlp"
+    use_head_mixer = args.use_mlp_mixer or args.attn_num_layers > 0
+    mixer_type = "attention" if args.attn_num_layers > 0 else "mlp"
 
     model = load_gemma_medusa_model(
         model_name=args.base_model,
@@ -524,6 +524,7 @@ if __name__ == "__main__":
         mixer_hidden=args.mlp_mixer_hidden,
         mixer_num_layers=args.mixer_num_layers,
         mixer_type=mixer_type,
+        attn_num_layers=args.attn_num_layers,
         causal_attn=args.causal_attn,
     )
     tokenizer = GemmaTokenizerWrapper(args.base_model)
@@ -985,8 +986,8 @@ if __name__ == "__main__":
                     "lora_rank": args.lora_rank,
                     "lora_alpha": args.lora_alpha,
                     "use_mlp_mixer": args.use_mlp_mixer,
-                    "use_attn": args.use_attn,
-                    "causal_attn": args.causal_attn if args.use_attn else None,
+                    "attn_num_layers": args.attn_num_layers,
+                    "causal_attn": args.causal_attn if args.attn_num_layers > 0 else None,
                     "mlp_mixer_hidden": args.mlp_mixer_hidden if args.use_mlp_mixer else None,
                     "mixer_num_layers": args.mixer_num_layers if args.use_mlp_mixer else None,
                 },

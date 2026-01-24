@@ -180,17 +180,25 @@ class MedusaLoRAHeadWithMixer(MedusaLoRAHead):
 
 class MedusaHeadAttention(nn.Module):
     """
-    Cross-head attention block for Medusa heads.
+    Cross-head attention block(s) for Medusa heads.
 
     Wraps nanochat/gpt.py Block to operate across heads:
     - Input: (num_heads, B, T, hidden_size)
     - Reshape to (B*T, num_heads, hidden_size) treating heads as sequence
-    - Apply attention block with QK norm, RoPE, ReLU² MLP
+    - Apply attention block(s) with QK norm, ReLU² MLP
     - Reshape back to (num_heads, B, T, hidden_size)
 
     Supports both causal and bidirectional attention via the causal parameter.
+    Supports stacking multiple attention blocks via num_layers parameter.
     """
-    def __init__(self, num_heads: int, hidden_size: int, n_attn_head: int | None = None, causal: bool = False):
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_size: int,
+        n_attn_head: int | None = None,
+        num_layers: int = 1,
+        causal: bool = False,
+    ):
         # Default: use 4 attention heads with head_dim=hidden_size/4 (matches Gemma 270M's ratio)
         if n_attn_head is None:
             n_attn_head = 4
@@ -200,6 +208,7 @@ class MedusaHeadAttention(nn.Module):
 
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
 
         # Create a minimal config for the Block
         @dataclass
@@ -208,11 +217,16 @@ class MedusaHeadAttention(nn.Module):
             n_kv_head: int = n_attn_head
             n_embd: int = hidden_size
 
-        self.block = Block(MixerConfig(), layer_idx=0, causal=causal)
+        # Create stacked attention blocks
+        self.blocks = nn.ModuleList([
+            Block(MixerConfig(), layer_idx=i, causal=causal)
+            for i in range(num_layers)
+        ])
 
-        # Zero-init output projections so block starts as identity
-        nn.init.zeros_(self.block.attn.c_proj.weight)
-        nn.init.zeros_(self.block.mlp.c_proj.weight)
+        # Zero-init output projections so blocks start as identity
+        for block in self.blocks:
+            nn.init.zeros_(block.attn.c_proj.weight)
+            nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Learnable position embeddings for head indices
         self.pos_emb = nn.Parameter(torch.zeros(num_heads, hidden_size))
@@ -235,7 +249,7 @@ class MedusaHeadAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Apply cross-head attention block.
+        Apply cross-head attention block(s).
 
         Args:
             x: (num_heads, B, T, hidden_size)
@@ -251,8 +265,9 @@ class MedusaHeadAttention(nn.Module):
         # Add learnable position embeddings
         x_flat = x_flat + self.pos_emb  # (B*T, num_heads, hidden) + (num_heads, hidden)
 
-        # Apply block (cos/sin are identity since we use learnable position embeddings)
-        x_flat = self.block(x_flat, (self.cos, self.sin), window_size=(-1, -1), kv_cache=None)
+        # Apply all blocks (cos/sin are identity since we use learnable position embeddings)
+        for block in self.blocks:
+            x_flat = block(x_flat, (self.cos, self.sin), window_size=(-1, -1), kv_cache=None)
 
         # Reshape back: (B*T, num_heads, hidden) -> (num_heads, B, T, hidden)
         return x_flat.reshape(B, T, num_heads, hidden_size).permute(2, 0, 1, 3)

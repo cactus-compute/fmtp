@@ -735,6 +735,7 @@ class GemmaMedusaModel(nn.Module):
         mixer_num_layers: int = 1,  # Number of mixer layers to stack
         mixer_type: str = "mlp",  # "mlp" or "attention"
         attention_head_dim: int | None = None,  # head_dim for attention mixer (default: min(64, hidden_size))
+        attn_num_layers: int = 1,  # Number of attention blocks for attention mixer
         causal_attn: bool = False,  # Use causal attention for attention mixer (default: bidirectional)
     ):
         super().__init__()
@@ -749,6 +750,7 @@ class GemmaMedusaModel(nn.Module):
         self.mixer_num_layers = mixer_num_layers
         self.mixer_type = mixer_type
         self.attention_head_dim = attention_head_dim
+        self.attn_num_layers = attn_num_layers
         self.causal_attn = causal_attn
 
         # Determine device and dtype
@@ -827,22 +829,17 @@ class GemmaMedusaModel(nn.Module):
                 self.channel_mixer_fc = nn.ModuleList(channel_mixer_fc_list).to(device=device, dtype=dtype)
                 self.head_attention = None
             elif mixer_type == "attention":
-                # Cross-head attention mixer (also supports multiple layers)
-                attention_list = []
-                channel_mixer_fc_list = []
-                for _ in range(mixer_num_layers):
-                    attn = MedusaHeadAttention(
-                        num_heads=medusa_num_heads,
-                        hidden_size=hidden_size,
-                        causal=causal_attn,
-                    )
-                    # Channel mixing MLP still used after attention (ResBlock style)
-                    channel_fc = nn.Linear(hidden_size, hidden_size, bias=False)
-                    nn.init.zeros_(channel_fc.weight)
-                    attention_list.append(attn)
-                    channel_mixer_fc_list.append(channel_fc)
-                self.head_attention = nn.ModuleList(attention_list).to(device=device, dtype=dtype)
-                self.channel_mixer_fc = nn.ModuleList(channel_mixer_fc_list).to(device=device, dtype=dtype)
+                # Cross-head attention mixer with stacked blocks
+                self.head_attention = MedusaHeadAttention(
+                    num_heads=medusa_num_heads,
+                    hidden_size=hidden_size,
+                    num_layers=attn_num_layers,
+                    causal=causal_attn,
+                ).to(device=device, dtype=dtype)
+                # Channel mixing MLP after attention (ResBlock style)
+                self.channel_mixer_fc = nn.Linear(hidden_size, hidden_size, bias=False)
+                nn.init.zeros_(self.channel_mixer_fc.weight)
+                self.channel_mixer_fc = self.channel_mixer_fc.to(device=device, dtype=dtype)
                 # Not used for attention mixer
                 self.head_mixer_fc1 = None
                 self.head_mixer_fc2 = None
@@ -1030,12 +1027,11 @@ class GemmaMedusaModel(nn.Module):
                         self.channel_mixer_fc[layer_idx],
                     )
             elif self.mixer_type == "attention" and self.head_attention is not None:
-                for layer_idx in range(len(self.head_attention)):
-                    # Apply cross-head attention
-                    stacked_resblock = self.head_attention[layer_idx](stacked_resblock)
-                    # Apply channel mixing (ResBlock style) after attention
-                    if self.channel_mixer_fc is not None:
-                        stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc[layer_idx](stacked_resblock))
+                # Apply cross-head attention (stacked blocks inside MedusaHeadAttention)
+                stacked_resblock = self.head_attention(stacked_resblock)
+                # Apply channel mixing (ResBlock style) after attention
+                if self.channel_mixer_fc is not None:
+                    stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
         # During training, stack weights fresh each forward to capture gradient updates
         # During inference, use pre-cached weights for efficiency
@@ -1160,12 +1156,11 @@ class GemmaMedusaModel(nn.Module):
                         self.channel_mixer_fc[layer_idx],
                     )
             elif self.mixer_type == "attention" and self.head_attention is not None:
-                for layer_idx in range(len(self.head_attention)):
-                    # Apply cross-head attention
-                    stacked_resblock = self.head_attention[layer_idx](stacked_resblock)
-                    # Apply channel mixing (ResBlock style) after attention
-                    if self.channel_mixer_fc is not None:
-                        stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc[layer_idx](stacked_resblock))
+                # Apply cross-head attention (stacked blocks inside MedusaHeadAttention)
+                stacked_resblock = self.head_attention(stacked_resblock)
+                # Apply channel mixing (ResBlock style) after attention
+                if self.channel_mixer_fc is not None:
+                    stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
         # Step 2: Compute LoRA projections (small memory: num_heads * B * T * rank)
         # Stack weights for batched computation
@@ -2376,30 +2371,32 @@ class GemmaMedusaModel(nn.Module):
                     for fc2 in self.head_mixer_fc2:
                         medusa_proj_params.append(fc2.weight)
             elif self.mixer_type == "attention" and self.head_attention is not None:
-                # Attention mixer params go to AdamW (iterate over layers)
-                for attn_layer in self.head_attention:
-                    # MedusaHeadAttention wraps a nanochat Block with attention in block.attn
-                    attn = attn_layer.block.attn
+                # Attention mixer params go to AdamW (iterate over stacked blocks)
+                for block in self.head_attention.blocks:
+                    # Each block has attention and MLP
+                    attn = block.attn
                     medusa_proj_params.append(attn.c_q.weight)
                     medusa_proj_params.append(attn.c_k.weight)
                     medusa_proj_params.append(attn.c_v.weight)
                     medusa_proj_params.append(attn.c_proj.weight)
                     # Also add MLP params from the block
-                    mlp = attn_layer.block.mlp
+                    mlp = block.mlp
                     medusa_proj_params.append(mlp.c_fc.weight)
                     medusa_proj_params.append(mlp.c_proj.weight)
             # Channel mixer is a matrix param -> Muon (used by both MLP and attention)
             if self.channel_mixer_fc is not None:
-                for channel_fc in self.channel_mixer_fc:
-                    medusa_matrix_params.append(channel_fc.weight)
+                if isinstance(self.channel_mixer_fc, nn.ModuleList):
+                    for channel_fc in self.channel_mixer_fc:
+                        medusa_matrix_params.append(channel_fc.weight)
+                else:
+                    medusa_matrix_params.append(self.channel_mixer_fc.weight)
 
         # Collect small params that can't be sharded in DDP (first dim < world_size)
         # These go to a separate non-distributed AdamW
         small_params = []
         if self.use_head_mixer and self.mixer_type == "attention" and self.head_attention is not None:
             # pos_emb has shape (num_heads, hidden_size) which is too small to shard
-            for attn_layer in self.head_attention:
-                small_params.append(attn_layer.pos_emb)
+            small_params.append(self.head_attention.pos_emb)
 
         # Scale LR by 1/sqrt(hidden_size/768) like nanochat does
         dmodel_lr_scale = (hidden_size / 768) ** -0.5
@@ -2470,6 +2467,7 @@ def load_gemma_medusa_model(
     mixer_num_layers: int = 1,
     mixer_type: str = "mlp",
     attention_head_dim: int | None = None,
+    attn_num_layers: int = 1,
     causal_attn: bool = False,
 ):
     """
@@ -2490,6 +2488,7 @@ def load_gemma_medusa_model(
         mixer_num_layers: Number of mixer layers to stack (default: 1)
         mixer_type: Type of mixer ("mlp" or "attention")
         attention_head_dim: Head dimension for attention mixer (default: min(64, hidden_size))
+        attn_num_layers: Number of attention blocks for attention mixer (default: 1)
         causal_attn: Use causal attention for attention mixer (default: bidirectional)
 
     Returns:
@@ -2510,5 +2509,6 @@ def load_gemma_medusa_model(
         mixer_num_layers=mixer_num_layers,
         mixer_type=mixer_type,
         attention_head_dim=attention_head_dim,
+        attn_num_layers=attn_num_layers,
         causal_attn=causal_attn,
     )
