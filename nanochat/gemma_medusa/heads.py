@@ -329,3 +329,83 @@ class MedusaDeltaHead(nn.Module):
         for block in self.blocks:
             delta = block(delta)
         return delta
+
+
+def compute_multi_layer_indices(n_layers: int) -> list[int]:
+    """
+    Compute evenly-spaced intermediate layer indices for multi-layer fusion.
+
+    Given N total layers (0 to N-1), we always use the final layer (N-1) plus
+    2 intermediate layers that divide the remaining (N-1) layers into thirds.
+
+    For N layers, we pick layers at positions that cut (N-1) into thirds:
+    - Layer at round((N-1) * 1/3)
+    - Layer at round((N-1) * 2/3)
+    - Layer N-1 (final layer, always included)
+
+    Examples:
+        N=26: layers [9, 17, 25] (round(25/3)=8, round(50/3)=17, final=25)
+        N=18: layers [6, 11, 17]
+        N=12: layers [4, 7, 11]
+
+    Args:
+        n_layers: Total number of transformer layers
+
+    Returns:
+        List of 3 layer indices in ascending order
+    """
+    # N-1 is the index of the last layer (0-indexed)
+    last_idx = n_layers - 1
+
+    # Compute the two intermediate positions that cut N-1 into thirds
+    first_third = round(last_idx * 1 / 3)
+    second_third = round(last_idx * 2 / 3)
+
+    assert first_third < second_third < last_idx
+    return [first_third, second_third, last_idx]
+
+
+class MultiLayerFusion(nn.Module):
+    """
+    Preprocessor that fuses hidden states from multiple transformer layers.
+
+    This module takes concatenated hidden states from multiple layers and
+    down-projects them back to the original hidden dimension. It is designed
+    to be used as a preprocessing step before any Medusa head (MedusaLoRAHead,
+    MedusaDeltaHead, etc.).
+
+    Architecture:
+        Input: (B, T, num_layers * hidden_size) - concatenated layer outputs
+        -> Linear down-projection
+        -> SiLU activation
+        Output: (B, T, hidden_size) - fused representation
+
+    The non-linearity (SiLU) allows the model to learn non-linear combinations
+    of layer information, which is important since the subsequent head layers
+    would otherwise absorb a purely linear transformation.
+
+    Args:
+        hidden_size: Hidden dimension of the model
+        num_fused_layers: Number of layers being fused (default: 3)
+    """
+    def __init__(self, hidden_size: int, num_fused_layers: int = 3):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_fused_layers = num_fused_layers
+
+        # Down-projection from concatenated multi-layer hidden states to original size
+        # Input: (B, T, num_fused_layers * hidden_size)
+        # Output: (B, T, hidden_size)
+        self.down_proj = nn.Linear(num_fused_layers * hidden_size, hidden_size, bias=False)
+
+    def forward(self, multi_layer_hidden: torch.Tensor) -> torch.Tensor:
+        """
+        Fuse multi-layer hidden states into single hidden representation.
+
+        Args:
+            multi_layer_hidden: (B, T, num_fused_layers * hidden_size) concatenated hidden states
+
+        Returns:
+            (B, T, hidden_size) fused hidden states
+        """
+        return F.silu(self.down_proj(multi_layer_hidden))

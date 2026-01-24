@@ -402,6 +402,8 @@ if __name__ == "__main__":
                         help="Number of attention blocks for cross-head mixing (0 = disabled)")
     parser.add_argument("--causal-attn", action="store_true",
                         help="Use causal attention for --attn-num-layers (default: bidirectional)")
+    parser.add_argument("--use-multi-layer", action="store_true",
+                        help="Use multi-layer hidden state fusion (3 layers: 2 evenly spaced + final)")
 
     # Performance optimization
     parser.add_argument("--compile", action="store_true",
@@ -504,7 +506,8 @@ if __name__ == "__main__":
         mixer_str = f", attn(layers={args.attn_num_layers}" + (",causal" if args.causal_attn else "") + ")"
     else:
         mixer_str = ""
-    print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, lora_rank={args.lora_rank}{mixer_str}")
+    multi_layer_str = ", multi_layer" if args.use_multi_layer else ""
+    print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, lora_rank={args.lora_rank}{mixer_str}{multi_layer_str}")
 
     # Determine mixer type for model
     use_head_mixer = args.use_mlp_mixer or args.attn_num_layers > 0
@@ -526,6 +529,7 @@ if __name__ == "__main__":
         mixer_type=mixer_type,
         attn_num_layers=args.attn_num_layers,
         causal_attn=args.causal_attn,
+        use_multi_layer=args.use_multi_layer,
     )
     tokenizer = GemmaTokenizerWrapper(args.base_model)
 
@@ -990,6 +994,7 @@ if __name__ == "__main__":
                     "causal_attn": args.causal_attn if args.attn_num_layers > 0 else None,
                     "mlp_mixer_hidden": args.mlp_mixer_hidden if args.use_mlp_mixer else None,
                     "mixer_num_layers": args.mixer_num_layers if args.use_mlp_mixer else None,
+                    "use_multi_layer": args.use_multi_layer,
                 },
                 "total_predictions": total_counts,
                 "recall": recall_rates,

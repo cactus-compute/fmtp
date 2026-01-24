@@ -14,7 +14,17 @@ from .model import (
     load_gemma_model,
     load_gemma_medusa_model,
 )
-from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaHeadAttention, MedusaResBlock, MedusaHead, MedusaDeltaHead, IndependentMedusaHead
+from .heads import (
+    MedusaLoRAHead,
+    MedusaLoRAHeadWithMixer,
+    MedusaHeadAttention,
+    MedusaResBlock,
+    MedusaHead,
+    MedusaDeltaHead,
+    IndependentMedusaHead,
+    MultiLayerFusion,
+    compute_multi_layer_indices,
+)
 
 __all__ = [
     # Config
@@ -36,4 +46,7 @@ __all__ = [
     "MedusaHead",
     "MedusaDeltaHead",
     "IndependentMedusaHead",
+    # Multi-layer fusion
+    "MultiLayerFusion",
+    "compute_multi_layer_indices",
 ]

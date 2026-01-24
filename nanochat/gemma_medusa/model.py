@@ -717,6 +717,11 @@ class GemmaMedusaModel(nn.Module):
 
     Optimization: Only ONE lm_head matmul needed. LoRA heads output vocab-sized deltas
     that are added to the base logits. The LoRA computation is much smaller than lm_head.
+
+    Multi-layer mode:
+        When use_multi_layer=True, heads receive concatenated hidden states from multiple
+        transformer layers (final layer + 2 intermediate layers evenly spaced), allowing
+        them to leverage both low-level and high-level features for better prediction.
     """
 
     def __init__(
@@ -737,6 +742,7 @@ class GemmaMedusaModel(nn.Module):
         attention_head_dim: int | None = None,  # head_dim for attention mixer (default: min(64, hidden_size))
         attn_num_layers: int = 1,  # Number of attention blocks for attention mixer
         causal_attn: bool = False,  # Use causal attention for attention mixer (default: bidirectional)
+        use_multi_layer: bool = False,  # Use multi-layer hidden state fusion
     ):
         super().__init__()
         self.model_name = model_name
@@ -752,6 +758,7 @@ class GemmaMedusaModel(nn.Module):
         self.attention_head_dim = attention_head_dim
         self.attn_num_layers = attn_num_layers
         self.causal_attn = causal_attn
+        self.use_multi_layer = use_multi_layer
 
         # Determine device and dtype
         if device is None:
@@ -793,10 +800,27 @@ class GemmaMedusaModel(nn.Module):
         hf_config = self.base_model.config
         hidden_size = hf_config.hidden_size
         vocab_size = hf_config.vocab_size
+        n_layers = hf_config.num_hidden_layers
         self._hidden_size = hidden_size
         self._vocab_size = vocab_size
+        self._n_layers = n_layers
 
-        # Create Medusa LoRA heads
+        # Compute multi-layer indices and create fusion module if using multi-layer fusion
+        if use_multi_layer:
+            from .heads import compute_multi_layer_indices, MultiLayerFusion
+            self._multi_layer_indices = compute_multi_layer_indices(n_layers)
+            num_fused_layers = len(self._multi_layer_indices)  # Always 3
+
+            # Create multi-layer fusion preprocessor (shared across all heads)
+            self.multi_layer_fusion = MultiLayerFusion(
+                hidden_size=hidden_size,
+                num_fused_layers=num_fused_layers,
+            ).to(device=device, dtype=dtype)
+        else:
+            self._multi_layer_indices = None
+            self.multi_layer_fusion = None
+
+        # Create standard Medusa LoRA heads (same heads used with or without multi-layer)
         self.medusa_heads = nn.ModuleList([
             MedusaLoRAHead(hidden_size, vocab_size, medusa_num_layers, lora_rank,
                           lora_alpha=self.lora_alpha, zero_init_mlp=zero_init_mlp)
@@ -883,8 +907,11 @@ class GemmaMedusaModel(nn.Module):
             param.requires_grad = True
 
     def get_medusa_param_count(self) -> int:
-        """Return number of trainable Medusa parameters."""
-        return sum(p.numel() for p in self.medusa_heads.parameters())
+        """Return number of trainable Medusa parameters (including fusion module if present)."""
+        count = sum(p.numel() for p in self.medusa_heads.parameters())
+        if self.multi_layer_fusion is not None:
+            count += sum(p.numel() for p in self.multi_layer_fusion.parameters())
+        return count
 
     def _cache_stacked_weights(self):
         """Pre-stack LoRA weights and scalings for efficient batched forward pass."""
@@ -902,19 +929,29 @@ class GemmaMedusaModel(nn.Module):
         self._scalings = torch.tensor([head.scaling for head in self.medusa_heads],
                                       device=self._device, dtype=self._dtype)
 
-    def _get_hidden_states(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _get_hidden_states(
+        self, input_ids: torch.Tensor
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """
-        Get final hidden states from the transformer (before lm_head).
+        Get hidden states from the transformer (before lm_head).
 
         Args:
             input_ids: (B, T) input token IDs
 
         Returns:
-            hidden_states: (B, T, hidden_size)
+            If use_multi_layer=False:
+                hidden_states: (B, T, hidden_size) - final layer only
+            If use_multi_layer=True:
+                Tuple of:
+                - hidden_states: (B, T, hidden_size) - final layer for lm_head
+                - multi_layer_hidden: (B, T, 3 * hidden_size) - concatenated layers for MTP heads
         """
+        # Determine if we need intermediate hidden states
+        need_all_hidden = self.use_multi_layer and self._multi_layer_indices is not None
+
         outputs = self.base_model.model(
             input_ids=input_ids,
-            output_hidden_states=False,
+            output_hidden_states=need_all_hidden,
             return_dict=True,
         )
         hidden_states = outputs.last_hidden_state
@@ -929,6 +966,17 @@ class GemmaMedusaModel(nn.Module):
                 print(f"[NaN DEBUG] Inf in hidden_states from base model!", flush=True)
                 print(f"[NaN DEBUG]   hidden_states max: {hidden_states.max().item()}", flush=True)
                 print(f"[NaN DEBUG]   hidden_states min: {hidden_states.min().item()}", flush=True)
+
+        if need_all_hidden:
+            # outputs.hidden_states is a tuple of (n_layers + 1) tensors:
+            # [embedding_output, layer_0_output, layer_1_output, ..., layer_(n-1)_output]
+            # We want specific layer outputs (0-indexed from the first transformer layer)
+            all_hidden = outputs.hidden_states
+            # +1 because index 0 is embedding output, layer i output is at index i+1
+            selected_hidden = [all_hidden[idx + 1] for idx in self._multi_layer_indices]
+            # Concatenate along hidden dimension: (B, T, 3 * hidden_size)
+            multi_layer_hidden = torch.cat(selected_hidden, dim=-1)
+            return hidden_states, multi_layer_hidden
 
         return hidden_states
 
@@ -969,6 +1017,7 @@ class GemmaMedusaModel(nn.Module):
         hidden_states: torch.Tensor,
         return_medusa: bool = True,
         last_only: bool = False,
+        multi_layer_hidden: torch.Tensor | None = None,
     ):
         """
         Compute main logits and Medusa logits efficiently with batched matmuls.
@@ -977,14 +1026,20 @@ class GemmaMedusaModel(nn.Module):
         - Main: lm_head(h) -> (B, T, vocab)
         - Each head: lm_head(h) + scaling * lora_B(lora_A(ResBlocks(h)))
 
+        For multi-layer heads:
+        - Main: lm_head(h_final) -> (B, T, vocab)
+        - Each head: lm_head(h_final) + scaling * lora_B(lora_A(ResBlocks(down_proj(h_multi))))
+
         Optimization: We batch the lora_B projections (rank -> vocab) into a single matmul.
         This is the expensive operation since vocab_size >> rank.
 
         Args:
-            hidden_states: (B, T, hidden_size) from transformer
+            hidden_states: (B, T, hidden_size) from transformer (final layer)
             return_medusa: Whether to compute Medusa logits
             last_only: If True, only compute logits for the last token position.
                        This is much faster for generation where we only need [:, -1, :].
+            multi_layer_hidden: (B, T, 3*hidden_size) concatenated multi-layer hidden states.
+                               Only used when use_multi_layer=True.
 
         Returns:
             main_logits: (B, T, vocab_size) or (B, 1, vocab_size) if last_only
@@ -993,16 +1048,24 @@ class GemmaMedusaModel(nn.Module):
         # For generation, we only need the last position's logits
         if last_only:
             hidden_states = hidden_states[:, -1:, :]  # (B, 1, hidden_size)
+            if multi_layer_hidden is not None:
+                multi_layer_hidden = multi_layer_hidden[:, -1:, :]  # (B, 1, 3*hidden_size)
 
         if not return_medusa or len(self.medusa_heads) == 0:
             return self.base_model.lm_head(hidden_states), None  # (B, T, vocab) or (B, 1, vocab)
 
         num_heads = len(self.medusa_heads)
 
+        # Apply multi-layer fusion if enabled (shared preprocessing for all heads)
+        if self.use_multi_layer and multi_layer_hidden is not None and self.multi_layer_fusion is not None:
+            head_input = self.multi_layer_fusion(multi_layer_hidden)  # (B, T, hidden_size)
+        else:
+            head_input = hidden_states
+
         # Step 1: Compute ResBlocks for each head (sequential to preserve gradients during training)
         resblock_outputs = []
         for head_idx, head in enumerate(self.medusa_heads):
-            x = hidden_states
+            x = head_input
             for block in head.blocks:
                 x = block(x)
             # NaN/Inf detection after ResBlocks
@@ -1111,6 +1174,7 @@ class GemmaMedusaModel(nn.Module):
         targets: torch.Tensor,
         loss_reduction: str = 'mean',
         chunk_size: int = 128,
+        multi_layer_hidden: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Compute losses with chunked cross-entropy to reduce peak memory.
@@ -1123,10 +1187,12 @@ class GemmaMedusaModel(nn.Module):
         only the vocab-sized tensors are chunked.
 
         Args:
-            hidden_states: (B, T, hidden_size) from transformer
+            hidden_states: (B, T, hidden_size) from transformer (final layer)
             targets: (B, T) target token IDs
             loss_reduction: 'mean' or 'none'
             chunk_size: Number of sequence positions to process at once
+            multi_layer_hidden: (B, T, 3*hidden_size) concatenated multi-layer hidden states.
+                               Only used when use_multi_layer=True.
 
         Returns:
             main_loss: scalar loss for main head
@@ -1136,10 +1202,17 @@ class GemmaMedusaModel(nn.Module):
         num_heads = len(self.medusa_heads)
         lm_head = self.base_model.lm_head
 
+        # Determine input for heads: multi-layer or single-layer
+        head_input = multi_layer_hidden if self.use_multi_layer and multi_layer_hidden is not None else hidden_states
+
+        # Apply multi-layer fusion if enabled (shared preprocessing for all heads)
+        if self.use_multi_layer and multi_layer_hidden is not None and self.multi_layer_fusion is not None:
+            head_input = self.multi_layer_fusion(multi_layer_hidden)  # (B, T, hidden_size)
+
         # Step 1: Compute ResBlocks for all heads (small memory: num_heads * B * T * hidden)
         resblock_outputs = []
         for head in self.medusa_heads:
-            x = hidden_states
+            x = head_input
             for block in head.blocks:
                 x = block(x)
             resblock_outputs.append(x)
@@ -1294,14 +1367,21 @@ class GemmaMedusaModel(nn.Module):
             raise NotImplementedError("KV cache not yet supported for GemmaMedusaModel")
 
         # Get hidden states from transformer
-        hidden_states = self._get_hidden_states(input_ids)
+        hidden_result = self._get_hidden_states(input_ids)
+
+        # Handle multi-layer vs single-layer case
+        if self.use_multi_layer and isinstance(hidden_result, tuple):
+            hidden_states, multi_layer_hidden = hidden_result
+        else:
+            hidden_states = hidden_result
+            multi_layer_hidden = None
 
         # Use chunked loss computation for memory efficiency during training
         if use_chunked_loss and targets is not None and return_medusa:
-            return self._compute_losses_chunked(hidden_states, targets, loss_reduction, chunk_size)
+            return self._compute_losses_chunked(hidden_states, targets, loss_reduction, chunk_size, multi_layer_hidden)
 
         # Standard path: compute logits then losses
-        main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa, last_only)
+        main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa, last_only, multi_layer_hidden)
 
         if targets is not None:
             # Training mode - compute losses
@@ -2469,6 +2549,7 @@ def load_gemma_medusa_model(
     attention_head_dim: int | None = None,
     attn_num_layers: int = 1,
     causal_attn: bool = False,
+    use_multi_layer: bool = False,
 ):
     """
     Load a Gemma model with Medusa LoRA heads.
@@ -2490,6 +2571,7 @@ def load_gemma_medusa_model(
         attention_head_dim: Head dimension for attention mixer (default: min(64, hidden_size))
         attn_num_layers: Number of attention blocks for attention mixer (default: 1)
         causal_attn: Use causal attention for attention mixer (default: bidirectional)
+        use_multi_layer: Use multi-layer hidden state fusion (3 layers: 2 evenly spaced + final)
 
     Returns:
         GemmaMedusaModel instance
@@ -2511,4 +2593,5 @@ def load_gemma_medusa_model(
         attention_head_dim=attention_head_dim,
         attn_num_layers=attn_num_layers,
         causal_attn=causal_attn,
+        use_multi_layer=use_multi_layer,
     )
