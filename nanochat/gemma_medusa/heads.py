@@ -376,13 +376,15 @@ class MultiLayerFusion(nn.Module):
 
     Architecture:
         Input: (B, T, num_layers * hidden_size) - concatenated layer outputs
+               (B, T, hidden_size) - final layer hidden states (for residual)
         -> Linear down-projection
         -> SiLU activation
+        -> Add residual from final hidden states
         Output: (B, T, hidden_size) - fused representation
 
-    The non-linearity (SiLU) allows the model to learn non-linear combinations
-    of layer information, which is important since the subsequent head layers
-    would otherwise absorb a purely linear transformation.
+    The residual connection ensures the model can always fall back to the
+    original final layer representation while learning to incorporate
+    information from intermediate layers.
 
     Args:
         hidden_size: Hidden dimension of the model
@@ -398,14 +400,19 @@ class MultiLayerFusion(nn.Module):
         # Output: (B, T, hidden_size)
         self.down_proj = nn.Linear(num_fused_layers * hidden_size, hidden_size, bias=False)
 
-    def forward(self, multi_layer_hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        multi_layer_hidden: torch.Tensor,
+        final_hidden: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Fuse multi-layer hidden states into single hidden representation.
 
         Args:
             multi_layer_hidden: (B, T, num_fused_layers * hidden_size) concatenated hidden states
+            final_hidden: (B, T, hidden_size) final layer hidden states for residual
 
         Returns:
-            (B, T, hidden_size) fused hidden states
+            (B, T, hidden_size) fused hidden states with residual from final layer
         """
-        return F.silu(self.down_proj(multi_layer_hidden))
+        return final_hidden + F.silu(self.down_proj(multi_layer_hidden))

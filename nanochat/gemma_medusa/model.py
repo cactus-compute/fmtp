@@ -1058,7 +1058,7 @@ class GemmaMedusaModel(nn.Module):
 
         # Apply multi-layer fusion if enabled (shared preprocessing for all heads)
         if self.use_multi_layer and multi_layer_hidden is not None and self.multi_layer_fusion is not None:
-            head_input = self.multi_layer_fusion(multi_layer_hidden)  # (B, T, hidden_size)
+            head_input = self.multi_layer_fusion(multi_layer_hidden, hidden_states)  # (B, T, hidden_size)
         else:
             head_input = hidden_states
 
@@ -1202,12 +1202,11 @@ class GemmaMedusaModel(nn.Module):
         num_heads = len(self.medusa_heads)
         lm_head = self.base_model.lm_head
 
-        # Determine input for heads: multi-layer or single-layer
-        head_input = multi_layer_hidden if self.use_multi_layer and multi_layer_hidden is not None else hidden_states
-
         # Apply multi-layer fusion if enabled (shared preprocessing for all heads)
         if self.use_multi_layer and multi_layer_hidden is not None and self.multi_layer_fusion is not None:
-            head_input = self.multi_layer_fusion(multi_layer_hidden)  # (B, T, hidden_size)
+            head_input = self.multi_layer_fusion(multi_layer_hidden, hidden_states)  # (B, T, hidden_size)
+        else:
+            head_input = hidden_states
 
         # Step 1: Compute ResBlocks for all heads (small memory: num_heads * B * T * hidden)
         resblock_outputs = []
