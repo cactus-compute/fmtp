@@ -428,7 +428,12 @@ if __name__ == "__main__":
 
     if 'standard' in results:
         speedup = results['mtp']['tokens_per_second'] / results['standard']['tokens_per_second']
-        print0(f"\nSpeedup: {speedup:.2f}x")
+        mean_accepted = results['mtp']['mean_accepted_length']
+        # Tree overhead factor: how many single-token passes a tree verification costs
+        # speedup = mean_accepted / tree_overhead, so tree_overhead = mean_accepted / speedup
+        tree_overhead = mean_accepted / speedup if speedup > 0 else float('inf')
+        print0(f"\nSpeedup: {speedup:.2f}x (wall-clock)")
+        print0(f"Tree overhead factor: {tree_overhead:.2f}x (break-even at mean_accepted={tree_overhead:.2f})")
 
     # Save results
     output_data = {

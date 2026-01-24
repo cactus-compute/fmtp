@@ -252,7 +252,11 @@ class MTPStats:
 
     @property
     def speedup(self) -> float:
-        """Approximate speedup vs standard autoregressive decoding."""
+        """Theoretical max speedup (= mean_accepted), assuming zero tree overhead.
+
+        Actual speedup is: mean_accepted / tree_overhead_factor
+        where tree_overhead_factor is typically 1.2-1.5x for small models.
+        """
         return self.mean_accepted_length
 
 
@@ -1657,17 +1661,24 @@ class GemmaMedusaModel(nn.Module):
         # tree_position_ids contains depth-based offsets (0, 1, 1, 1, 2, 2, ...)
         position_ids = base_seq_len + tree_position_ids.unsqueeze(0)  # (1, tree_len)
 
-        # Build full attention mask: [attend to all cached, then tree attention pattern]
-        # Shape: (1, 1, tree_len, base_seq_len + tree_len)
-        cache_attn = torch.ones(1, 1, tree_len, base_seq_len, device=self._device, dtype=tree_attn_mask.dtype)
-        full_attn_mask = torch.cat([cache_attn, tree_attn_mask], dim=-1)
+        # Build attention mask efficiently (HF format: 0 = attend, -inf = don't)
+        # All tree tokens attend to all cached tokens (zeros), plus tree attention pattern
+        # Use pre-computed HF-format tree mask from buffers
+        hf_tree_mask = buffers.get("hf_tree_attn_mask")
+        if hf_tree_mask is None:
+            # Convert tree mask to HF format once and cache it
+            hf_tree_mask = torch.where(
+                tree_attn_mask > 0.5,
+                torch.zeros_like(tree_attn_mask),
+                torch.full_like(tree_attn_mask, float('-inf'))
+            )
+            buffers["hf_tree_attn_mask"] = hf_tree_mask
 
-        # Convert to HuggingFace format: 0 = attend, -inf = don't attend
-        hf_attn_mask = torch.where(
-            full_attn_mask > 0.5,
-            torch.zeros_like(full_attn_mask),
-            torch.full_like(full_attn_mask, float('-inf'))
-        )
+        # Create full mask: [zeros for cache attention, tree pattern]
+        # Shape: (1, 1, tree_len, base_seq_len + tree_len)
+        hf_attn_mask = torch.zeros(1, 1, tree_len, base_seq_len + tree_len,
+                                   device=self._device, dtype=tree_attn_mask.dtype)
+        hf_attn_mask[:, :, :, base_seq_len:] = hf_tree_mask
 
         # Forward pass with cache and tree attention mask
         hidden_states, new_past_key_values = self._get_hidden_states_with_cache(
@@ -2140,27 +2151,19 @@ class GemmaMedusaModel(nn.Module):
                         expected_tree_end = cache_len_before_tree + tree_len
 
                         if expected_tree_end <= cache_size:
-                            # No wrapping - simple case
-                            # Extract accepted positions from tree part
-                            accepted_kv_indices = [cache_len_before_tree + pos for pos in accepted_tree_positions]
-
-                            # Bounds check
-                            max_idx = max(accepted_kv_indices) if accepted_kv_indices else 0
-                            if max_idx >= cache_size:
-                                # Edge case: tree tokens don't fully fit, use fallback
-                                layer.keys = layer.keys[:, :, :cache_len_before_tree, :]
-                                layer.values = layer.values[:, :, :cache_len_before_tree, :]
-                                need_fallback = True
-                            else:
-                                # Build new cache: original + accepted
-                                original_keys = layer.keys[:, :, :cache_len_before_tree, :]
-                                original_values = layer.values[:, :, :cache_len_before_tree, :]
-
-                                accepted_keys = layer.keys[:, :, accepted_kv_indices, :]
-                                accepted_values = layer.values[:, :, accepted_kv_indices, :]
-
-                                layer.keys = torch.cat([original_keys, accepted_keys], dim=2)
-                                layer.values = torch.cat([original_values, accepted_values], dim=2)
+                            # No wrapping - use in-place optimization
+                            if num_accepted > 0:
+                                # Copy accepted positions to their final locations
+                                for i, tree_pos in enumerate(accepted_tree_positions):
+                                    src_idx = cache_len_before_tree + tree_pos
+                                    dst_idx = cache_len_before_tree + i
+                                    if src_idx != dst_idx and src_idx < cache_size:
+                                        layer.keys[:, :, dst_idx, :] = layer.keys[:, :, src_idx, :]
+                                        layer.values[:, :, dst_idx, :] = layer.values[:, :, src_idx, :]
+                            # Trim to final size
+                            final_len = cache_len_before_tree + num_accepted
+                            layer.keys = layer.keys[:, :, :final_len, :]
+                            layer.values = layer.values[:, :, :final_len, :]
                         else:
                             # Wrapping case - need fallback for this layer
                             # Truncate back to original and mark for fallback
@@ -2172,27 +2175,19 @@ class GemmaMedusaModel(nn.Module):
                     else:
                         # Regular (non-sliding window) layer - simple extraction
                         # Tree tokens are at positions current_seq_len to current_seq_len + tree_len - 1
-                        accepted_kv_indices = [current_seq_len + pos for pos in accepted_tree_positions]
-
-                        # Debug: check bounds
-                        cache_size = layer.keys.shape[2]
-                        max_idx = max(accepted_kv_indices) if accepted_kv_indices else 0
-                        if max_idx >= cache_size:
-                            raise RuntimeError(
-                                f"KV cache index out of bounds: max_idx={max_idx}, cache_size={cache_size}, "
-                                f"current_seq_len={current_seq_len}, tree_len={tree_len}, "
-                                f"accepted_tree_positions={accepted_tree_positions}"
-                            )
-
-                        # Build new cache: original + accepted
-                        original_keys = layer.keys[:, :, :current_seq_len, :]
-                        original_values = layer.values[:, :, :current_seq_len, :]
-
-                        accepted_keys = layer.keys[:, :, accepted_kv_indices, :]
-                        accepted_values = layer.values[:, :, accepted_kv_indices, :]
-
-                        layer.keys = torch.cat([original_keys, accepted_keys], dim=2)
-                        layer.values = torch.cat([original_values, accepted_values], dim=2)
+                        # Optimization: copy accepted KV entries in-place, then slice to final size
+                        if num_accepted > 0:
+                            # Copy accepted positions to their final locations
+                            for i, tree_pos in enumerate(accepted_tree_positions):
+                                src_idx = current_seq_len + tree_pos
+                                dst_idx = current_seq_len + i
+                                if src_idx != dst_idx:  # Only copy if needed
+                                    layer.keys[:, :, dst_idx, :] = layer.keys[:, :, src_idx, :]
+                                    layer.values[:, :, dst_idx, :] = layer.values[:, :, src_idx, :]
+                        # Trim to final size (this is a view, no allocation)
+                        final_len = current_seq_len + num_accepted
+                        layer.keys = layer.keys[:, :, :final_len, :]
+                        layer.values = layer.values[:, :, :final_len, :]
 
             # Update sequence with accepted tokens
             current_tokens.extend(tokens_to_add)
