@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
 import json
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -239,6 +240,7 @@ class MTPStats:
     forward_passes: int
     total_proposed: int
     total_accepted: int
+    timing: Dict[str, float | int] | None = None
 
     @property
     def mean_accepted_length(self) -> float:
@@ -2024,6 +2026,8 @@ class GemmaMedusaModel(nn.Module):
 
             stats.forward_passes += 1
             stats.total_proposed += max_speculation
+            if collect_timing:
+                timing["iterations"] = stats.forward_passes
 
             # Evaluate which candidates to accept (optimized, works on tree_logits directly)
             if temperature == 0.0:
@@ -2077,6 +2081,7 @@ class GemmaMedusaModel(nn.Module):
         posterior_threshold: float = 0.09,
         posterior_alpha: float = 0.3,
         eos_token_id: Optional[int] = None,
+        collect_timing: bool = False,
     ) -> Tuple[List[int], MTPStats]:
         """
         Generate tokens using MTP with KV caching for maximum speed.
@@ -2113,12 +2118,28 @@ class GemmaMedusaModel(nn.Module):
         retrieve_indices = buffers["retrieve_indices"]
         max_speculation = retrieve_indices.shape[1] - 1
 
+        timing = None
+        if collect_timing:
+            timing = {
+                "prefill_s": 0.0,
+                "candidate_s": 0.0,
+                "tree_verify_s": 0.0,
+                "eval_s": 0.0,
+                "kv_update_s": 0.0,
+                "compute_logits_s": 0.0,
+                "iterations": 0,
+                "tree_len": int(buffers["tree_indices"].shape[0]),
+                "max_speculation": int(max_speculation),
+                "topk": int(topk),
+            }
+
         # Initialize stats
         stats = MTPStats(
             tokens_generated=0,
             forward_passes=0,
             total_proposed=0,
             total_accepted=0,
+            timing=timing,
         )
 
         # Initialize tokens
@@ -2128,6 +2149,10 @@ class GemmaMedusaModel(nn.Module):
         # Process initial prompt and get KV cache
         input_tensor = torch.tensor([current_tokens], dtype=torch.long, device=self._device)
 
+        if collect_timing and is_cuda:
+            torch.cuda.synchronize()
+        if collect_timing:
+            t0 = time.perf_counter()
         if is_cuda:
             with torch.amp.autocast('cuda', dtype=dtype):
                 hidden_states, past_key_values = self._get_hidden_states_with_cache(input_tensor)
@@ -2135,6 +2160,10 @@ class GemmaMedusaModel(nn.Module):
         else:
             hidden_states, past_key_values = self._get_hidden_states_with_cache(input_tensor)
             main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa=True, last_only=True)
+        if collect_timing:
+            if is_cuda:
+                torch.cuda.synchronize()
+            timing["prefill_s"] += time.perf_counter() - t0
 
         assert medusa_logits is not None
         # Note: Don't count initial prompt processing as a forward pass for mean_accepted_length
@@ -2149,13 +2178,25 @@ class GemmaMedusaModel(nn.Module):
 
         while num_generated < max_new_tokens:
             # Generate candidates (vectorized, fast)
+            if collect_timing and is_cuda:
+                torch.cuda.synchronize()
+            if collect_timing:
+                t0 = time.perf_counter()
             candidates, tree_candidates = self._generate_candidates(
                 last_main, last_medusa, buffers, topk, temperature
             )
+            if collect_timing:
+                if is_cuda:
+                    torch.cuda.synchronize()
+                timing["candidate_s"] += time.perf_counter() - t0
 
             # Verify candidates with tree attention using KV cache
             # The tree verification extends the KV cache with tree tokens.
             # After acceptance, we keep only the accepted path's KV entries (no extra forward pass!)
+            if collect_timing and is_cuda:
+                torch.cuda.synchronize()
+            if collect_timing:
+                t0 = time.perf_counter()
             if is_cuda:
                 with torch.amp.autocast('cuda', dtype=dtype):
                     tree_logits, ret_indices, valid_mask, _, tree_hidden_states = self.forward_mtp_with_cache(
@@ -2165,11 +2206,19 @@ class GemmaMedusaModel(nn.Module):
                 tree_logits, ret_indices, valid_mask, _, tree_hidden_states = self.forward_mtp_with_cache(
                     tree_candidates, buffers, past_key_values, current_seq_len
                 )
+            if collect_timing:
+                if is_cuda:
+                    torch.cuda.synchronize()
+                timing["tree_verify_s"] += time.perf_counter() - t0
 
             stats.forward_passes += 1
             stats.total_proposed += max_speculation
 
             # Evaluate which candidates to accept
+            if collect_timing and is_cuda:
+                torch.cuda.synchronize()
+            if collect_timing:
+                t0 = time.perf_counter()
             if temperature == 0.0:
                 best_candidate, accept_length = self._evaluate_candidates_greedy_fast(
                     tree_logits, candidates, ret_indices, valid_mask
@@ -2179,6 +2228,10 @@ class GemmaMedusaModel(nn.Module):
                     tree_logits, candidates, ret_indices, valid_mask, temperature,
                     posterior_threshold, posterior_alpha
                 )
+            if collect_timing:
+                if is_cuda:
+                    torch.cuda.synchronize()
+                timing["eval_s"] += time.perf_counter() - t0
 
             # Accept tokens from the best candidate
             accepted_tokens = candidates[best_candidate, : accept_length + 1].tolist()
@@ -2207,6 +2260,10 @@ class GemmaMedusaModel(nn.Module):
             tree_len = tree_candidates.shape[0]
             need_fallback = False  # Track if any layer needs fallback
 
+            if collect_timing and is_cuda:
+                torch.cuda.synchronize()
+            if collect_timing:
+                t0 = time.perf_counter()
             for layer in past_key_values.layers:
                 if hasattr(layer, 'keys') and layer.keys is not None:
                     if hasattr(layer, 'sliding_window') and layer.sliding_window is not None:
@@ -2260,6 +2317,10 @@ class GemmaMedusaModel(nn.Module):
                         final_len = current_seq_len + num_accepted
                         layer.keys = layer.keys[:, :, :final_len, :]
                         layer.values = layer.values[:, :, :final_len, :]
+            if collect_timing:
+                if is_cuda:
+                    torch.cuda.synchronize()
+                timing["kv_update_s"] += time.perf_counter() - t0
 
             # Update sequence with accepted tokens
             current_tokens.extend(tokens_to_add)
@@ -2280,6 +2341,10 @@ class GemmaMedusaModel(nn.Module):
             last_hidden = tree_hidden_states[last_accepted_tree_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, hidden)
 
             # Compute main logits and Medusa heads from this hidden state
+            if collect_timing and is_cuda:
+                torch.cuda.synchronize()
+            if collect_timing:
+                t0 = time.perf_counter()
             if is_cuda:
                 with torch.amp.autocast('cuda', dtype=dtype):
                     main_logits, medusa_logits = self._compute_logits(
@@ -2289,6 +2354,10 @@ class GemmaMedusaModel(nn.Module):
                 main_logits, medusa_logits = self._compute_logits(
                     last_hidden, return_medusa=True
                 )
+            if collect_timing:
+                if is_cuda:
+                    torch.cuda.synchronize()
+                timing["compute_logits_s"] += time.perf_counter() - t0
 
             assert medusa_logits is not None
             # main_logits is (1, 1, vocab), medusa_logits is (num_heads, 1, 1, vocab)

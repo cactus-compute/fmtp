@@ -137,7 +137,8 @@ def evaluate_response(conversation, completion_text, eval_type, task=None):
         return pred_answer == ref_answer, pred_answer, ref_answer
 
 
-def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens, temperature, use_fixed_size_tree=False, use_heuristic_tree=False):
+def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens, temperature,
+                 use_fixed_size_tree=False, use_heuristic_tree=False, collect_timing=False):
     """Run evaluation using MTP speculative decoding."""
     num_problems = min(len(task), max_problems) if max_problems else len(task)
 
@@ -145,6 +146,9 @@ def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens
     total_time = 0.0
     total_forward_passes = 0
     num_passed = 0
+    timing_totals = None
+    timing_meta = None
+    timing_iters = 0
 
     eos_token_id = tokenizer.hf_tokenizer.eos_token_id
 
@@ -165,6 +169,7 @@ def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens
             eos_token_id=eos_token_id,
             use_fixed_size_tree=use_fixed_size_tree,
             use_heuristic_tree=use_heuristic_tree,
+            collect_timing=collect_timing,
         )
 
         torch.cuda.synchronize()
@@ -187,6 +192,19 @@ def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens
         total_tokens += gen_tokens
         total_time += (t1 - t0)
         total_forward_passes += stats.forward_passes
+        if collect_timing and stats.timing is not None:
+            if timing_totals is None:
+                timing_totals = {k: 0.0 for k in stats.timing.keys() if k.endswith("_s")}
+                timing_meta = {
+                    k: stats.timing.get(k)
+                    for k in ("tree_len", "max_speculation", "topk")
+                    if k in stats.timing
+                }
+            for key, value in stats.timing.items():
+                if key.endswith("_s"):
+                    timing_totals[key] += float(value)
+                elif key == "iterations":
+                    timing_iters += int(value)
 
         print(f"\r[MTP] {i+1}/{num_problems} | {num_passed}/{i+1} ({100*num_passed/(i+1):.1f}%) | "
               f"mean_accepted={stats.mean_accepted_length:.2f}", end='', flush=True)
@@ -197,7 +215,7 @@ def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens
     tok_per_sec = total_tokens / total_time if total_time > 0 else 0
     mean_accepted = total_tokens / total_forward_passes if total_forward_passes > 0 else 0
 
-    return {
+    result = {
         'accuracy': accuracy,
         'tokens': total_tokens,
         'time_seconds': total_time,
@@ -207,6 +225,30 @@ def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens
         'num_correct': num_passed,
         'num_total': num_problems,
     }
+    if collect_timing and timing_totals is not None:
+        decode_keys = ["candidate_s", "tree_verify_s", "eval_s", "kv_update_s", "compute_logits_s"]
+        decode_s = sum(timing_totals.get(k, 0.0) for k in decode_keys)
+        per_iter_ms = (decode_s / timing_iters * 1000.0) if timing_iters > 0 else 0.0
+        per_token_ms = (decode_s / total_tokens * 1000.0) if total_tokens > 0 else 0.0
+        result["timing"] = {
+            "totals_s": timing_totals,
+            "prefill_s": timing_totals.get("prefill_s", 0.0),
+            "decode_s": decode_s,
+            "iterations": timing_iters,
+            "per_iter_ms": per_iter_ms,
+            "per_token_ms": per_token_ms,
+            "meta": timing_meta or {},
+        }
+        print0(f"Timing (MTP decode): {per_iter_ms:.3f} ms/iter, {per_token_ms:.3f} ms/token")
+        if decode_s > 0:
+            parts = []
+            for key in decode_keys:
+                if key in timing_totals:
+                    parts.append(f"{key}={100*timing_totals[key]/decode_s:.1f}%")
+            if parts:
+                print0("Timing breakdown: " + ", ".join(parts))
+
+    return result
 
 
 def run_standard_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens, temperature):
@@ -309,12 +351,16 @@ if __name__ == "__main__":
                         help='Number of attention blocks for cross-head mixing (0 = disabled)')
     parser.add_argument('--use-multi-layer', action='store_true',
                         help='Use multi-layer hidden state fusion')
+    parser.add_argument('--timing', action='store_true',
+                        help='Collect detailed MTP timing (adds CUDA sync overhead)')
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     print0(f"Loading model: {args.model_name}")
+    if args.timing:
+        print0("Timing enabled: tok/s will include CUDA sync overhead")
     lora_alpha = args.lora_alpha if args.lora_alpha is not None else args.lora_rank
     print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, rank={args.lora_rank}, alpha={lora_alpha}")
 
@@ -403,6 +449,7 @@ if __name__ == "__main__":
             model, tokenizer, task, eval_type, args.max_problems, args.max_new_tokens, args.temperature,
             use_fixed_size_tree=args.fixed_tree_size,
             use_heuristic_tree=args.use_heuristic_tree,
+            collect_timing=args.timing,
         )
     print0(f"MTP: {100*results['mtp']['accuracy']:.2f}% accuracy, "
            f"{results['mtp']['tokens_per_second']:.1f} tok/s, "
