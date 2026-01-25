@@ -665,8 +665,10 @@ if __name__ == "__main__":
             if 'head_mixer_fc1' in checkpoint and model.head_mixer_fc1 is not None:
                 model.head_mixer_fc1.load_state_dict(checkpoint['head_mixer_fc1'])
                 model.head_mixer_fc2.load_state_dict(checkpoint['head_mixer_fc2'])
-                model.channel_mixer_fc.load_state_dict(checkpoint['channel_mixer_fc'])
                 print0("Loaded head_mixer weights")
+            if 'channel_mixer_fc' in checkpoint and model.channel_mixer_fc is not None:
+                model.channel_mixer_fc.load_state_dict(checkpoint['channel_mixer_fc'])
+                print0("Loaded channel_mixer weights")
             # Load optimizer states if available
             if 'optimizers' in checkpoint:
                 for opt, state in zip(optimizers, checkpoint['optimizers']):
@@ -777,6 +779,7 @@ if __name__ == "__main__":
             if model.head_mixer_fc1 is not None:
                 checkpoint['head_mixer_fc1'] = model.head_mixer_fc1.state_dict()
                 checkpoint['head_mixer_fc2'] = model.head_mixer_fc2.state_dict()
+            if model.channel_mixer_fc is not None:
                 checkpoint['channel_mixer_fc'] = model.channel_mixer_fc.state_dict()
             torch.save(checkpoint, os.path.join(checkpoint_dir, "medusa_heads.pt"))
             print0(f"Saved checkpoint to {checkpoint_dir}")
@@ -954,6 +957,7 @@ if __name__ == "__main__":
         if model.head_mixer_fc1 is not None:
             checkpoint['head_mixer_fc1'] = model.head_mixer_fc1.state_dict()
             checkpoint['head_mixer_fc2'] = model.head_mixer_fc2.state_dict()
+        if model.channel_mixer_fc is not None:
             checkpoint['channel_mixer_fc'] = model.channel_mixer_fc.state_dict()
         torch.save(checkpoint, os.path.join(final_checkpoint_dir, "medusa_heads.pt"))
         print0(f"\nSaved final checkpoint to {final_checkpoint_dir}")

@@ -352,8 +352,16 @@ if __name__ == "__main__":
     if 'head_mixer_fc1' in checkpoint and model.head_mixer_fc1 is not None:
         model.head_mixer_fc1.load_state_dict(checkpoint['head_mixer_fc1'])
         model.head_mixer_fc2.load_state_dict(checkpoint['head_mixer_fc2'])
-        model.channel_mixer_fc.load_state_dict(checkpoint['channel_mixer_fc'])
         print0("Loaded head_mixer weights")
+    if 'channel_mixer_fc' in checkpoint and model.channel_mixer_fc is not None:
+        model.channel_mixer_fc.load_state_dict(checkpoint['channel_mixer_fc'])
+        print0("Loaded channel_mixer weights")
+    if 'head_attention' in checkpoint and model.head_attention is None:
+        print0("Warning: checkpoint has head_attention weights but attn mixer is disabled; pass --attn-num-layers to enable it.")
+    if 'head_mixer_fc1' in checkpoint and model.head_mixer_fc1 is None:
+        print0("Warning: checkpoint has head_mixer weights but MLP mixer is disabled; pass --use-head-mixer to enable it.")
+    if model.channel_mixer_fc is not None and 'channel_mixer_fc' not in checkpoint:
+        print0("Warning: checkpoint missing channel_mixer weights; attention mixer will run without channel mixing.")
     model._checkpoint_path = args.checkpoint  # Store for optimal tree generation from head_acc.json
     model.eval()
     print0(f"Medusa parameters: {model.get_medusa_param_count():,}")
