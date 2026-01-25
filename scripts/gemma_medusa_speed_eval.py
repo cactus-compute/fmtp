@@ -159,7 +159,8 @@ def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens
         prompt_ids = tokenizer.render_for_completion(conversation)
 
         # Generate with MTP
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         output_ids, stats = model.generate_mtp_with_cache(
@@ -172,7 +173,8 @@ def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens
             collect_timing=collect_timing,
         )
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t1 = time.perf_counter()
 
         # Decode completion
@@ -269,7 +271,8 @@ def run_standard_eval(model, tokenizer, task, eval_type, max_problems, max_new_t
         prompt_ids = tokenizer.render_for_completion(conversation)
 
         # Generate with standard autoregressive
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         output_ids, forward_passes = model.generate_standard_with_cache(
@@ -279,7 +282,8 @@ def run_standard_eval(model, tokenizer, task, eval_type, max_problems, max_new_t
             eos_token_id=eos_token_id,
         )
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t1 = time.perf_counter()
 
         # Decode completion
@@ -319,15 +323,31 @@ def run_standard_eval(model, tokenizer, task, eval_type, max_problems, max_new_t
     }
 
 
+def load_checkpoint_config(checkpoint_path: str) -> dict:
+    """Load config.json from checkpoint directory if it exists."""
+    # Try to find config.json
+    config_path = os.path.join(checkpoint_path, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            return json.load(f)
+    return {}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('-m', '--model-name', type=str, default='google/gemma-3-270m-it')
-    parser.add_argument('--medusa-num-heads', type=int, default=4)
-    parser.add_argument('--medusa-num-layers', type=int, default=1)
-    parser.add_argument('--lora-rank', type=int, default=64)
-    parser.add_argument('--lora-alpha', type=int, default=None)
+    parser.add_argument('-m', '--model-name', type=str, default=None,
+                        help='Model name (auto-detected from checkpoint config.json if not specified)')
+    parser.add_argument('--medusa-num-heads', type=int, default=None,
+                        help='Number of Medusa heads (auto-detected from checkpoint if not specified)')
+    parser.add_argument('--medusa-num-layers', type=int, default=None,
+                        help='ResBlock layers per head (auto-detected from checkpoint if not specified)')
+    parser.add_argument('--lora-rank', type=int, default=None,
+                        help='LoRA rank (auto-detected from checkpoint if not specified)')
+    parser.add_argument('--lora-alpha', type=int, default=None,
+                        help='LoRA alpha (auto-detected from checkpoint if not specified)')
     parser.add_argument('--checkpoint', type=str, default=None, required=True)
-    parser.add_argument('--zero-init-mtp-mlp', action='store_true')
+    parser.add_argument('--zero-init-mtp-mlp', action='store_true', default=None,
+                        help='Use zero-init for MTP MLP (auto-detected from checkpoint if not specified)')
     parser.add_argument('-x', '--max-problems', type=int, default=100)
     parser.add_argument('--max-new-tokens', type=int, default=None,
                         help='Max tokens to generate (default: 512 for generative, 16 for categorical)')
@@ -343,45 +363,74 @@ if __name__ == "__main__":
                         help='Use fixed 79-node tree for fair ablation comparison across head counts')
     parser.add_argument('--use-heuristic-tree', action='store_true',
                         help='Use heuristic tree instead of calibrated optimal tree (default: use optimal)')
-    parser.add_argument('--use-head-mixer', action='store_true',
-                        help='Use cross-head MLP mixer (for mixer checkpoint)')
-    parser.add_argument('--mixer-hidden', type=int, default=16,
-                        help='Hidden dimension for the cross-head mixer MLP')
-    parser.add_argument('--attn-num-layers', type=int, default=0,
-                        help='Number of attention blocks for cross-head mixing (0 = disabled)')
-    parser.add_argument('--use-multi-layer', action='store_true',
-                        help='Use multi-layer hidden state fusion')
+    parser.add_argument('--use-head-mixer', action='store_true', default=None,
+                        help='Use cross-head MLP mixer (auto-detected from checkpoint if not specified)')
+    parser.add_argument('--mixer-hidden', type=int, default=None,
+                        help='Hidden dimension for the cross-head mixer MLP (auto-detected from checkpoint)')
+    parser.add_argument('--attn-num-layers', type=int, default=None,
+                        help='Number of attention blocks for cross-head mixing (auto-detected from checkpoint)')
+    parser.add_argument('--use-multi-layer', action='store_true', default=None,
+                        help='Use multi-layer hidden state fusion (auto-detected from checkpoint)')
     parser.add_argument('--timing', action='store_true',
                         help='Collect detailed MTP timing (adds CUDA sync overhead)')
     args = parser.parse_args()
 
+    # Load checkpoint config and merge with args (args take precedence if specified)
+    ckpt_config = load_checkpoint_config(args.checkpoint)
+
+    # Helper to get config value with fallback
+    def get_cfg(arg_val, config_key, default):
+        if arg_val is not None:
+            return arg_val
+        return ckpt_config.get(config_key, default)
+
+    # Apply config with fallbacks (checkpoint config -> defaults)
+    model_name = get_cfg(args.model_name, 'base_model', 'google/gemma-3-270m-it')
+    medusa_num_heads = get_cfg(args.medusa_num_heads, 'medusa_num_heads', 4)
+    medusa_num_layers = get_cfg(args.medusa_num_layers, 'medusa_num_layers', 2)
+    lora_rank = get_cfg(args.lora_rank, 'lora_rank', 64)
+    lora_alpha = get_cfg(args.lora_alpha, 'lora_alpha', lora_rank)
+    zero_init_mlp = get_cfg(args.zero_init_mtp_mlp, 'zero_init_mtp_mlp', True)
+    mixer_hidden = get_cfg(args.mixer_hidden, 'mlp_mixer_hidden', 16)
+    attn_num_layers = get_cfg(args.attn_num_layers, 'attn_num_layers', 0)
+    use_multi_layer = get_cfg(args.use_multi_layer, 'use_multi_layer', False)
+
+    # Auto-detect head mixer type from config
+    # Config has 'use_mlp_mixer' for MLP mixer and 'attn_num_layers' for attention mixer
+    if args.use_head_mixer is not None:
+        use_head_mixer = args.use_head_mixer
+    else:
+        use_head_mixer = ckpt_config.get('use_mlp_mixer', False) or attn_num_layers > 0
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
-    print0(f"Loading model: {args.model_name}")
+    print0(f"Loading model: {model_name}")
+    if ckpt_config:
+        print0(f"Auto-loaded config from: {args.checkpoint}/config.json")
     if args.timing:
         print0("Timing enabled: tok/s will include CUDA sync overhead")
-    lora_alpha = args.lora_alpha if args.lora_alpha is not None else args.lora_rank
-    print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, rank={args.lora_rank}, alpha={lora_alpha}")
+    print0(f"Medusa config: {medusa_num_heads} heads, {medusa_num_layers} layers, rank={lora_rank}, alpha={lora_alpha}")
 
-    # Determine if we need head mixer (either MLP or attention)
-    use_head_mixer = args.use_head_mixer or args.attn_num_layers > 0
-    mixer_type = "attention" if args.attn_num_layers > 0 else "mlp"
+    # Determine mixer type
+    mixer_type = "attention" if attn_num_layers > 0 else "mlp"
+    if use_head_mixer:
+        print0(f"Mixer: {mixer_type}, layers={attn_num_layers if mixer_type == 'attention' else 1}")
 
     model = load_gemma_medusa_model(
-        model_name=args.model_name,
-        medusa_num_heads=args.medusa_num_heads,
-        medusa_num_layers=args.medusa_num_layers,
-        lora_rank=args.lora_rank,
+        model_name=model_name,
+        medusa_num_heads=medusa_num_heads,
+        medusa_num_layers=medusa_num_layers,
+        lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         device=device,
         dtype=dtype,
-        zero_init_mlp=args.zero_init_mtp_mlp,
+        zero_init_mlp=zero_init_mlp,
         use_head_mixer=use_head_mixer,
-        mixer_hidden=args.mixer_hidden,
+        mixer_hidden=mixer_hidden,
         mixer_type=mixer_type,
-        attn_num_layers=args.attn_num_layers,
-        use_multi_layer=args.use_multi_layer,
+        attn_num_layers=attn_num_layers,
+        use_multi_layer=use_multi_layer,
     )
 
     # Load checkpoint
@@ -400,8 +449,8 @@ if __name__ == "__main__":
 
     # Set inference num heads for ablation testing
     if args.inference_num_heads is not None:
-        if args.inference_num_heads > args.medusa_num_heads:
-            raise ValueError(f"inference_num_heads ({args.inference_num_heads}) cannot exceed medusa_num_heads ({args.medusa_num_heads})")
+        if args.inference_num_heads > medusa_num_heads:
+            raise ValueError(f"inference_num_heads ({args.inference_num_heads}) cannot exceed medusa_num_heads ({medusa_num_heads})")
         # Simply override medusa_num_heads - tree buffers will be regenerated
         model.medusa_num_heads = args.inference_num_heads
         # Clear tree buffer cache to force regeneration
@@ -409,7 +458,7 @@ if __name__ == "__main__":
         model._tree_buffers_config = None
         print0(f"Using {args.inference_num_heads} heads for inference (ablation mode)")
 
-    tokenizer = GemmaTokenizerWrapper(args.model_name)
+    tokenizer = GemmaTokenizerWrapper(model_name)
 
     # Load task
     task, eval_type = load_task(args.task)
@@ -438,7 +487,7 @@ if __name__ == "__main__":
                f"{results['standard']['tokens_per_second']:.1f} tok/s")
 
     # Run MTP generation
-    effective_heads = args.inference_num_heads if args.inference_num_heads else args.medusa_num_heads
+    effective_heads = args.inference_num_heads if args.inference_num_heads else medusa_num_heads
     print0("\n" + "="*50)
     tree_info = "fixed=79" if args.fixed_tree_size else "topk=10"
     tree_type = "heuristic" if args.use_heuristic_tree else "optimal"
@@ -480,13 +529,13 @@ if __name__ == "__main__":
     output_data = {
         'timestamp': datetime.now().isoformat(),
         'task': args.task,
-        'model_name': args.model_name,
+        'model_name': model_name,
         'checkpoint': args.checkpoint,
         'config': {
-            'medusa_num_heads': args.medusa_num_heads,
+            'medusa_num_heads': medusa_num_heads,
             'inference_num_heads': effective_heads,
-            'medusa_num_layers': args.medusa_num_layers,
-            'lora_rank': args.lora_rank,
+            'medusa_num_layers': medusa_num_layers,
+            'lora_rank': lora_rank,
             'lora_alpha': lora_alpha,
             'max_problems': args.max_problems,
             'max_new_tokens': args.max_new_tokens,

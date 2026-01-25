@@ -38,7 +38,10 @@ def main():
         checkpoint_path = os.path.join(args.checkpoint, "medusa_heads.pt")
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.medusa_heads.load_state_dict(checkpoint['medusa_heads'])
+    # Load all Medusa weights using unified method
+    warnings = model.load_medusa_state_dict(checkpoint, strict=True)
+    for w in warnings:
+        print(f"WARNING: {w}")
     model.eval()
 
     # Get tokenizer
@@ -385,7 +388,10 @@ if __name__ == '__main__':
     )
     checkpoint_path = os_module.path.join(args.checkpoint, "final", "medusa_heads.pt")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.medusa_heads.load_state_dict(checkpoint['medusa_heads'])
+    # Load all Medusa weights using unified method
+    warnings = model.load_medusa_state_dict(checkpoint, strict=True)
+    for w in warnings:
+        print(f"WARNING: {w}")
     model.eval()
 
     from transformers import AutoTokenizer
