@@ -917,6 +917,78 @@ class GemmaMedusaModel(nn.Module):
             count += sum(p.numel() for p in self.multi_layer_fusion.parameters())
         return count
 
+    def get_medusa_state_dict(self) -> dict:
+        """Get state dict for all trainable Medusa components.
+
+        This is the recommended way to save checkpoints - it automatically
+        includes all Medusa-related weights regardless of mixer type.
+        """
+        state = {
+            'medusa_heads': self.medusa_heads.state_dict(),
+        }
+        if self.head_attention is not None:
+            state['head_attention'] = self.head_attention.state_dict()
+        if self.head_mixer_fc1 is not None:
+            state['head_mixer_fc1'] = self.head_mixer_fc1.state_dict()
+        if self.head_mixer_fc2 is not None:
+            state['head_mixer_fc2'] = self.head_mixer_fc2.state_dict()
+        if self.channel_mixer_fc is not None:
+            state['channel_mixer_fc'] = self.channel_mixer_fc.state_dict()
+        if self.multi_layer_fusion is not None:
+            state['multi_layer_fusion'] = self.multi_layer_fusion.state_dict()
+        return state
+
+    def load_medusa_state_dict(self, state: dict, strict: bool = True) -> list[str]:
+        """Load state dict for all trainable Medusa components.
+
+        Args:
+            state: State dict from get_medusa_state_dict()
+            strict: If True, raise error on missing/unexpected keys
+
+        Returns:
+            List of warning messages (empty if all loaded successfully)
+        """
+        warnings = []
+
+        # Always load medusa_heads
+        self.medusa_heads.load_state_dict(state['medusa_heads'])
+
+        # Load optional components, warn if mismatch
+        if 'head_attention' in state:
+            if self.head_attention is not None:
+                self.head_attention.load_state_dict(state['head_attention'])
+            elif strict:
+                warnings.append("Checkpoint has head_attention but model doesn't (pass attn_num_layers > 0)")
+        elif self.head_attention is not None and strict:
+            warnings.append("Model has head_attention but checkpoint doesn't")
+
+        if 'head_mixer_fc1' in state:
+            if self.head_mixer_fc1 is not None:
+                self.head_mixer_fc1.load_state_dict(state['head_mixer_fc1'])
+                self.head_mixer_fc2.load_state_dict(state['head_mixer_fc2'])
+            elif strict:
+                warnings.append("Checkpoint has MLP mixer but model doesn't (pass use_head_mixer=True)")
+        elif self.head_mixer_fc1 is not None and strict:
+            warnings.append("Model has MLP mixer but checkpoint doesn't")
+
+        if 'channel_mixer_fc' in state:
+            if self.channel_mixer_fc is not None:
+                self.channel_mixer_fc.load_state_dict(state['channel_mixer_fc'])
+            elif strict:
+                warnings.append("Checkpoint has channel_mixer_fc but model doesn't")
+        elif self.channel_mixer_fc is not None and strict:
+            warnings.append("Model has channel_mixer_fc but checkpoint doesn't - using zero-init")
+
+        if 'multi_layer_fusion' in state:
+            if self.multi_layer_fusion is not None:
+                self.multi_layer_fusion.load_state_dict(state['multi_layer_fusion'])
+            elif strict:
+                warnings.append("Checkpoint has multi_layer_fusion but model doesn't (pass use_multi_layer=True)")
+        elif self.multi_layer_fusion is not None and strict:
+            warnings.append("Model has multi_layer_fusion but checkpoint doesn't")
+
+        return warnings
+
     def _cache_stacked_weights(self):
         """Pre-stack LoRA weights and scalings for efficient batched forward pass."""
         if len(self.medusa_heads) == 0:
