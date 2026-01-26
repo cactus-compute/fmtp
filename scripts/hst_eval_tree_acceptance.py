@@ -165,6 +165,13 @@ def parse_args():
         action="store_true",
         help="Disable threshold-based pruning (set score_threshold to 0)",
     )
+    parser.add_argument(
+        "--hst-blend-mode",
+        type=str,
+        choices=["convex", "agreement"],
+        default="agreement",
+        help="Blending mode: 'convex' for standard blend, 'agreement' for boost-when-agree",
+    )
 
     # Hardware
     parser.add_argument(
@@ -198,6 +205,7 @@ def create_hst_scorer(
     beta: float = 0.3,
     gamma: float = 0.1,
     no_pruning: bool = False,
+    blend_mode: str = "agreement",
 ):
     """Create HST scorer with retrieval module."""
     from nanochat.gemma_medusa.hst_scorer import HSTScorer
@@ -218,6 +226,7 @@ def create_hst_scorer(
         beta=beta,
         gamma=gamma,
         score_threshold=score_threshold,
+        blend_mode=blend_mode,
     )
 
     return scorer
@@ -579,10 +588,12 @@ def evaluate_tree_acceptance(args) -> TreeAcceptanceMetrics:
             beta=args.hst_beta,
             gamma=args.hst_gamma,
             no_pruning=args.hst_no_pruning,
+            blend_mode=args.hst_blend_mode,
         )
         pruning_status = "disabled" if args.hst_no_pruning else "enabled (threshold=0.01)"
         print(f"  HST weights: α={args.hst_alpha}, β={args.hst_beta}, γ={args.hst_gamma}")
         print(f"  Pruning: {pruning_status}")
+        print(f"  Blend mode: {args.hst_blend_mode}")
 
     # Tracking variables
     current_total_accepted = 0

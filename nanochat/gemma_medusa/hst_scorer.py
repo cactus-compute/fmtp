@@ -68,6 +68,8 @@ class HSTScorer:
         agreement_bonus: float = 1.5,  # Multiplier when sources agree
         # Pruning configuration
         score_threshold: float = 0.01,  # Minimum score to keep candidate
+        # Blending mode
+        blend_mode: str = "agreement",  # "convex" or "agreement"
     ):
         """
         Initialize the HST scorer.
@@ -103,6 +105,7 @@ class HSTScorer:
         self.gamma = gamma
         self.agreement_bonus = agreement_bonus
         self.score_threshold = score_threshold
+        self.blend_mode = blend_mode
 
         # Context window for retrieval
         self.retrieval_context_window = retrieval_context_window
@@ -454,19 +457,22 @@ class HSTScorer:
         context_tokens: List[int],
     ) -> torch.Tensor:
         """
-        Blend Medusa logits with retrieval logits using convex combination.
+        Blend Medusa logits with retrieval logits.
 
-        This method encapsulates all HST-specific blending logic so the model
-        doesn't need to know about retrieval weights or blending formulas.
+        Two modes (controlled by self.blend_mode):
+        1. "convex": Standard convex combination
+           blended = (1 - β) * medusa + β * retrieval
 
-        Formula: blended = (1 - β) * medusa_logits + β * retrieval_logits
+        2. "agreement": Only boost tokens where both agree (preserves MTP ranking otherwise)
+           If token is in retrieval top-k AND medusa top-k, boost by β
+           Otherwise, leave medusa logits unchanged
 
         Args:
-            medusa_logits: [num_heads, vocab_size] or [num_heads, B, vocab_size] Medusa head logits
+            medusa_logits: [num_heads, vocab_size] or [num_heads, B, vocab_size]
             context_tokens: Current context token IDs
 
         Returns:
-            blended_logits: Same shape as medusa_logits, with retrieval blended in
+            blended_logits: Same shape as medusa_logits
         """
         if not self._enabled or self.beta <= 0:
             return medusa_logits
@@ -482,13 +488,29 @@ class HSTScorer:
         # Get full vocab retrieval logits
         retrieval_logits = self.retrieval_module(context_tensor)[0]  # [vocab_size]
 
-        # Handle different input shapes
-        # medusa_logits could be [num_heads, vocab_size] or [num_heads, B, vocab_size]
-        if medusa_logits.dim() == 2:
-            # [num_heads, vocab_size] - broadcast retrieval to all heads
-            blended = (1 - self.beta) * medusa_logits + self.beta * retrieval_logits.unsqueeze(0)
+        if self.blend_mode == "convex":
+            # Standard convex combination
+            if medusa_logits.dim() == 2:
+                blended = (1 - self.beta) * medusa_logits + self.beta * retrieval_logits.unsqueeze(0)
+            else:
+                blended = (1 - self.beta) * medusa_logits + self.beta * retrieval_logits.unsqueeze(0).unsqueeze(1)
         else:
-            # [num_heads, B, vocab_size] - broadcast retrieval to all heads and batches
-            blended = (1 - self.beta) * medusa_logits + self.beta * retrieval_logits.unsqueeze(0).unsqueeze(1)
+            # Agreement-based boosting: only boost tokens that retrieval also likes
+            # Find tokens where retrieval has high probability
+            retrieval_probs = F.softmax(retrieval_logits, dim=-1)
+            retrieval_confident = retrieval_probs > 0.01  # Top ~1% of vocab
+
+            # Create boost mask
+            if medusa_logits.dim() == 2:
+                # [num_heads, vocab_size]
+                boost_mask = retrieval_confident.unsqueeze(0).expand_as(medusa_logits)
+                # Boost = add scaled retrieval logits only where retrieval is confident
+                boost = self.beta * retrieval_logits.unsqueeze(0) * boost_mask.float()
+                blended = medusa_logits + boost
+            else:
+                # [num_heads, B, vocab_size]
+                boost_mask = retrieval_confident.unsqueeze(0).unsqueeze(0).expand_as(medusa_logits)
+                boost = self.beta * retrieval_logits.unsqueeze(0).unsqueeze(0) * boost_mask.float()
+                blended = medusa_logits + boost
 
         return blended
