@@ -322,6 +322,9 @@ class WildChatDataset(IterableDataset):
     Dataset for WildChat fine-tuning.
 
     Loads from JSONL file with format: {"messages": [...]}
+
+    For fine-tuning on model outputs (distillation data), we only train on
+    assistant responses to learn the model's generation patterns.
     """
 
     def __init__(
@@ -330,43 +333,71 @@ class WildChatDataset(IterableDataset):
         tokenizer,
         context_window: int = 4,
         max_samples: int = 100_000,
+        assistant_only: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.data_path = Path(data_path)
         self.tokenizer = tokenizer
         self.context_window = context_window
         self.max_samples = max_samples
+        self.assistant_only = assistant_only
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         samples_seen = 0
+        line_idx = 0
 
         with open(self.data_path) as f:
             for line in f:
+                # Shard across workers
+                if line_idx % self.world_size != self.rank:
+                    line_idx += 1
+                    continue
+                line_idx += 1
+
                 if samples_seen >= self.max_samples:
                     return
 
                 data = json.loads(line)
 
-                # Concatenate messages into text
+                # Extract text based on format
                 if "messages" in data:
-                    text = " ".join(m.get("content", "") for m in data["messages"])
+                    if self.assistant_only:
+                        # Only train on assistant responses (model outputs)
+                        # This teaches retrieval to predict what the model generates
+                        texts = [
+                            m.get("content", "")
+                            for m in data["messages"]
+                            if m.get("role") == "assistant"
+                        ]
+                    else:
+                        # Use all messages
+                        texts = [m.get("content", "") for m in data["messages"]]
                 elif "text" in data:
-                    text = data["text"]
+                    texts = [data["text"]]
                 else:
                     continue
 
-                # Tokenize
-                tokens = self.tokenizer.encode(text, add_special_tokens=False)
+                # Process each text segment
+                for text in texts:
+                    if not text:
+                        continue
 
-                # Create training pairs
-                for i in range(self.context_window, len(tokens)):
-                    if samples_seen >= self.max_samples:
-                        return
+                    # Tokenize
+                    tokens = self.tokenizer.encode(text, add_special_tokens=False)
 
-                    context = tokens[i - self.context_window : i]
-                    target = tokens[i]
+                    # Create training pairs by sliding window
+                    for i in range(self.context_window, len(tokens)):
+                        if samples_seen >= self.max_samples:
+                            return
 
-                    yield torch.tensor(context), torch.tensor(target)
-                    samples_seen += 1
+                        context = tokens[i - self.context_window : i]
+                        target = tokens[i]
+
+                        yield torch.tensor(context), torch.tensor(target)
+                        samples_seen += 1
 
 
 def create_retrieval_module(args, vocab_size: int):
@@ -575,6 +606,9 @@ def main():
             tokenizer=tokenizer,
             context_window=args.context_window,
             max_samples=args.samples // world_size,
+            assistant_only=True,  # Only train on model outputs for distillation
+            rank=rank,
+            world_size=world_size,
         )
 
     # Note: Using num_workers=0 for IterableDataset to avoid duplicate data issues
@@ -610,6 +644,9 @@ def main():
                 tokenizer=tokenizer,
                 context_window=args.context_window,
                 max_samples=min(args.samples, 10000),
+                assistant_only=True,
+                rank=0,
+                world_size=1,
             )
 
         eval_dataloader = DataLoader(
