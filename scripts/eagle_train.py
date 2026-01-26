@@ -314,6 +314,8 @@ def parse_args():
                         help="Use torch.compile")
     parser.add_argument("--bf16", action="store_true", default=True,
                         help="Use bfloat16 training")
+    parser.add_argument("--no-chunked-loss", action="store_true",
+                        help="Disable chunked loss computation")
 
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1,
@@ -519,7 +521,8 @@ if __name__ == "__main__":
 
             with autocast_ctx:
                 losses, accuracies = model(
-                    input_ids, attention_mask, loss_mask, args.num_steps
+                    input_ids, attention_mask, loss_mask, args.num_steps,
+                    use_chunked_loss=not args.no_chunked_loss,
                 )
                 loss = sum(w * l for w, l in zip(loss_weights, losses))
                 total_loss += loss.detach()
