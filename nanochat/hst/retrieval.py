@@ -257,6 +257,207 @@ class RetrievalMLP(nn.Module):
         return logits
 
 
+class RetrievalRNN(nn.Module):
+    """
+    RNN-based retrieval module with tied SVD embeddings.
+
+    Uses a GRU to encode the token sequence, capturing sequential dependencies
+    that the MLP (which just flattens) cannot model. The SVD embedding trick
+    keeps the output projection efficient.
+
+    Architecture:
+        Input: Last K token IDs [B, K]
+          ↓
+        SVD Embedding Lookup: svd_embedding[token_ids]  # TRAINABLE, tied with output
+          → [B, K, svd_rank]
+          ↓
+        GRU: processes sequence, outputs final hidden state
+          → [B, hidden_dim]
+          ↓
+        Output projection: Linear → [B, svd_rank]
+          ↓
+        Output: h @ svd_embedding.T → [B, vocab_size]  # TIED with input embedding
+
+    Why GRU over LSTM:
+    - Faster (fewer gates: 3 vs 4)
+    - Often similar or better performance for short sequences
+    - K=8 context is quite short, don't need LSTM's longer-term memory
+
+    Parameter count (Gemma 262k vocab, svd_rank=64, hidden_dim=128):
+        - SVD embedding: 262k × 64 = 16.8M params (shared with MLP)
+        - GRU: 3 * (svd_rank + hidden_dim) * hidden_dim = ~73k params (1-layer)
+        - Output: hidden_dim × svd_rank = 8k params
+        - Total: ~16.9M params
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_dim: int = 128,
+        context_window: int = 8,
+        svd_rank: int = 64,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ):
+        """
+        Args:
+            vocab_size: Vocabulary size (must match SVD)
+            hidden_dim: GRU hidden dimension
+            context_window: Number of recent tokens to use (K)
+            svd_rank: Rank for SVD compression (64 recommended)
+            num_layers: Number of GRU layers (1 is usually enough for K=8)
+            dropout: Dropout between GRU layers (only if num_layers > 1)
+        """
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.hidden_dim = hidden_dim
+        self.context_window = context_window
+        self.svd_rank = svd_rank
+        self.num_layers = num_layers
+
+        # Tied SVD embedding - TRAINABLE, used for both input lookup and output projection
+        self.svd_embedding = nn.Parameter(torch.zeros(vocab_size, svd_rank))
+        self._svd_initialized = False
+
+        # GRU encoder - processes token sequence
+        self.gru = nn.GRU(
+            input_size=svd_rank,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # Output projection: hidden_dim -> svd_rank (for tied output)
+        self.output_proj = nn.Linear(hidden_dim, svd_rank, bias=False)
+
+    def load_svd(self, compressed_vocab: torch.Tensor) -> None:
+        """Initialize SVD embedding from precomputed SVD-compressed vocabulary."""
+        if compressed_vocab.shape[0] != self.vocab_size:
+            raise ValueError(
+                f"Vocab size mismatch: expected {self.vocab_size}, "
+                f"got {compressed_vocab.shape[0]}"
+            )
+        if compressed_vocab.shape[1] != self.svd_rank:
+            raise ValueError(
+                f"SVD rank mismatch: expected {self.svd_rank}, "
+                f"got {compressed_vocab.shape[1]}"
+            )
+        self.svd_embedding.data.copy_(compressed_vocab)
+        self._svd_initialized = True
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        return_hidden: bool = False,
+    ) -> torch.Tensor:
+        """
+        Predict next token logits from last K token IDs.
+
+        Args:
+            token_ids: [B, K] or [B,] last K token IDs
+            return_hidden: If True, also return hidden state
+
+        Returns:
+            logits: [B, vocab_size] next token logits
+            hidden: [B, hidden_dim] if return_hidden=True
+        """
+        if not self._svd_initialized:
+            raise RuntimeError(
+                "SVD embedding not initialized. "
+                "Call load_svd() with precomputed vocabulary before forward."
+            )
+
+        # Handle input dimensions
+        if token_ids.dim() == 1:
+            token_ids = token_ids.unsqueeze(0)  # [K] -> [1, K]
+
+        B, K = token_ids.shape
+
+        # Pad or truncate to context_window
+        if K < self.context_window:
+            padding = torch.zeros(
+                B, self.context_window - K,
+                device=token_ids.device,
+                dtype=token_ids.dtype
+            )
+            token_ids = torch.cat([padding, token_ids], dim=1)
+        elif K > self.context_window:
+            token_ids = token_ids[:, -self.context_window:]
+
+        # Lookup in SVD embedding: [B, K, svd_rank]
+        svd_embeds = self.svd_embedding[token_ids]
+
+        # GRU forward: get final hidden state
+        # output: [B, K, hidden_dim], h_n: [num_layers, B, hidden_dim]
+        _, h_n = self.gru(svd_embeds)
+
+        # Use final layer's hidden state: [B, hidden_dim]
+        h = h_n[-1]
+
+        # Project to SVD rank: [B, svd_rank]
+        h_proj = self.output_proj(h)
+
+        # Compute logits via TIED SVD embedding
+        logits = h_proj @ self.svd_embedding.T
+
+        if return_hidden:
+            return logits, h
+        return logits
+
+    def forward_topk(
+        self,
+        token_ids: torch.Tensor,
+        candidate_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Fast inference: compute logits only for specific candidate tokens.
+
+        Args:
+            token_ids: [B, K] context token IDs
+            candidate_ids: [num_candidates] or [B, num_candidates] candidate token IDs
+
+        Returns:
+            logits: [B, num_candidates] logits for candidate tokens only
+        """
+        if not self._svd_initialized:
+            raise RuntimeError("SVD embedding not initialized.")
+
+        # Handle input dimensions
+        if token_ids.dim() == 1:
+            token_ids = token_ids.unsqueeze(0)
+
+        B, K = token_ids.shape
+
+        # Pad or truncate
+        if K < self.context_window:
+            padding = torch.zeros(
+                B, self.context_window - K,
+                device=token_ids.device,
+                dtype=token_ids.dtype
+            )
+            token_ids = torch.cat([padding, token_ids], dim=1)
+        elif K > self.context_window:
+            token_ids = token_ids[:, -self.context_window:]
+
+        # Lookup and GRU forward
+        svd_embeds = self.svd_embedding[token_ids]
+        _, h_n = self.gru(svd_embeds)
+        h = h_n[-1]
+        h_proj = self.output_proj(h)
+
+        # Project only to candidate embeddings
+        if candidate_ids.dim() == 1:
+            candidate_embeds = self.svd_embedding[candidate_ids]
+            logits = h_proj @ candidate_embeds.T
+        else:
+            candidate_embeds = self.svd_embedding[candidate_ids]
+            logits = torch.einsum('br,bnr->bn', h_proj, candidate_embeds)
+
+        return logits
+
+
 class RetrievalModuleTiny(nn.Module):
     """
     Ultra-light retrieval module for minimal overhead.

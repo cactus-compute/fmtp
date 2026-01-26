@@ -182,6 +182,19 @@ def parse_args():
         action="store_true",
         help="Use rolling/shifted context per head when blending logits (before candidate generation)",
     )
+    parser.add_argument(
+        "--hst-model-type",
+        type=str,
+        choices=["mlp", "rnn"],
+        default="mlp",
+        help="Retrieval model architecture: 'mlp' (default) or 'rnn' (GRU-based)",
+    )
+    parser.add_argument(
+        "--hst-rnn-layers",
+        type=int,
+        default=1,
+        help="Number of GRU layers (only for --hst-model-type rnn)",
+    )
 
     # Hardware
     parser.add_argument(
@@ -218,6 +231,8 @@ def create_hst_scorer(
     blend_mode: str = "agreement",
     use_rolling_context: bool = True,
     use_rolling_blend: bool = False,
+    model_type: str = "mlp",
+    rnn_layers: int = 1,
 ):
     """Create HST scorer with retrieval module."""
     from nanochat.gemma_medusa.hst_scorer import HSTScorer
@@ -241,6 +256,8 @@ def create_hst_scorer(
         blend_mode=blend_mode,
         use_rolling_context=use_rolling_context,
         use_rolling_blend=use_rolling_blend,
+        retrieval_model_type=model_type,
+        rnn_layers=rnn_layers,
     )
 
     return scorer
@@ -605,6 +622,8 @@ def evaluate_tree_acceptance(args) -> TreeAcceptanceMetrics:
             blend_mode=args.hst_blend_mode,
             use_rolling_context=args.hst_rolling_context,
             use_rolling_blend=args.hst_rolling_blend,
+            model_type=args.hst_model_type,
+            rnn_layers=args.hst_rnn_layers,
         )
         pruning_status = "disabled" if args.hst_no_pruning else "enabled (threshold=0.01)"
         print(f"  HST weights: α={args.hst_alpha}, β={args.hst_beta}, γ={args.hst_gamma}")
@@ -612,6 +631,7 @@ def evaluate_tree_acceptance(args) -> TreeAcceptanceMetrics:
         print(f"  Blend mode: {args.hst_blend_mode}")
         print(f"  Rolling context: {'enabled' if args.hst_rolling_context else 'disabled'}")
         print(f"  Rolling blend: {'enabled' if args.hst_rolling_blend else 'disabled'}")
+        print(f"  Model type: {args.hst_model_type}" + (f" (layers={args.hst_rnn_layers})" if args.hst_model_type == "rnn" else ""))
 
     # Tracking variables
     current_total_accepted = 0

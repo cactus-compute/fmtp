@@ -122,6 +122,19 @@ def parse_args():
         default=64,
         help="SVD rank for tied embeddings (input and output)",
     )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["mlp", "rnn"],
+        default="mlp",
+        help="Retrieval model architecture: 'mlp' (default) or 'rnn' (GRU-based)",
+    )
+    parser.add_argument(
+        "--rnn-layers",
+        type=int,
+        default=1,
+        help="Number of GRU layers (only for --model-type rnn)",
+    )
 
     # Training
     parser.add_argument(
@@ -402,14 +415,25 @@ class WildChatDataset(IterableDataset):
 
 def create_retrieval_module(args, vocab_size: int):
     """Create and initialize the retrieval module."""
-    from nanochat.hst.retrieval import RetrievalMLP, load_svd_basis
+    from nanochat.hst.retrieval import RetrievalMLP, RetrievalRNN, load_svd_basis
 
-    module = RetrievalMLP(
-        vocab_size=vocab_size,
-        hidden_dim=args.hidden_dim,
-        context_window=args.context_window,
-        svd_rank=args.svd_rank,
-    )
+    if args.model_type == "rnn":
+        module = RetrievalRNN(
+            vocab_size=vocab_size,
+            hidden_dim=args.hidden_dim,
+            context_window=args.context_window,
+            svd_rank=args.svd_rank,
+            num_layers=args.rnn_layers,
+        )
+        print(f"Created RetrievalRNN (hidden={args.hidden_dim}, layers={args.rnn_layers})")
+    else:
+        module = RetrievalMLP(
+            vocab_size=vocab_size,
+            hidden_dim=args.hidden_dim,
+            context_window=args.context_window,
+            svd_rank=args.svd_rank,
+        )
+        print(f"Created RetrievalMLP (hidden={args.hidden_dim})")
 
     # Load SVD to initialize the tied embedding (will be fine-tuned during training)
     try:
