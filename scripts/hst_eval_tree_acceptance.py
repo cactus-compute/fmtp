@@ -160,6 +160,11 @@ def parse_args():
         default=0.1,
         help="HST weight for suffix match predictions",
     )
+    parser.add_argument(
+        "--hst-no-pruning",
+        action="store_true",
+        help="Disable threshold-based pruning (set score_threshold to 0)",
+    )
 
     # Hardware
     parser.add_argument(
@@ -192,12 +197,16 @@ def create_hst_scorer(
     alpha: float = 0.6,
     beta: float = 0.3,
     gamma: float = 0.1,
+    no_pruning: bool = False,
 ):
     """Create HST scorer with retrieval module."""
     from nanochat.gemma_medusa.hst_scorer import HSTScorer
 
     device_obj = torch.device(device)
     dtype = torch.bfloat16 if device_obj.type == "cuda" else torch.float32
+
+    # Set score_threshold to 0 to disable pruning if requested
+    score_threshold = 0.0 if no_pruning else 0.01
 
     scorer = HSTScorer(
         vocab_size=vocab_size,
@@ -208,6 +217,7 @@ def create_hst_scorer(
         alpha=alpha,
         beta=beta,
         gamma=gamma,
+        score_threshold=score_threshold,
     )
 
     return scorer
@@ -568,8 +578,11 @@ def evaluate_tree_acceptance(args) -> TreeAcceptanceMetrics:
             alpha=args.hst_alpha,
             beta=args.hst_beta,
             gamma=args.hst_gamma,
+            no_pruning=args.hst_no_pruning,
         )
+        pruning_status = "disabled" if args.hst_no_pruning else "enabled (threshold=0.01)"
         print(f"  HST weights: α={args.hst_alpha}, β={args.hst_beta}, γ={args.hst_gamma}")
+        print(f"  Pruning: {pruning_status}")
 
     # Tracking variables
     current_total_accepted = 0
