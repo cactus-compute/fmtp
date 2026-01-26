@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
-from nanochat.hst.retrieval import RetrievalMLP, load_svd_basis
+from nanochat.hst.retrieval import RetrievalMLP, RetrievalRNN, load_svd_basis
 from nanochat.hst.suffix_match import SuffixMatcher
 
 
@@ -74,6 +74,9 @@ class HSTScorer:
         use_rolling_context: bool = True,  # Use speculative path in retrieval context
         # Rolling blend mode (for blending logits before candidate generation)
         use_rolling_blend: bool = False,  # Use shifted context per head in blend
+        # Model architecture
+        retrieval_model_type: str = "mlp",  # "mlp" or "rnn"
+        rnn_layers: int = 1,  # Number of GRU layers if using RNN
     ):
         """
         Initialize the HST scorer.
@@ -116,13 +119,22 @@ class HSTScorer:
         # Context window for retrieval
         self.retrieval_context_window = retrieval_context_window
 
-        # Initialize retrieval module
-        self.retrieval_module = RetrievalMLP(
-            vocab_size=vocab_size,
-            hidden_dim=retrieval_hidden_dim,
-            context_window=retrieval_context_window,
-            svd_rank=svd_rank,
-        )
+        # Initialize retrieval module (MLP or RNN)
+        if retrieval_model_type == "rnn":
+            self.retrieval_module = RetrievalRNN(
+                vocab_size=vocab_size,
+                hidden_dim=retrieval_hidden_dim,
+                context_window=retrieval_context_window,
+                svd_rank=svd_rank,
+                num_layers=rnn_layers,
+            )
+        else:
+            self.retrieval_module = RetrievalMLP(
+                vocab_size=vocab_size,
+                hidden_dim=retrieval_hidden_dim,
+                context_window=retrieval_context_window,
+                svd_rank=svd_rank,
+            )
 
         # Load SVD basis
         try:
