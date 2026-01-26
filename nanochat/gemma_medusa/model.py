@@ -1995,8 +1995,18 @@ class GemmaMedusaModel(nn.Module):
                     tree_candidates,  # [tree_len]
                     current_tokens,  # List[int]
                 )
-                # Store scores for potential use in evaluation (scorer can influence selection)
+                # Store scores for use in candidate evaluation
                 buffers["_custom_scores"] = custom_scores
+
+                # Use scores to re-rank candidates - sort by score and take top candidates
+                # This influences which path we explore first in verification
+                threshold = getattr(scorer, 'score_threshold', None)
+                if threshold is not None:
+                    # Mask out low-scoring tree positions (set to padding token 0)
+                    # This effectively prunes the tree without changing its structure
+                    low_score_mask = custom_scores < threshold
+                    tree_candidates = tree_candidates.clone()
+                    tree_candidates[low_score_mask] = 0  # Padding token
 
             # Verify candidates with tree attention forward pass
             # Returns tree_logits directly to avoid expensive extraction
@@ -2186,6 +2196,13 @@ class GemmaMedusaModel(nn.Module):
                     current_tokens,  # List[int]
                 )
                 buffers["_custom_scores"] = custom_scores
+
+                # Use scores to prune low-confidence candidates
+                threshold = getattr(scorer, 'score_threshold', None)
+                if threshold is not None:
+                    low_score_mask = custom_scores < threshold
+                    tree_candidates = tree_candidates.clone()
+                    tree_candidates[low_score_mask] = 0  # Padding token
 
             if collect_timing:
                 if is_cuda:
