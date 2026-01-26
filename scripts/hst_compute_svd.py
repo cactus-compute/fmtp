@@ -81,7 +81,7 @@ def main():
     # Load model to extract embedding weights
     model = AutoModel.from_pretrained(
         args.model,
-        torch_dtype=torch.float32,  # Always load as float32 for extraction
+        dtype=torch.float32,  # Always load as float32 for extraction
         device_map="cpu",  # Keep on CPU for embedding extraction
     )
 

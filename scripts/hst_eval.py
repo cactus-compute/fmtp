@@ -181,7 +181,7 @@ def evaluate_retrieval(args) -> RetrievalMetrics:
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     base_model = AutoModel.from_pretrained(
         args.base_model,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         device_map="cpu",
     )
 
@@ -315,7 +315,7 @@ def evaluate_benchmark(args) -> list[HSTBenchmarkMetrics]:
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     model = AutoModel.from_pretrained(
         args.base_model,
-        torch_dtype=torch.bfloat16 if args.device == "cuda" else torch.float32,
+        dtype=torch.bfloat16 if args.device == "cuda" else torch.float32,
         device_map=args.device,
     )
     model.eval()

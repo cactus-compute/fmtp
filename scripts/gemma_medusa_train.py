@@ -30,163 +30,39 @@ import json
 import os
 import time
 from contextlib import nullcontext
-from datetime import datetime
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import wandb
 
 from nanochat.common import (
     compute_init,
     compute_cleanup,
-    get_dist_info,
     print0,
     DummyWandb,
     autodetect_device_type,
-    get_base_dir,
 )
 from nanochat.gemma_medusa import (
     GemmaTokenizerWrapper,
     load_gemma_medusa_model,
     GemmaMedusaModel,
 )
-
-
-# -----------------------------------------------------------------------------
-# Data loading
-
-def load_sharegpt_data(filepath):
-    """Load ShareGPT-format JSON data.
-
-    Supports both JSONL and JSON array formats.
-    Expected format:
-    {
-        "conversations": [
-            {"role": "user", "content": "..."},
-            {"role": "assistant", "content": "..."}
-        ]
-    }
-    or:
-    {
-        "messages": [...]
-    }
-    """
-    conversations = []
-    with open(filepath, 'r') as f:
-        content = f.read().strip()
-        if content.startswith('['):
-            # JSON array format
-            data = json.loads(content)
-            for item in data:
-                if 'conversations' in item:
-                    # ShareGPT format with "from"/"value" keys
-                    messages = []
-                    for turn in item['conversations']:
-                        role = turn.get('from', turn.get('role'))
-                        content = turn.get('value', turn.get('content'))
-                        if role == 'human':
-                            role = 'user'
-                        elif role == 'gpt':
-                            role = 'assistant'
-                        messages.append({'role': role, 'content': content})
-                    conversations.append({'messages': messages})
-                elif 'messages' in item:
-                    conversations.append(item)
-        else:
-            # JSONL format
-            for line in content.split('\n'):
-                if line.strip():
-                    item = json.loads(line)
-                    if 'conversations' in item:
-                        messages = []
-                        for turn in item['conversations']:
-                            role = turn.get('from', turn.get('role'))
-                            content = turn.get('value', turn.get('content'))
-                            if role == 'human':
-                                role = 'user'
-                            elif role == 'gpt':
-                                role = 'assistant'
-                            messages.append({'role': role, 'content': content})
-                        conversations.append({'messages': messages})
-                    elif 'messages' in item:
-                        conversations.append(item)
-    return conversations
-
-
-def filter_dataset(dataset, tokenizer, max_seq_len, min_valid_tokens=10):
-    """
-    Filter dataset to remove conversations without enough valid (assistant) tokens.
-
-    Args:
-        dataset: List of conversations
-        tokenizer: Tokenizer wrapper
-        max_seq_len: Maximum sequence length
-        min_valid_tokens: Minimum number of valid (non-masked) tokens required
-
-    Returns:
-        Filtered dataset
-    """
-    filtered = []
-    skipped = 0
-    for doc in dataset:
-        ids, mask = tokenizer.render_conversation(doc, max_tokens=max_seq_len)
-        # Count valid tokens (mask=1 means assistant content we train on)
-        # We check mask[1:] because targets are shifted by 1
-        valid_count = sum(mask[1:])
-        if valid_count >= min_valid_tokens:
-            filtered.append(doc)
-        else:
-            skipped += 1
-    return filtered, skipped
-
-
-def medusa_data_generator(dataset, tokenizer, batch_size, max_seq_len, device, ddp_rank=0, ddp_world_size=1):
-    """
-    Generate batches of tokenized conversations for Medusa training.
-
-    Yields (inputs, targets) where targets is shifted by 1 from inputs.
-    The loss mask is applied via -1 in targets.
-    """
-    pad_token_id = tokenizer.hf_tokenizer.eos_token_id
-
-    def collate_and_yield(batch):
-        nrows = len(batch)
-        # Truncate to max_seq_len and find max length
-        batch = [(ids[:max_seq_len], mask[:max_seq_len]) for ids, mask in batch]
-        ncols = max(len(ids) for ids, mask in batch) - 1  # seq of n creates inputs/targets of n-1
-
-        inputs = torch.full((nrows, ncols), pad_token_id, dtype=torch.long)
-        targets = torch.full((nrows, ncols), -1, dtype=torch.long)  # -1 is ignore index
-
-        for i, (ids, mask) in enumerate(batch):
-            n = len(ids)
-            ids_tensor = torch.tensor(ids, dtype=torch.long)
-            inputs[i, :n-1] = ids_tensor[:-1]
-            # Apply mask: -1 where mask is 0
-            row_targets = ids_tensor[1:]
-            mask_tensor = torch.tensor(mask[1:], dtype=torch.long)
-            row_targets[mask_tensor == 0] = -1
-            targets[i, :n-1] = row_targets
-
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        return inputs, targets
-
-    # Iterate over dataset in epochs
-    epoch = 0
-    while True:
-        batch = []
-        for i in range(ddp_rank, len(dataset), ddp_world_size):
-            doc = dataset[i]
-            ids, mask = tokenizer.render_conversation(doc, max_tokens=max_seq_len)
-            batch.append((ids, mask))
-            if len(batch) == batch_size:
-                yield collate_and_yield(batch), epoch
-                batch = []
-        epoch += 1
+from nanochat.gemma_common import (
+    load_sharegpt_data,
+    filter_dataset,
+    split_train_val,
+    data_generator,
+    get_lr_scheduler,
+    apply_lr_schedule,
+    save_checkpoint,
+    setup_output_dir,
+    compute_grad_norms,
+    compute_weight_norms,
+    EMALoss,
+    estimate_eta,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -635,7 +511,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------------
     # Setup data loaders
 
-    train_loader = medusa_data_generator(
+    train_loader = data_generator(
         train_data, tokenizer, args.device_batch_size, args.max_seq_len, device,
         ddp_rank=ddp_rank, ddp_world_size=ddp_world_size
     )
@@ -643,7 +519,7 @@ if __name__ == "__main__":
     def build_val_loader():
         if val_data is None:
             return None
-        return medusa_data_generator(
+        return data_generator(
             val_data, tokenizer, args.device_batch_size, args.max_seq_len, device,
             ddp_rank=ddp_rank, ddp_world_size=ddp_world_size
         )
