@@ -647,7 +647,6 @@ class GemmaEagleModel(nn.Module):
         multi_layer_hidden = torch.cat(selected_hidden, dim=-1)
         return self.fusion(multi_layer_hidden)
 
-    @torch.no_grad()
     def get_base_hidden_states(
         self,
         input_ids: torch.Tensor,
@@ -660,16 +659,22 @@ class GemmaEagleModel(nn.Module):
             fused_hidden: (B, T, hidden_size) - fused multi-layer hidden states
             target_logits: (B, T, vocab_size) - base model logits for training
         """
-        outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        # Base model forward is no_grad (frozen), but fusion needs gradients
+        with torch.no_grad():
+            outputs = self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            # Detach hidden states so fusion layer can compute gradients
+            all_hidden = tuple(h.detach() for h in outputs.hidden_states)
+            target_logits = outputs.logits.detach()
 
-        fused_hidden = self._fuse_selected_hidden(outputs.hidden_states)
+        # Fusion layer IS trainable - do NOT wrap in no_grad
+        fused_hidden = self._fuse_selected_hidden(all_hidden)
 
-        return fused_hidden, outputs.logits
+        return fused_hidden, target_logits
 
     @torch.no_grad()
     def get_base_hidden_states_with_cache(
