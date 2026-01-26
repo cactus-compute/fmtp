@@ -26,6 +26,10 @@ from transformers import AutoModelForCausalLM, AutoConfig
 
 from .config import GemmaConfigWrapper, GemmaMedusaConfig
 from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaHeadAttention, MedusaResBlock
+from nanochat.gemma_common.speculative import (
+    build_tree_attention_mask,
+    update_kv_cache_from_tree,
+)
 
 
 # Cache for loaded optimal tree choices (keyed by checkpoint path or num_heads)
@@ -1692,23 +1696,14 @@ class GemmaMedusaModel(nn.Module):
         position_ids = base_seq_len + tree_position_ids.unsqueeze(0)  # (1, tree_len)
 
         # Build attention mask efficiently (HF format: 0 = attend, -inf = don't)
-        # All tree tokens attend to all cached tokens (zeros), plus tree attention pattern
-        # Use pre-computed HF-format tree mask from buffers
         hf_tree_mask = buffers.get("hf_tree_attn_mask")
-        if hf_tree_mask is None:
-            # Convert tree mask to HF format once and cache it
-            hf_tree_mask = torch.where(
-                tree_attn_mask > 0.5,
-                torch.zeros_like(tree_attn_mask),
-                torch.full_like(tree_attn_mask, float('-inf'))
-            )
-            buffers["hf_tree_attn_mask"] = hf_tree_mask
-
-        # Create full mask: [zeros for cache attention, tree pattern]
-        # Shape: (1, 1, tree_len, base_seq_len + tree_len)
-        hf_attn_mask = torch.zeros(1, 1, tree_len, base_seq_len + tree_len,
-                                   device=self._device, dtype=tree_attn_mask.dtype)
-        hf_attn_mask[:, :, :, base_seq_len:] = hf_tree_mask
+        hf_attn_mask, hf_tree_mask = build_tree_attention_mask(
+            tree_attn_mask,
+            base_seq_len,
+            hf_tree_mask=hf_tree_mask,
+            dtype=self._dtype,
+        )
+        buffers["hf_tree_attn_mask"] = hf_tree_mask
 
         # Forward pass with cache and tree attention mask
         hidden_states, new_past_key_values = self._get_hidden_states_with_cache(
@@ -2297,65 +2292,17 @@ class GemmaMedusaModel(nn.Module):
             # We need: [original_cache | accepted_tree_positions]
             # This avoids a redundant forward pass!
             tree_len = tree_candidates.shape[0]
-            need_fallback = False  # Track if any layer needs fallback
 
             if collect_timing and is_cuda:
                 torch.cuda.synchronize()
             if collect_timing:
                 t0 = time.perf_counter()
-            for layer in past_key_values.layers:
-                if hasattr(layer, 'keys') and layer.keys is not None:
-                    if hasattr(layer, 'sliding_window') and layer.sliding_window is not None:
-                        # Sliding window layer
-                        sw = layer.sliding_window
-                        cache_len_before_tree = min(current_seq_len, sw)
-
-                        # For sliding window, we need to be careful about wrapping
-                        # The KV tensor has shape (B, heads, min(total_len, sw), head_dim)
-                        total_len_with_tree = current_seq_len + tree_len
-
-                        # Check actual cache size to determine if tree tokens fit
-                        cache_size = layer.keys.shape[2]
-                        expected_tree_end = cache_len_before_tree + tree_len
-
-                        if expected_tree_end <= cache_size:
-                            # No wrapping - use in-place optimization
-                            if num_accepted > 0:
-                                # Copy accepted positions to their final locations
-                                for i, tree_pos in enumerate(accepted_tree_positions):
-                                    src_idx = cache_len_before_tree + tree_pos
-                                    dst_idx = cache_len_before_tree + i
-                                    if src_idx != dst_idx and src_idx < cache_size:
-                                        layer.keys[:, :, dst_idx, :] = layer.keys[:, :, src_idx, :]
-                                        layer.values[:, :, dst_idx, :] = layer.values[:, :, src_idx, :]
-                            # Trim to final size
-                            final_len = cache_len_before_tree + num_accepted
-                            layer.keys = layer.keys[:, :, :final_len, :]
-                            layer.values = layer.values[:, :, :final_len, :]
-                        else:
-                            # Wrapping case - need fallback for this layer
-                            # Truncate back to original and mark for fallback
-                            layer.keys = layer.keys[:, :, :cache_len_before_tree, :]
-                            layer.values = layer.values[:, :, :cache_len_before_tree, :]
-                            need_fallback = True
-
-                        layer.cumulative_length = current_seq_len + num_accepted
-                    else:
-                        # Regular (non-sliding window) layer - simple extraction
-                        # Tree tokens are at positions current_seq_len to current_seq_len + tree_len - 1
-                        # Optimization: copy accepted KV entries in-place, then slice to final size
-                        if num_accepted > 0:
-                            # Copy accepted positions to their final locations
-                            for i, tree_pos in enumerate(accepted_tree_positions):
-                                src_idx = current_seq_len + tree_pos
-                                dst_idx = current_seq_len + i
-                                if src_idx != dst_idx:  # Only copy if needed
-                                    layer.keys[:, :, dst_idx, :] = layer.keys[:, :, src_idx, :]
-                                    layer.values[:, :, dst_idx, :] = layer.values[:, :, src_idx, :]
-                        # Trim to final size (this is a view, no allocation)
-                        final_len = current_seq_len + num_accepted
-                        layer.keys = layer.keys[:, :, :final_len, :]
-                        layer.values = layer.values[:, :, :final_len, :]
+            past_key_values, _ = update_kv_cache_from_tree(
+                past_key_values,
+                accepted_tree_positions,
+                current_seq_len,
+                tree_len,
+            )
             if collect_timing:
                 if is_cuda:
                     torch.cuda.synchronize()

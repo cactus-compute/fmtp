@@ -29,6 +29,11 @@ from .training import (
     estimate_eta,
 )
 
+from .speculative import (
+    build_tree_attention_mask,
+    update_kv_cache_from_tree,
+)
+
 __all__ = [
     # Data
     "load_sharegpt_data",
@@ -48,4 +53,7 @@ __all__ = [
     "EMALoss",
     "format_time",
     "estimate_eta",
+    # Speculative decoding helpers
+    "build_tree_attention_mask",
+    "update_kv_cache_from_tree",
 ]
