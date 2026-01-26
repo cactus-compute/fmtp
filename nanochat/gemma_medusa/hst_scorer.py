@@ -72,6 +72,8 @@ class HSTScorer:
         blend_mode: str = "agreement",  # "convex" or "agreement"
         # Rolling context mode
         use_rolling_context: bool = True,  # Use speculative path in retrieval context
+        # Rolling blend mode (for blending logits before candidate generation)
+        use_rolling_blend: bool = False,  # Use shifted context per head in blend
     ):
         """
         Initialize the HST scorer.
@@ -109,6 +111,7 @@ class HSTScorer:
         self.score_threshold = score_threshold
         self.blend_mode = blend_mode
         self.use_rolling_context = use_rolling_context
+        self.use_rolling_blend = use_rolling_blend
 
         # Context window for retrieval
         self.retrieval_context_window = retrieval_context_window
@@ -526,6 +529,10 @@ class HSTScorer:
         if not self._enabled or self.beta <= 0:
             return medusa_logits
 
+        # Use rolling blend if enabled (different context per head)
+        if self.use_rolling_blend:
+            return self.blend_medusa_logits_rolling(medusa_logits, context_tokens)
+
         # Use last K tokens for retrieval
         K = self.retrieval_context_window
         retrieval_context = context_tokens[-K:] if len(context_tokens) >= K else context_tokens
@@ -561,5 +568,67 @@ class HSTScorer:
                 boost_mask = retrieval_confident.unsqueeze(0).unsqueeze(0).expand_as(medusa_logits)
                 boost = self.beta * retrieval_logits.unsqueeze(0).unsqueeze(0) * boost_mask.float()
                 blended = medusa_logits + boost
+
+        return blended
+
+    @torch.inference_mode()
+    def blend_medusa_logits_rolling(
+        self,
+        medusa_logits: torch.Tensor,
+        context_tokens: List[int],
+    ) -> torch.Tensor:
+        """
+        Blend Medusa logits with retrieval using rolling/shifted context per head.
+
+        For head d (predicting position t+d+1), we shift the context by d positions
+        to simulate having d speculative tokens. This is an approximation since we
+        don't know the actual speculative tokens yet.
+
+        The idea: head 0 uses context[-K:], head 1 uses context[-(K-1):], etc.
+        This gives each head a "fresher" context window.
+
+        Args:
+            medusa_logits: [num_heads, vocab_size] Medusa head logits
+            context_tokens: Current context token IDs
+
+        Returns:
+            blended_logits: Same shape as medusa_logits
+        """
+        if not self._enabled or self.beta <= 0:
+            return medusa_logits
+
+        num_heads = medusa_logits.shape[0]
+        K = self.retrieval_context_window
+        blended = medusa_logits.clone()
+
+        for head_idx in range(num_heads):
+            # For head d, use context shifted by d positions
+            # This simulates having d speculative tokens we don't know yet
+            # by using a shorter committed context window
+            shift = head_idx
+            effective_k = K - shift
+
+            if effective_k <= 0:
+                # Not enough context, skip blending for this head
+                continue
+
+            # Use last effective_k tokens
+            retrieval_context = context_tokens[-effective_k:] if len(context_tokens) >= effective_k else context_tokens
+
+            context_tensor = torch.tensor(
+                [retrieval_context], device=self.device, dtype=torch.long
+            )
+
+            # Get retrieval logits for this head's context
+            retrieval_logits = self.retrieval_module(context_tensor)[0]  # [vocab_size]
+
+            if self.blend_mode == "convex":
+                blended[head_idx] = (1 - self.beta) * medusa_logits[head_idx] + self.beta * retrieval_logits
+            else:
+                # Agreement mode
+                retrieval_probs = F.softmax(retrieval_logits, dim=-1)
+                retrieval_confident = retrieval_probs > 0.01
+                boost = self.beta * retrieval_logits * retrieval_confident.float()
+                blended[head_idx] = medusa_logits[head_idx] + boost
 
         return blended

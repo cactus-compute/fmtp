@@ -177,6 +177,11 @@ def parse_args():
         action="store_true",
         help="Use rolling context (speculative path) in retrieval scoring",
     )
+    parser.add_argument(
+        "--hst-rolling-blend",
+        action="store_true",
+        help="Use rolling/shifted context per head when blending logits (before candidate generation)",
+    )
 
     # Hardware
     parser.add_argument(
@@ -212,6 +217,7 @@ def create_hst_scorer(
     no_pruning: bool = False,
     blend_mode: str = "agreement",
     use_rolling_context: bool = True,
+    use_rolling_blend: bool = False,
 ):
     """Create HST scorer with retrieval module."""
     from nanochat.gemma_medusa.hst_scorer import HSTScorer
@@ -234,6 +240,7 @@ def create_hst_scorer(
         score_threshold=score_threshold,
         blend_mode=blend_mode,
         use_rolling_context=use_rolling_context,
+        use_rolling_blend=use_rolling_blend,
     )
 
     return scorer
@@ -597,12 +604,14 @@ def evaluate_tree_acceptance(args) -> TreeAcceptanceMetrics:
             no_pruning=args.hst_no_pruning,
             blend_mode=args.hst_blend_mode,
             use_rolling_context=args.hst_rolling_context,
+            use_rolling_blend=args.hst_rolling_blend,
         )
         pruning_status = "disabled" if args.hst_no_pruning else "enabled (threshold=0.01)"
         print(f"  HST weights: α={args.hst_alpha}, β={args.hst_beta}, γ={args.hst_gamma}")
         print(f"  Pruning: {pruning_status}")
         print(f"  Blend mode: {args.hst_blend_mode}")
         print(f"  Rolling context: {'enabled' if args.hst_rolling_context else 'disabled'}")
+        print(f"  Rolling blend: {'enabled' if args.hst_rolling_blend else 'disabled'}")
 
     # Tracking variables
     current_total_accepted = 0
