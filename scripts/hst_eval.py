@@ -173,7 +173,7 @@ def parse_args():
 
 def evaluate_retrieval(args) -> RetrievalMetrics:
     """Evaluate retrieval module Recall@K."""
-    from nanochat.hst.retrieval import RetrievalMixer, load_svd_basis
+    from nanochat.hst.retrieval import RetrievalMLP, load_svd_basis
 
     print("Evaluating retrieval module...")
 
@@ -193,16 +193,14 @@ def evaluate_retrieval(args) -> RetrievalMetrics:
     else:
         raise RuntimeError("Could not find embeddings")
 
-    embed_dim = embeddings.embedding_dim
     vocab_size = embeddings.num_embeddings
     embeddings = embeddings.to(args.device)
 
     # Create retrieval module
-    module = RetrievalMixer(
-        embed_dim=embed_dim,
+    module = RetrievalMLP(
         vocab_size=vocab_size,
+        hidden_dim=128,
         context_window=4,
-        num_layers=2,
         svd_rank=64,
     )
 
@@ -306,7 +304,7 @@ def evaluate_retrieval(args) -> RetrievalMetrics:
 
 def evaluate_benchmark(args) -> list[HSTBenchmarkMetrics]:
     """Benchmark HST vs baseline generation."""
-    from nanochat.hst.retrieval import RetrievalMixer, load_svd_basis
+    from nanochat.hst.retrieval import RetrievalMLP, load_svd_basis
     from nanochat.hst.suffix_match import SuffixMatcher
     from nanochat.hst.tree_builder import HybridScorer, HSTTreeBuilder
     from nanochat.hst.tree_attention import generate_hst_buffers, verify_tree_greedy
@@ -330,15 +328,13 @@ def evaluate_benchmark(args) -> list[HSTBenchmarkMetrics]:
     else:
         raise RuntimeError("Could not find embeddings")
 
-    embed_dim = embeddings.embedding_dim
     vocab_size = embeddings.num_embeddings
 
     # Create HST components
-    retrieval_module = RetrievalMixer(
-        embed_dim=embed_dim,
+    retrieval_module = RetrievalMLP(
         vocab_size=vocab_size,
+        hidden_dim=128,
         context_window=4,
-        num_layers=2,
         svd_rank=64,
     )
 

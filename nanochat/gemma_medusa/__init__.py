@@ -25,6 +25,7 @@ from .heads import (
     MultiLayerFusion,
     compute_multi_layer_indices,
 )
+from .hst_scorer import HSTScorer
 
 __all__ = [
     # Config
@@ -49,4 +50,6 @@ __all__ = [
     # Multi-layer fusion
     "MultiLayerFusion",
     "compute_multi_layer_indices",
+    # HST scoring
+    "HSTScorer",
 ]

@@ -14,6 +14,7 @@ from nanochat.medusa_buffers import (
     get_sparse_medusa_choices,
     validate_medusa_choices,
 )
+from nanochat.gemma_medusa.model import SPARSE_TREES
 
 
 class TestMedusaResBlock:
@@ -1099,7 +1100,8 @@ class TestMedusaEngineIntegration:
         from nanochat.medusa_engine import MedusaEngine
 
         model, tokenizer = model_and_tokenizer
-        engine = MedusaEngine(model, tokenizer, use_sparse_tree=True)
+        num_heads = len(model.medusa_heads)
+        engine = MedusaEngine(model, tokenizer, medusa_choices=SPARSE_TREES[num_heads])
 
         prompt = [1, 10, 20, 30]  # BOS + some tokens
         tokens_generated = []
@@ -1115,7 +1117,8 @@ class TestMedusaEngineIntegration:
         from nanochat.medusa_engine import MedusaEngine
 
         model, tokenizer = model_and_tokenizer
-        engine = MedusaEngine(model, tokenizer, use_sparse_tree=True)
+        num_heads = len(model.medusa_heads)
+        engine = MedusaEngine(model, tokenizer, medusa_choices=SPARSE_TREES[num_heads])
 
         prompt = [1, 10, 20, 30]
         results, masks = engine.generate_batch(prompt, max_tokens=5, temperature=0.0)
@@ -1129,7 +1132,8 @@ class TestMedusaEngineIntegration:
         from nanochat.medusa_engine import MedusaEngine, MedusaStats
 
         model, tokenizer = model_and_tokenizer
-        engine = MedusaEngine(model, tokenizer, use_sparse_tree=True)
+        num_heads = len(model.medusa_heads)
+        engine = MedusaEngine(model, tokenizer, medusa_choices=SPARSE_TREES[num_heads])
 
         prompt = [1, 10, 20, 30]
         result, stats = engine.generate_with_stats(prompt, max_tokens=5, temperature=0.0)

@@ -72,14 +72,13 @@ def parse_args():
 
 def load_model(model_path: str, vocab_size: int, device: str):
     """Load trained retrieval model."""
-    from nanochat.hst.retrieval import RetrievalMixer, load_svd_basis
+    from nanochat.hst.retrieval import RetrievalMLP, load_svd_basis
 
     # Create model
-    model = RetrievalMixer(
+    model = RetrievalMLP(
         vocab_size=vocab_size,
-        embed_dim=256,
+        hidden_dim=128,
         context_window=4,
-        num_layers=2,
         svd_rank=64,
     )
 

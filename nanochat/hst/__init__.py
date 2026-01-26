@@ -3,20 +3,20 @@ Hybrid Smoothed Tree (HST) Speculation module.
 
 HST is a novel multi-token prediction algorithm that fuses:
 1. MTP head drafter (leveraging cross-head attention architecture)
-2. Learned retrieval module (MLP-Mixer + SVD-compressed output)
+2. Learned retrieval module (3-layer MLP + SVD-compressed output)
 3. Context suffix matching (zero-parameter lookup mechanism)
 
 These components feed into a unified tree builder using Bayesian smoothed scoring
 and priority-queue based expansion.
 
 Key components:
-- RetrievalMixer: Learned retrieval with SVD-compressed vocab projection
+- RetrievalMLP: Learned retrieval with SVD-compressed vocab projection
 - SuffixMatcher: Context-aware suffix matching for repetition patterns
 - HybridScorer: Combines MTP + retrieval + suffix scores
 - HSTTreeBuilder: Priority-queue based adaptive tree construction
 
 Usage:
-    from nanochat.hst import RetrievalMixer, SuffixMatcher, HSTTreeBuilder
+    from nanochat.hst import RetrievalMLP, SuffixMatcher, HSTTreeBuilder
     from nanochat.hst_engine import HSTEngine
 
     # For full HST inference:
@@ -26,7 +26,7 @@ Usage:
 """
 
 from nanochat.hst.retrieval import (
-    RetrievalMixer,
+    RetrievalMLP,
     RetrievalModuleTiny,
     load_svd_basis,
     compute_svd_basis,
@@ -55,7 +55,7 @@ from nanochat.hst.tree_attention import (
 
 __all__ = [
     # Retrieval
-    "RetrievalMixer",
+    "RetrievalMLP",
     "RetrievalModuleTiny",
     "load_svd_basis",
     "compute_svd_basis",

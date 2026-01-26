@@ -75,6 +75,29 @@ class HybridScorer:
         S(token) = α * P_mtp(token) + β * P_retrieval(token) + γ * P_suffix(token)
 
     Where α + β + γ = 1.0 and each P is a calibrated probability distribution.
+
+    Current implementation uses fixed weights (default α=0.6, β=0.3, γ=0.1).
+    Use scripts/hst_tune_weights.py to find optimal weights via grid search.
+
+    TODO: Future improvements for adaptive weighting:
+    1. Entropy-adaptive weighting: Adjust β based on base model entropy
+       - High entropy → lower β (retrieval may be overconfident when model is uncertain)
+       - Could compute: β_adaptive = β * sigmoid(-entropy + threshold)
+
+    2. Entropy-normalized combination: Instead of fixed weights, normalize by entropy
+       - H_mtp = entropy(P_mtp), H_ret = entropy(P_ret)
+       - Confident sources (low entropy) should get higher weight
+       - S(token) = P_mtp^(1/H_mtp) * P_ret^(1/H_ret) (product of experts)
+
+    3. Learned weighting: Train a small MLP to predict (α, β, γ) from:
+       - Base model entropy
+       - Retrieval confidence (max probability)
+       - Context features (length, domain indicators)
+       - This would require additional training data with oracle acceptance labels
+
+    4. Per-source temperature calibration: Learn τ_mtp, τ_ret, τ_suffix
+       - P_calibrated = softmax(logits / τ)
+       - Different sources may need different calibration
     """
 
     def __init__(

@@ -168,7 +168,7 @@ def main():
     torch.save(Vt_truncated, vt_path)
     print(f"Saved Vt matrix to: {vt_path}")
 
-    print("\nDone! You can now use the compressed vocabulary with RetrievalMixer:")
+    print("\nDone! You can now use the compressed vocabulary with RetrievalMLP:")
     print(f"  from nanochat.hst import load_svd_basis")
     print(f"  compressed_vocab = load_svd_basis(rank={args.rank})")
     print(f"  retrieval_module.load_svd(compressed_vocab)")

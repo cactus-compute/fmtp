@@ -18,8 +18,8 @@ def test_tree_buffer_generation():
     """Test that tree buffers are generated correctly."""
     from nanochat.gemma_medusa.model import (
         generate_tree_buffers,
-        get_default_tree_choices,
-        get_sparse_tree_choices,
+        DEFAULT_TREES,
+        SPARSE_TREES,
     )
 
     print("\n=== Testing Tree Buffer Generation ===")
@@ -27,7 +27,7 @@ def test_tree_buffer_generation():
     device = torch.device("cpu")
 
     # Test sparse tree (smaller, faster)
-    choices = get_sparse_tree_choices(num_heads=4)
+    choices = SPARSE_TREES[4]
     print(f"Sparse tree choices: {len(choices)} paths")
     assert len(choices) > 0
 
@@ -45,10 +45,10 @@ def test_tree_buffer_generation():
     assert buffers["tree_position_ids"].shape == (tree_len,)
 
     # Test default tree (larger)
-    choices_default = get_default_tree_choices(num_heads=4, topk=5)
-    print(f"\nDefault tree choices (topk=5): {len(choices_default)} paths")
+    choices_default = DEFAULT_TREES[4]
+    print(f"\nDefault tree choices: {len(choices_default)} paths")
 
-    buffers_default = generate_tree_buffers(choices_default, device, topk=5)
+    buffers_default = generate_tree_buffers(choices_default, device, topk=10)
     print(f"Default tree attention mask shape: {buffers_default['tree_attn_mask'].shape}")
 
     print("\n✓ Tree buffer generation tests passed!")
@@ -82,7 +82,7 @@ def test_candidate_generation_mock():
     """Test candidate generation with mock logits."""
     from nanochat.gemma_medusa.model import (
         generate_tree_buffers,
-        get_sparse_tree_choices,
+        SPARSE_TREES,
     )
 
     print("\n=== Testing Candidate Generation (Mock) ===")
@@ -93,7 +93,7 @@ def test_candidate_generation_mock():
     topk = 5
 
     # Create sparse tree
-    choices = get_sparse_tree_choices(num_heads)
+    choices = SPARSE_TREES[num_heads]
     buffers = generate_tree_buffers(choices, device, topk=topk)
 
     # Mock logits
@@ -241,6 +241,7 @@ def test_full_mtp_generation():
     print(f"Input tokens: {len(input_ids)}")
 
     # Test MTP generation
+    from nanochat.gemma_medusa.model import SPARSE_TREES
     print("\n--- MTP Generation ---")
     t0 = time.perf_counter()
     mtp_tokens, mtp_stats = model.generate_mtp(
@@ -248,7 +249,7 @@ def test_full_mtp_generation():
         max_new_tokens=20,
         temperature=0.0,
         topk=5,
-        use_sparse_tree=True,
+        tree_choices=SPARSE_TREES[4],
     )
     t_mtp = time.perf_counter() - t0
 
@@ -282,10 +283,13 @@ def test_full_mtp_generation():
     print(f"Forward pass reduction: {std_passes / mtp_stats.forward_passes:.2f}x")
 
     # Check outputs match (greedy should be deterministic)
-    if mtp_text != std_text:
-        print(f"WARNING: Outputs differ!")
-        print(f"  MTP: {mtp_text}")
-        print(f"  Std: {std_text}")
+    # MTP and standard generation must produce identical outputs for greedy decoding
+    assert mtp_text == std_text, (
+        f"MTP and standard generation produced different outputs!\n"
+        f"  MTP: {mtp_text}\n"
+        f"  Std: {std_text}\n"
+        f"This indicates a bug in tree candidate mapping or verification."
+    )
 
     print("\n✓ Full MTP generation tests passed!")
 
@@ -299,14 +303,14 @@ def test_forward_mtp_shapes():
 
     from nanochat.gemma_medusa.model import (
         generate_tree_buffers,
-        get_sparse_tree_choices,
+        SPARSE_TREES,
     )
 
     device = torch.device("cpu")
     num_heads = 4
     topk = 5
 
-    choices = get_sparse_tree_choices(num_heads)
+    choices = SPARSE_TREES[num_heads]
     buffers = generate_tree_buffers(choices, device, topk=topk)
 
     tree_len = len(choices) + 1
@@ -330,7 +334,7 @@ def test_kv_cache_methods():
     from nanochat.gemma_medusa.model import (
         GemmaMedusaModel,
         generate_tree_buffers,
-        get_sparse_tree_choices,
+        SPARSE_TREES,
     )
 
     print("\n=== Testing KV Cache Methods ===")
@@ -351,7 +355,7 @@ def test_kv_cache_methods():
     num_heads = 4
     topk = 5
 
-    choices = get_sparse_tree_choices(num_heads)
+    choices = SPARSE_TREES[num_heads]
     buffers = generate_tree_buffers(choices, device, topk=topk)
 
     # Simulate KV cache scenario

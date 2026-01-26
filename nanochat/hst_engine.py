@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from nanochat.medusa_engine import MedusaEngine, MedusaStats
-from nanochat.hst.retrieval import RetrievalMixer, load_svd_basis
+from nanochat.hst.retrieval import RetrievalMLP, load_svd_basis
 from nanochat.hst.suffix_match import SuffixMatcher
 from nanochat.hst.tree_builder import HybridScorer, HSTTreeBuilder, HSTNode
 from nanochat.hst.tree_attention import (
@@ -88,8 +88,8 @@ class HSTEngine(MedusaEngine):
         # Retrieval configuration
         retrieval_checkpoint: Optional[str] = None,
         svd_rank: int = 64,
-        retrieval_context_window: int = 4,
-        retrieval_num_layers: int = 2,
+        retrieval_context_window: int = 8,  # K=8 based on ablation study
+        retrieval_hidden_dim: int = 128,
         # Suffix matching configuration
         suffix_buffer_size: int = 1024,
         suffix_max_len: int = 4,
@@ -109,7 +109,6 @@ class HSTEngine(MedusaEngine):
         # Parent class arguments
         medusa_choices=None,
         topk: int = 10,
-        use_sparse_tree: bool = False,
     ):
         """
         Initialize the HST engine.
@@ -118,9 +117,9 @@ class HSTEngine(MedusaEngine):
             model: GPT model with Medusa heads
             tokenizer: Tokenizer for encoding/decoding
             retrieval_checkpoint: Path to trained retrieval module
-            svd_rank: SVD rank for retrieval output
-            retrieval_context_window: Number of context tokens for retrieval
-            retrieval_num_layers: Number of MLP-Mixer layers
+            svd_rank: SVD rank for retrieval output (default 64)
+            retrieval_context_window: Number of context tokens for retrieval (default 8)
+            retrieval_hidden_dim: Hidden dimension for retrieval MLP (default 128)
             suffix_buffer_size: Size of suffix matching buffer
             suffix_max_len: Maximum suffix length to index
             alpha: Weight for MTP head predictions
@@ -133,9 +132,8 @@ class HSTEngine(MedusaEngine):
             retrieval_top_k: Top-k from retrieval per expansion
             suffix_top_k: Top-k from suffix matching per expansion
             entropy_threshold: Entropy threshold for disabling retrieval
-            medusa_choices: Custom Medusa tree structure
+            medusa_choices: Custom Medusa tree structure (use DEFAULT_TREES or SPARSE_TREES)
             topk: Number of top-k for Medusa
-            use_sparse_tree: Use sparse Medusa tree
         """
         # Initialize parent MedusaEngine
         super().__init__(
@@ -143,7 +141,6 @@ class HSTEngine(MedusaEngine):
             tokenizer=tokenizer,
             medusa_choices=medusa_choices,
             topk=topk,
-            use_sparse_tree=use_sparse_tree,
         )
 
         self.device = model.get_device()
@@ -152,24 +149,22 @@ class HSTEngine(MedusaEngine):
         self.embed_dim = model.config.n_embd
         self.vocab_size = model.config.vocab_size
 
-        # Initialize retrieval module
-        self.retrieval_module = RetrievalMixer(
-            embed_dim=self.embed_dim,
+        # Initialize retrieval module (new RetrievalMLP that takes token IDs directly)
+        self.retrieval_module = RetrievalMLP(
             vocab_size=self.vocab_size,
+            hidden_dim=retrieval_hidden_dim,
             context_window=retrieval_context_window,
-            num_layers=retrieval_num_layers,
             svd_rank=svd_rank,
-            input_mode="last_k",
         )
 
-        # Load SVD basis
+        # Load SVD basis to initialize tied embeddings
         try:
             compressed_vocab = load_svd_basis(rank=svd_rank, model_name="gemma")
             self.retrieval_module.load_svd(compressed_vocab)
         except FileNotFoundError:
             # Initialize with random for testing if SVD not available
-            self.retrieval_module.compressed_vocab.normal_(0, 0.01)
-            self.retrieval_module._svd_loaded = True
+            self.retrieval_module.svd_embedding.data.normal_(0, 0.01)
+            self.retrieval_module._svd_initialized = True
 
         # Load retrieval checkpoint if provided
         if retrieval_checkpoint:
@@ -213,28 +208,47 @@ class HSTEngine(MedusaEngine):
     def _get_retrieval_logits(
         self,
         context_ids: torch.Tensor,
-        embeddings: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Get logits from the learned retrieval module.
+        Get full vocab logits from the learned retrieval module.
 
         Args:
             context_ids: [B, T] Recent context token IDs
-            embeddings: Optional pre-computed embeddings
 
         Returns:
             logits: [B, vocab_size] Retrieval logits
         """
-        if embeddings is None:
-            # Get embeddings from model
-            embeddings = self.model.transformer.wte(context_ids)
-
-        # Use last K tokens
-        if embeddings.shape[1] > self.retrieval_context_window:
-            embeddings = embeddings[:, -self.retrieval_context_window:, :]
+        # Use last K tokens (K=8 by default)
+        if context_ids.shape[1] > self.retrieval_context_window:
+            context_ids = context_ids[:, -self.retrieval_context_window:]
 
         with torch.no_grad():
-            return self.retrieval_module(embeddings)
+            return self.retrieval_module(context_ids)
+
+    def _get_retrieval_logits_topk(
+        self,
+        context_ids: torch.Tensor,
+        candidate_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Get logits only for specific candidate tokens (fast inference).
+
+        This is the optimized path that provides 86-98x speedup by only
+        computing logits for MTP head candidates instead of full vocab.
+
+        Args:
+            context_ids: [B, T] Recent context token IDs
+            candidate_ids: [num_candidates] or [B, num_candidates] candidate token IDs
+
+        Returns:
+            logits: [B, num_candidates] Retrieval logits for candidates only
+        """
+        # Use last K tokens (K=8 by default)
+        if context_ids.shape[1] > self.retrieval_context_window:
+            context_ids = context_ids[:, -self.retrieval_context_window:]
+
+        with torch.no_grad():
+            return self.retrieval_module.forward_topk(context_ids, candidate_ids)
 
     def _get_suffix_probs(
         self,
@@ -271,6 +285,9 @@ class HSTEngine(MedusaEngine):
         """
         Build HST tree using hybrid scoring.
 
+        Uses sliding window context for retrieval: at depth d, the retrieval
+        context is context[-(K-d):] + path[:d], always maintaining K tokens.
+
         Args:
             base_logits: [vocab_size] Base model logits
             medusa_logits: [num_heads, vocab_size] Medusa head logits
@@ -284,14 +301,10 @@ class HSTEngine(MedusaEngine):
         entropy = self._compute_entropy(base_logits)
         use_retrieval = entropy < self.entropy_threshold
 
-        # Get retrieval logits
-        retrieval_logits = None
-        if use_retrieval:
-            context_ids = torch.tensor([context_tokens[-self.retrieval_context_window:]], device=self.device)
-            retrieval_logits = self._get_retrieval_logits(context_ids)[0]
-
         # Get suffix probabilities
         suffix_probs = self._get_suffix_probs(context_tokens)
+
+        K = self.retrieval_context_window  # K=8 by default
 
         # Define callback functions for tree builder
         def get_mtp_logits(depth: int, path: List[int]) -> torch.Tensor:
@@ -299,10 +312,22 @@ class HSTEngine(MedusaEngine):
                 return medusa_logits[depth]
             return base_logits  # Fall back to base logits for deeper levels
 
-        def get_retrieval_logits_fn(context: List[int]) -> Optional[torch.Tensor]:
-            if use_retrieval and retrieval_logits is not None:
-                return retrieval_logits
-            return None
+        def get_retrieval_logits_fn(extended_context: List[int]) -> Optional[torch.Tensor]:
+            """
+            Get retrieval logits using sliding window context.
+
+            At depth d (where d = len(extended_context) - len(context_tokens)):
+            - Use context[-(K-d):] committed tokens
+            - Plus path[:d] speculative tokens
+            - Total: always K tokens
+            """
+            if not use_retrieval:
+                return None
+
+            # Build K-token context: last K tokens from extended_context
+            retrieval_context = extended_context[-K:] if len(extended_context) >= K else extended_context
+            context_ids = torch.tensor([retrieval_context], device=self.device)
+            return self._get_retrieval_logits(context_ids)[0]
 
         def get_suffix_probs_fn(suffix: List[int]) -> torch.Tensor:
             return self._get_suffix_probs(suffix)

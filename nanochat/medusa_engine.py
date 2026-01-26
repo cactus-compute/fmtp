@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from nanochat.medusa_buffers import (
     generate_medusa_buffers,
     get_default_medusa_choices,
-    get_sparse_medusa_choices,
 )
 
 
@@ -71,7 +70,6 @@ class MedusaEngine:
         tokenizer,
         medusa_choices: Optional[List[Tuple[int, ...]]] = None,
         topk: int = 10,
-        use_sparse_tree: bool = False,
     ):
         """
         Initialize the Medusa engine.
@@ -79,9 +77,10 @@ class MedusaEngine:
         Args:
             model: GPT model with Medusa heads
             tokenizer: Tokenizer for encoding/decoding
-            medusa_choices: Custom tree structure (None = auto-generate)
+            medusa_choices: Tree structure for speculation. If None, uses default tree.
+                           For manual override, import and use DEFAULT_TREES or SPARSE_TREES
+                           from nanochat.gemma_medusa.model.
             topk: Number of top predictions from each head
-            use_sparse_tree: Use smaller tree for faster but less accurate speculation
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -93,12 +92,9 @@ class MedusaEngine:
 
         self.num_heads = len(model.medusa_heads)
 
-        # Set up tree configuration
+        # Set up tree configuration - default to heuristic tree if not provided
         if medusa_choices is None:
-            if use_sparse_tree:
-                medusa_choices = get_sparse_medusa_choices(self.num_heads)
-            else:
-                medusa_choices = get_default_medusa_choices(self.num_heads, topk)
+            medusa_choices = get_default_medusa_choices(self.num_heads, topk)
 
         self.medusa_choices = medusa_choices
         self.medusa_buffers = None  # Lazily initialized
@@ -581,7 +577,7 @@ def benchmark_medusa(
     prompts: List[str],
     max_tokens: int = 100,
     temperature: float = 0.0,
-    use_sparse_tree: bool = False,
+    medusa_choices: Optional[List[Tuple[int, ...]]] = None,
 ) -> List[Dict]:
     """
     Benchmark Medusa inference against standard generation.
@@ -592,7 +588,7 @@ def benchmark_medusa(
         prompts: List of prompt strings to benchmark
         max_tokens: Maximum tokens per generation
         temperature: Sampling temperature
-        use_sparse_tree: Use smaller tree for faster speculation
+        medusa_choices: Tree structure for speculation (None = default tree)
 
     Returns:
         List of benchmark results per prompt
@@ -601,7 +597,7 @@ def benchmark_medusa(
     from nanochat.engine import Engine
 
     standard_engine = Engine(model, tokenizer)
-    medusa_engine = MedusaEngine(model, tokenizer, use_sparse_tree=use_sparse_tree)
+    medusa_engine = MedusaEngine(model, tokenizer, medusa_choices=medusa_choices)
 
     results = []
     bos = tokenizer.get_bos_token_id()

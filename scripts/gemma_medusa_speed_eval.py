@@ -138,7 +138,7 @@ def evaluate_response(conversation, completion_text, eval_type, task=None):
 
 
 def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens, temperature,
-                 use_fixed_size_tree=False, use_heuristic_tree=False, collect_timing=False):
+                 tree_choices=None, collect_timing=False):
     """Run evaluation using MTP speculative decoding."""
     num_problems = min(len(task), max_problems) if max_problems else len(task)
 
@@ -168,8 +168,7 @@ def run_mtp_eval(model, tokenizer, task, eval_type, max_problems, max_new_tokens
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             eos_token_id=eos_token_id,
-            use_fixed_size_tree=use_fixed_size_tree,
-            use_heuristic_tree=use_heuristic_tree,
+            tree_choices=tree_choices,
             collect_timing=collect_timing,
         )
 
@@ -359,10 +358,8 @@ if __name__ == "__main__":
     parser.add_argument('--skip-standard', action='store_true', help='Skip standard generation baseline')
     parser.add_argument('--inference-num-heads', type=int, default=None,
                         help='Override number of heads to use during inference (for ablation testing)')
-    parser.add_argument('--fixed-tree-size', action='store_true',
-                        help='Use fixed 79-node tree for fair ablation comparison across head counts')
     parser.add_argument('--use-heuristic-tree', action='store_true',
-                        help='Use heuristic tree instead of calibrated optimal tree (default: use optimal)')
+                        help='Use heuristic (DEFAULT_TREES) instead of calibrated optimal tree')
     parser.add_argument('--use-head-mixer', action='store_true', default=None,
                         help='Use cross-head MLP mixer (auto-detected from checkpoint if not specified)')
     parser.add_argument('--mixer-hidden', type=int, default=None,
@@ -489,15 +486,28 @@ if __name__ == "__main__":
     # Run MTP generation
     effective_heads = args.inference_num_heads if args.inference_num_heads else medusa_num_heads
     print0("\n" + "="*50)
-    tree_info = "fixed=79" if args.fixed_tree_size else "topk=10"
-    tree_type = "heuristic" if args.use_heuristic_tree else "optimal"
+
+    # Get tree choices - use optimal tree from checkpoint by default
+    from nanochat.gemma_medusa.model import get_tree_choices, DEFAULT_TREES
+    if args.use_heuristic_tree:
+        tree_choices = DEFAULT_TREES.get(effective_heads, DEFAULT_TREES[4])
+        tree_type = "heuristic"
+    else:
+        try:
+            tree_choices = get_tree_choices(effective_heads, args.checkpoint)
+            tree_type = "optimal"
+        except FileNotFoundError:
+            print0("Warning: head_acc.json not found, falling back to default tree")
+            tree_choices = DEFAULT_TREES.get(effective_heads, DEFAULT_TREES[4])
+            tree_type = "default"
+
+    tree_info = f"nodes={len(tree_choices)+1}"
     print0(f"Running MTP Speculative Decoding (heads={effective_heads}, {tree_info}, tree={tree_type})")
     print0("="*50)
     with torch.amp.autocast('cuda', dtype=dtype):
         results['mtp'] = run_mtp_eval(
             model, tokenizer, task, eval_type, args.max_problems, args.max_new_tokens, args.temperature,
-            use_fixed_size_tree=args.fixed_tree_size,
-            use_heuristic_tree=args.use_heuristic_tree,
+            tree_choices=tree_choices,
             collect_timing=args.timing,
         )
     print0(f"MTP: {100*results['mtp']['accuracy']:.2f}% accuracy, "
@@ -540,8 +550,8 @@ if __name__ == "__main__":
             'max_problems': args.max_problems,
             'max_new_tokens': args.max_new_tokens,
             'temperature': args.temperature,
-            'use_fixed_size_tree': args.fixed_tree_size,
-            'use_heuristic_tree': args.use_heuristic_tree,
+            'tree_type': tree_type,
+            'tree_nodes': len(tree_choices) + 1,
         },
         'results': results,
     }

@@ -14,7 +14,7 @@ Memory optimization:
 - Gradient checkpointing: Optional, trades compute for memory
 """
 
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Callable
 from dataclasses import dataclass
 import json
 import os
@@ -32,6 +32,49 @@ from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaHeadAttention,
 _OPTIMAL_TREE_CACHE: Dict[str, List[Tuple[int, ...]]] = {}
 
 
+# =============================================================================
+# Pre-defined tree constants for manual override
+# =============================================================================
+
+# Default trees by head count (original heuristic structure)
+# These can be passed to tree_choices parameter for manual override
+DEFAULT_TREES: Dict[int, List[Tuple[int, ...]]] = {  # type: ignore[assignment]
+    1: [(i,) for i in range(10)],  # 10 depth-1 candidates
+    2: (
+        [(i,) for i in range(10)] +  # 10 depth-1
+        [(i, j) for i in range(5) for j in range(5)]  # 25 depth-2
+    ),  # Total: 35 nodes
+    3: (
+        [(i,) for i in range(10)] +  # 10 depth-1
+        [(i, j) for i in range(5) for j in range(5)] +  # 25 depth-2
+        [(i, j, k) for i in range(3) for j in range(3) for k in range(3)]  # 27 depth-3
+    ),  # Total: 62 nodes
+    4: (
+        [(i,) for i in range(10)] +  # 10 depth-1
+        [(i, j) for i in range(5) for j in range(5)] +  # 25 depth-2
+        [(i, j, k) for i in range(3) for j in range(3) for k in range(3)] +  # 27 depth-3
+        [(i, j, k, m) for i in range(2) for j in range(2) for k in range(2) for m in range(2)]  # 16 depth-4
+    ),  # Total: 78 nodes
+}
+
+# Sparse trees for fast testing (minimal candidates per depth)
+SPARSE_TREES: Dict[int, List[Tuple[int, ...]]] = {  # type: ignore[assignment]
+    1: [(0,), (1,), (2,)],  # 3 nodes
+    2: [(0,), (1,), (2,), (0, 0), (0, 1), (1, 0), (1, 1)],  # 7 nodes
+    3: (
+        [(0,), (1,), (2,)] +  # 3 depth-1
+        [(0, 0), (0, 1), (1, 0), (1, 1)] +  # 4 depth-2
+        [(0, 0, 0), (0, 0, 1), (0, 1, 0), (1, 0, 0)]  # 4 depth-3
+    ),  # Total: 11 nodes
+    4: (
+        [(0,), (1,), (2,)] +  # 3 depth-1
+        [(0, 0), (0, 1), (1, 0), (1, 1)] +  # 4 depth-2
+        [(0, 0, 0), (0, 0, 1), (0, 1, 0), (1, 0, 0)] +  # 4 depth-3
+        [(0, 0, 0, 0)]  # 1 depth-4
+    ),  # Total: 12 nodes
+}
+
+
 def _get_node_expectation(
     accuracies: Dict[int, Dict[int, float]],
     node: Tuple[int, ...],
@@ -45,14 +88,23 @@ def _get_node_expectation(
     - Second element: which top-k prediction from head 1 (depth 1)
     - etc.
 
-    Expected acceptance = product of recall@(rank+1) for each position.
+    Expected acceptance = product of marginal probabilities P(rank k is correct).
+    For rank k, this is Recall@k - Recall@(k-1), i.e. the probability that
+    the correct token is exactly at rank k (not just somewhere in top-k).
     """
     expectation = 1.0
     for depth, rank in enumerate(node):
         # rank is 0-indexed, so rank=0 means top-1, rank=1 means top-2, etc.
         k = min(rank + 1, topk)
         recall_at_k = accuracies[depth].get(k, 0.0)
-        expectation *= recall_at_k
+        # Marginal probability: P(correct is exactly at rank k)
+        # = Recall@k - Recall@(k-1)
+        if rank == 0:
+            marginal_prob = recall_at_k
+        else:
+            recall_at_k_minus_1 = accuracies[depth].get(k - 1, 0.0)
+            marginal_prob = recall_at_k - recall_at_k_minus_1
+        expectation *= marginal_prob
     return expectation
 
 
@@ -176,63 +228,6 @@ def generate_optimal_tree_from_head_acc(
         return None
 
 
-def load_optimal_tree_choices(num_heads: int, checkpoint_path: Optional[str] = None) -> Optional[List[Tuple[int, ...]]]:
-    """
-    Load or generate optimal tree choices.
-
-    Priority order:
-    1. If checkpoint_path provided, try to load/generate from <checkpoint>/head_acc.json
-    2. Fall back to pre-computed trees in results/medusa/optimal_tree_Nheads.json
-
-    Args:
-        num_heads: Number of Medusa heads
-        checkpoint_path: Optional path to checkpoint directory
-
-    Returns:
-        List of tree node tuples, or None if not available
-    """
-    # Try checkpoint's head_acc.json first
-    if checkpoint_path:
-        # Normalize checkpoint path (handle final/ subdirectory)
-        if checkpoint_path.endswith("/final"):
-            base_checkpoint = os.path.dirname(checkpoint_path)
-        else:
-            base_checkpoint = checkpoint_path
-
-        head_acc_path = os.path.join(base_checkpoint, "head_acc.json")
-        cache_key = f"{head_acc_path}:{num_heads}"
-
-        if cache_key in _OPTIMAL_TREE_CACHE:
-            return _OPTIMAL_TREE_CACHE[cache_key]
-
-        tree_choices = generate_optimal_tree_from_head_acc(head_acc_path, num_heads)
-        if tree_choices is not None:
-            _OPTIMAL_TREE_CACHE[cache_key] = tree_choices
-            return tree_choices
-
-    # Fall back to pre-computed trees
-    cache_key = f"precomputed:{num_heads}"
-    if cache_key in _OPTIMAL_TREE_CACHE:
-        return _OPTIMAL_TREE_CACHE[cache_key]
-
-    # Find the results/medusa directory relative to this file
-    module_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    tree_path = os.path.join(module_dir, "results", "medusa", f"optimal_tree_{num_heads}head{'s' if num_heads > 1 else ''}.json")
-
-    if not os.path.exists(tree_path):
-        return None
-
-    try:
-        with open(tree_path) as f:
-            data = json.load(f)
-        # Convert lists back to tuples
-        choices = [tuple(node) for node in data["tree_choices"]]
-        _OPTIMAL_TREE_CACHE[cache_key] = choices
-        return choices
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return None
-
-
 @dataclass
 class MTPStats:
     """Statistics from MTP generation for benchmarking."""
@@ -341,166 +336,72 @@ def generate_tree_buffers(
     }
 
 
-def get_default_tree_choices(num_heads: int, topk: int = 10) -> List[Tuple[int, ...]]:
-    """Generate default tree configuration based on number of Medusa heads."""
-    choices = []
-
-    if num_heads >= 1:
-        for i in range(min(topk, 10)):
-            choices.append((i,))
-
-    if num_heads >= 2:
-        for i in range(min(topk, 5)):
-            for j in range(min(topk, 5)):
-                choices.append((i, j))
-
-    if num_heads >= 3:
-        for i in range(min(topk, 3)):
-            for j in range(min(topk, 3)):
-                for k in range(min(topk, 3)):
-                    choices.append((i, j, k))
-
-    if num_heads >= 4:
-        for i in range(min(topk, 2)):
-            for j in range(min(topk, 2)):
-                for k in range(min(topk, 2)):
-                    for m in range(min(topk, 2)):
-                        choices.append((i, j, k, m))
-
-    return choices
-
-
-def get_sparse_tree_choices(num_heads: int) -> List[Tuple[int, ...]]:
-    """Generate a sparse tree configuration optimized for speed."""
-    choices = []
-
-    for i in range(min(3, num_heads and 3)):
-        choices.append((i,))
-
-    if num_heads >= 2:
-        for i in range(2):
-            for j in range(2):
-                choices.append((i, j))
-
-    if num_heads >= 3:
-        choices.extend([(0, 0, 0), (0, 0, 1), (0, 1, 0), (1, 0, 0)])
-
-    if num_heads >= 4:
-        choices.append((0, 0, 0, 0))
-
-    return choices
-
-
-def get_fixed_size_tree_choices(
+def get_tree_choices(
     num_heads: int,
-    target_size: int = 79,
-    use_heuristic: bool = False,
-    checkpoint_path: Optional[str] = None,
+    checkpoint_path: str,
+    tree_size: int = 79,
+    topk: int = 64,
 ) -> List[Tuple[int, ...]]:
     """
-    Generate tree choices that result in exactly target_size nodes (including root).
+    Generate optimal tree choices from calibrated head accuracies.
 
-    By default, uses calibrated optimal trees. Priority order:
-    1. If checkpoint_path provided, generate from <checkpoint>/head_acc.json
-    2. Fall back to pre-computed trees in results/medusa/
-    3. Fall back to heuristic trees if no optimal tree available
+    This is the single entry point for tree generation. It requires a checkpoint
+    with head_acc.json containing calibrated head accuracy statistics.
+
+    For manual override with pre-defined trees, use DEFAULT_TREES or SPARSE_TREES
+    constants directly instead of this function.
 
     Args:
         num_heads: Number of Medusa heads
-        target_size: Target tree size (default 79)
-        use_heuristic: If True, use heuristic trees instead of calibrated optimal trees
-        checkpoint_path: Optional path to checkpoint directory with head_acc.json
+        checkpoint_path: Path to checkpoint directory containing head_acc.json
+        tree_size: Target tree size (default 79)
+        topk: Max top-k to consider per head (default 64)
 
     Returns:
-        List of tree node tuples representing the tree structure
+        List of tree node tuples representing the optimal tree structure
+
+    Raises:
+        FileNotFoundError: If head_acc.json not found at checkpoint_path
+        ValueError: If head_acc.json is invalid or cannot generate tree
     """
-    # Try to load calibrated optimal tree unless explicitly using heuristic
-    if not use_heuristic:
-        optimal_choices = load_optimal_tree_choices(num_heads, checkpoint_path)
-        if optimal_choices is not None:
-            return optimal_choices
+    # Normalize checkpoint path (handle final/ subdirectory)
+    if checkpoint_path.endswith("/final"):
+        base_checkpoint = os.path.dirname(checkpoint_path)
+    else:
+        base_checkpoint = checkpoint_path
 
-    # Fall back to heuristic tree generation
-    return _get_heuristic_tree_choices(num_heads, target_size)
+    head_acc_path = os.path.join(base_checkpoint, "head_acc.json")
+    cache_key = f"{head_acc_path}:{num_heads}:{tree_size}:{topk}"
+
+    if cache_key in _OPTIMAL_TREE_CACHE:
+        return _OPTIMAL_TREE_CACHE[cache_key]
+
+    if not os.path.exists(head_acc_path):
+        raise FileNotFoundError(
+            f"head_acc.json not found at {head_acc_path}. "
+            f"Run calibration first or use DEFAULT_TREES/SPARSE_TREES for manual override."
+        )
+
+    tree_choices = generate_optimal_tree_from_head_acc(head_acc_path, num_heads, tree_size, topk)
+    if tree_choices is None:
+        raise ValueError(
+            f"Failed to generate tree from {head_acc_path}. "
+            f"File may be corrupted or missing required fields."
+        )
+
+    _OPTIMAL_TREE_CACHE[cache_key] = tree_choices
+    return tree_choices
 
 
-def _get_heuristic_tree_choices(num_heads: int, target_size: int = 79) -> List[Tuple[int, ...]]:
-    """
-    Generate heuristic tree choices that result in exactly target_size nodes.
+# Legacy function aliases for backward compatibility (deprecated)
+def get_default_tree_choices(num_heads: int, topk: int = 10) -> List[Tuple[int, ...]]:
+    """Deprecated: Use DEFAULT_TREES[num_heads] instead."""
+    return list(DEFAULT_TREES.get(num_heads, DEFAULT_TREES[4]))
 
-    This is the original algorithm based on assumed tree structures:
-    - 4 heads: use default tree (10 d1 + 25 d2 + 27 d3 + 16 d4 = 78 + root = 79)
-    - 3 heads: 10 d1 + 25 d2 + 43 d3 = 78
-    - 2 heads: 10 d1 + 68 d2 = 78
-    - 1 head: 78 depth-1 candidates (top-78)
-    """
-    num_candidates = target_size - 1  # subtract 1 for root (78 candidates)
-    choices = []
 
-    if num_heads == 1:
-        # All candidates are depth-1: top-78 from head 1
-        # This is optimal for 1 head - explore the 78 most likely next tokens
-        for i in range(num_candidates):
-            choices.append((i,))
-
-    elif num_heads == 2:
-        # Heuristic 2-head tree: balance width at depth-1 vs depth-2 exploration
-        # - 10 depth-1 candidates (top-10 from head 1)
-        # - 68 depth-2 candidates (explore head 2 given head 1 predictions)
-
-        # Add depth-1: top 10 (same as default)
-        for i in range(10):
-            choices.append((i,))
-
-        # Add depth-2: need 68 more to reach 78 total
-        # Use roughly 8x8=64 + extra 4 from top row = 68
-        # Structure: top 9 from head1, each with top 7-8 from head2
-        remaining = num_candidates - 10  # 68
-        count = 0
-        for i in range(10):
-            width = 8 if i < 8 else 2  # First 8 rows get 8 columns, last 2 get 2 each
-            for j in range(width):
-                choices.append((i, j))
-                count += 1
-                if count >= remaining:
-                    break
-            if count >= remaining:
-                break
-
-    elif num_heads == 3:
-        # Heuristic 3-head tree: use default structure extended to 79 nodes
-        # Default 3-head: 10 d1 + 25 d2 + 27 d3 = 62, need 16 more
-        # Add more depth-3 paths to reach 78 total
-
-        # Add depth-1: top 10 (same as default)
-        for i in range(10):
-            choices.append((i,))
-
-        # Add depth-2: 5x5 = 25 (same as default)
-        for i in range(5):
-            for j in range(5):
-                choices.append((i, j))
-
-        # Add depth-3: 3x3x3 = 27 (same as default) + 16 more = 43 total
-        # Use 4x4x3 = 48, take first 43
-        count = 0
-        for i in range(4):
-            for j in range(4):
-                for k in range(3):
-                    choices.append((i, j, k))
-                    count += 1
-                    if count >= 43:
-                        break
-                if count >= 43:
-                    break
-            if count >= 43:
-                break
-
-    else:  # num_heads >= 4
-        # Use standard tree which is already 79 nodes (optimal structure)
-        return get_default_tree_choices(num_heads)
-
-    return choices
+def get_sparse_tree_choices(num_heads: int) -> List[Tuple[int, ...]]:
+    """Deprecated: Use SPARSE_TREES[num_heads] instead."""
+    return list(SPARSE_TREES.get(num_heads, SPARSE_TREES[4]))
 
 
 class GemmaModelWrapper(nn.Module):
@@ -895,12 +796,60 @@ class GemmaMedusaModel(nn.Module):
             medusa_num_heads=medusa_num_heads,
         )
 
+        # Candidate scorer callback (optional, for custom tree scoring/pruning)
+        # Any callable with signature: (main_logits, medusa_logits, tree_candidates, context) -> scores
+        self._candidate_scorer = None
+        self._scorer_context: List[int] = []
+
     @property
     def config(self):
         return self._config
 
     def get_device(self) -> torch.device:
         return self._device
+
+    @property
+    def candidate_scorer(self):
+        """Return the attached candidate scorer callback, if any."""
+        return self._candidate_scorer
+
+    def set_candidate_scorer(self, scorer) -> None:
+        """
+        Set a callback for custom candidate scoring during speculative decoding.
+
+        The scorer should be a callable (or object with __call__) with signature:
+            scorer(main_logits, medusa_logits, tree_candidates, context_tokens) -> scores
+
+        Where:
+            main_logits: [vocab_size] Base model logits
+            medusa_logits: [num_heads, vocab_size] Medusa head logits
+            tree_candidates: [tree_len] Candidate tokens in tree structure
+            context_tokens: List[int] Current context token IDs
+
+        Returns:
+            scores: [tree_len] Scores for each tree position (higher = better)
+
+        The scorer can also implement optional methods:
+            - reset(): Called at start of new generation
+            - on_tokens_accepted(token_ids: List[int]): Called when tokens are accepted
+
+        Args:
+            scorer: Callable scorer or None to disable custom scoring
+        """
+        self._candidate_scorer = scorer
+        self._scorer_context = []
+
+    def _reset_scorer(self) -> None:
+        """Reset scorer state for new generation."""
+        self._scorer_context = []
+        if self._candidate_scorer is not None and hasattr(self._candidate_scorer, 'reset'):
+            self._candidate_scorer.reset()
+
+    def _update_scorer_context(self, token_ids: List[int]) -> None:
+        """Update scorer with accepted tokens."""
+        self._scorer_context.extend(token_ids)
+        if self._candidate_scorer is not None and hasattr(self._candidate_scorer, 'on_tokens_accepted'):
+            self._candidate_scorer.on_tokens_accepted(token_ids)
 
     def freeze_base_model(self):
         """Freeze all base model parameters."""
@@ -1558,43 +1507,48 @@ class GemmaMedusaModel(nn.Module):
     # =========================================================================
 
     _tree_buffers_cache: Optional[Dict[str, torch.Tensor]] = None
-    _tree_buffers_config: Optional[Tuple[int, bool, bool, bool]] = None
+    _tree_buffers_config: Optional[Tuple[Tuple[Tuple[int, ...], ...], int]] = None
 
     def _get_tree_buffers(
         self,
+        tree_choices: Optional[List[Tuple[int, ...]]] = None,
         topk: int = 10,
-        use_sparse_tree: bool = False,
-        use_fixed_size_tree: bool = False,
-        use_heuristic_tree: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Get tree attention buffers, using cache if config matches.
 
         Args:
-            topk: Number of top predictions from each head
-            use_sparse_tree: Use smaller tree for faster but less accurate speculation
-            use_fixed_size_tree: Use fixed 79-node tree for fair ablation comparison
-            use_heuristic_tree: Use heuristic trees instead of calibrated optimal trees
+            tree_choices: Tree structure to use. If None, generates optimal tree from
+                         checkpoint's head_acc.json. For manual override, pass
+                         DEFAULT_TREES[num_heads] or SPARSE_TREES[num_heads].
+            topk: Number of top predictions from each head (used for buffer sizing)
 
         Returns:
             Dictionary of tree buffers
+
+        Raises:
+            FileNotFoundError: If tree_choices is None and head_acc.json not found
+            ValueError: If tree_choices is None and head_acc.json is invalid
         """
-        config = (topk, use_sparse_tree, use_fixed_size_tree, use_heuristic_tree, self._checkpoint_path)
-        if self._tree_buffers_cache is None or self._tree_buffers_config != config:
-            if use_fixed_size_tree:
-                choices = get_fixed_size_tree_choices(
-                    self.medusa_num_heads,
-                    target_size=79,
-                    use_heuristic=use_heuristic_tree,
-                    checkpoint_path=self._checkpoint_path,
+        # Generate choices if not provided
+        if tree_choices is None:
+            if self._checkpoint_path is None:
+                raise ValueError(
+                    "Cannot generate optimal tree: checkpoint_path not set. "
+                    "Either set checkpoint_path or pass tree_choices explicitly "
+                    "(e.g., tree_choices=DEFAULT_TREES[num_heads])."
                 )
-            elif use_sparse_tree:
-                choices = get_sparse_tree_choices(self.medusa_num_heads)
-            else:
-                choices = get_default_tree_choices(self.medusa_num_heads, topk)
-            # For fixed-size tree with 1 head, we need higher topk
-            effective_topk = max(topk, len(choices)) if use_fixed_size_tree else topk
-            self._tree_buffers_cache = generate_tree_buffers(choices, self._device, effective_topk)
+            tree_choices = get_tree_choices(
+                self.medusa_num_heads,
+                self._checkpoint_path,
+            )
+
+        # Use tuple for hashable cache key
+        config = (tuple(tree_choices), topk)
+        if self._tree_buffers_cache is None or self._tree_buffers_config != config:
+            # Ensure topk is large enough for the tree structure
+            effective_topk = max(topk, len(tree_choices))
+            self._tree_buffers_cache = generate_tree_buffers(tree_choices, self._device, effective_topk)
             self._tree_buffers_config = config
         return self._tree_buffers_cache
 
@@ -1936,11 +1890,11 @@ class GemmaMedusaModel(nn.Module):
         max_new_tokens: int = 100,
         temperature: float = 0.0,
         topk: int = 10,
-        use_sparse_tree: bool = False,
-        use_heuristic_tree: bool = False,
+        tree_choices: Optional[List[Tuple[int, ...]]] = None,
         posterior_threshold: float = 0.09,
         posterior_alpha: float = 0.3,
         eos_token_id: Optional[int] = None,
+        candidate_scorer: Optional[Callable] = None,
     ) -> Tuple[List[int], MTPStats]:
         """
         Generate tokens using MTP (Multi-Token Prediction) speculative decoding.
@@ -1953,11 +1907,18 @@ class GemmaMedusaModel(nn.Module):
             max_new_tokens: Maximum new tokens to generate
             temperature: Sampling temperature (0.0 = greedy)
             topk: Number of top-k predictions per Medusa head
-            use_sparse_tree: Use smaller tree for faster speculation
-            use_heuristic_tree: Use heuristic trees instead of calibrated optimal trees
+            tree_choices: Tree structure for speculation. If None, uses optimal tree
+                         from checkpoint's head_acc.json. For manual override, pass
+                         DEFAULT_TREES[num_heads] or SPARSE_TREES[num_heads].
             posterior_threshold: Typical acceptance hard threshold
             posterior_alpha: Typical acceptance entropy factor
             eos_token_id: EOS token ID for stopping (None = no early stop)
+            candidate_scorer: Optional callback for custom candidate scoring.
+                Signature: (main_logits, medusa_logits, tree_candidates, context) -> scores
+                Where scores is [tree_len] tensor. If provided, candidates are re-ranked
+                by these scores before verification. The scorer can also implement:
+                - reset(): Called at start of generation
+                - on_tokens_accepted(tokens: List[int]): Called when tokens accepted
 
         Returns:
             Tuple of (generated_token_ids, stats)
@@ -1970,7 +1931,7 @@ class GemmaMedusaModel(nn.Module):
         is_cuda = self._device.type == "cuda"
 
         # Get cached tree buffers (avoids regeneration each call)
-        buffers = self._get_tree_buffers(topk, use_sparse_tree, use_heuristic_tree=use_heuristic_tree)
+        buffers = self._get_tree_buffers(tree_choices, topk)
         retrieve_indices = buffers["retrieve_indices"]
         max_speculation = retrieve_indices.shape[1] - 1
 
@@ -1985,6 +1946,13 @@ class GemmaMedusaModel(nn.Module):
         # Initialize tokens
         current_tokens = list(input_ids)
         num_generated = 0
+
+        # Use instance scorer if no explicit scorer provided
+        scorer = candidate_scorer or self._candidate_scorer
+
+        # Reset scorer state for new generation
+        if scorer is not None and hasattr(scorer, 'reset'):
+            scorer.reset()
 
         # Helper to run forward with autocast (CUDA optimized)
         def run_forward(tokens: List[int], return_medusa: bool = True, last_only: bool = True):
@@ -2018,6 +1986,18 @@ class GemmaMedusaModel(nn.Module):
                 last_main, last_medusa, buffers, topk, temperature
             )
 
+            # Apply custom scoring if scorer is provided
+            if scorer is not None:
+                # Call scorer: (main_logits, medusa_logits, tree_candidates, context) -> scores
+                custom_scores = scorer(
+                    last_main[0],  # [vocab_size]
+                    last_medusa[:, 0, :],  # [num_heads, vocab_size]
+                    tree_candidates,  # [tree_len]
+                    current_tokens,  # List[int]
+                )
+                # Store scores for potential use in evaluation (scorer can influence selection)
+                buffers["_custom_scores"] = custom_scores
+
             # Verify candidates with tree attention forward pass
             # Returns tree_logits directly to avoid expensive extraction
             tree_logits, ret_indices, valid_mask = run_forward_mtp(
@@ -2026,8 +2006,6 @@ class GemmaMedusaModel(nn.Module):
 
             stats.forward_passes += 1
             stats.total_proposed += max_speculation
-            if collect_timing:
-                timing["iterations"] = stats.forward_passes
 
             # Evaluate which candidates to accept (optimized, works on tree_logits directly)
             if temperature == 0.0:
@@ -2043,6 +2021,10 @@ class GemmaMedusaModel(nn.Module):
             # Accept tokens from the best candidate
             accepted_tokens = candidates[best_candidate, : accept_length + 1].tolist()
             stats.total_accepted += len(accepted_tokens)
+
+            # Notify scorer of accepted tokens
+            if scorer is not None and hasattr(scorer, 'on_tokens_accepted'):
+                scorer.on_tokens_accepted(accepted_tokens)
 
             # Add accepted tokens
             for token in accepted_tokens:
@@ -2075,13 +2057,12 @@ class GemmaMedusaModel(nn.Module):
         max_new_tokens: int = 100,
         temperature: float = 0.0,
         topk: int = 10,
-        use_sparse_tree: bool = False,
-        use_fixed_size_tree: bool = False,
-        use_heuristic_tree: bool = False,
+        tree_choices: Optional[List[Tuple[int, ...]]] = None,
         posterior_threshold: float = 0.09,
         posterior_alpha: float = 0.3,
         eos_token_id: Optional[int] = None,
         collect_timing: bool = False,
+        candidate_scorer: Optional[Callable] = None,
     ) -> Tuple[List[int], MTPStats]:
         """
         Generate tokens using MTP with KV caching for maximum speed.
@@ -2096,12 +2077,15 @@ class GemmaMedusaModel(nn.Module):
             max_new_tokens: Maximum new tokens to generate
             temperature: Sampling temperature (0.0 = greedy)
             topk: Number of top-k predictions per Medusa head
-            use_sparse_tree: Use smaller tree for faster speculation
-            use_fixed_size_tree: Use fixed 79-node tree for fair ablation comparison
-            use_heuristic_tree: Use heuristic trees instead of calibrated optimal trees
+            tree_choices: Tree structure for speculation. If None, uses optimal tree
+                         from checkpoint's head_acc.json. For manual override, pass
+                         DEFAULT_TREES[num_heads] or SPARSE_TREES[num_heads].
             posterior_threshold: Typical acceptance hard threshold
             posterior_alpha: Typical acceptance entropy factor
             eos_token_id: EOS token ID for stopping (None = no early stop)
+            collect_timing: Whether to collect detailed timing metrics
+            candidate_scorer: Optional callback for custom candidate scoring.
+                Signature: (main_logits, medusa_logits, tree_candidates, context) -> scores
 
         Returns:
             Tuple of (generated_token_ids, stats)
@@ -2114,7 +2098,7 @@ class GemmaMedusaModel(nn.Module):
         is_cuda = self._device.type == "cuda"
 
         # Get cached tree buffers
-        buffers = self._get_tree_buffers(topk, use_sparse_tree, use_fixed_size_tree, use_heuristic_tree)
+        buffers = self._get_tree_buffers(tree_choices, topk)
         retrieve_indices = buffers["retrieve_indices"]
         max_speculation = retrieve_indices.shape[1] - 1
 
@@ -2145,6 +2129,13 @@ class GemmaMedusaModel(nn.Module):
         # Initialize tokens
         current_tokens = list(input_ids)
         num_generated = 0
+
+        # Use instance scorer if no explicit scorer provided
+        scorer = candidate_scorer or self._candidate_scorer
+
+        # Reset scorer state for new generation
+        if scorer is not None and hasattr(scorer, 'reset'):
+            scorer.reset()
 
         # Process initial prompt and get KV cache
         input_tensor = torch.tensor([current_tokens], dtype=torch.long, device=self._device)
@@ -2185,6 +2176,17 @@ class GemmaMedusaModel(nn.Module):
             candidates, tree_candidates = self._generate_candidates(
                 last_main, last_medusa, buffers, topk, temperature
             )
+
+            # Apply custom scoring if scorer is provided
+            if scorer is not None:
+                custom_scores = scorer(
+                    last_main[0],  # [vocab_size]
+                    last_medusa[:, 0, :],  # [num_heads, vocab_size]
+                    tree_candidates,  # [tree_len]
+                    current_tokens,  # List[int]
+                )
+                buffers["_custom_scores"] = custom_scores
+
             if collect_timing:
                 if is_cuda:
                     torch.cuda.synchronize()
@@ -2236,6 +2238,10 @@ class GemmaMedusaModel(nn.Module):
             # Accept tokens from the best candidate
             accepted_tokens = candidates[best_candidate, : accept_length + 1].tolist()
             stats.total_accepted += len(accepted_tokens)
+
+            # Notify scorer of accepted tokens
+            if scorer is not None and hasattr(scorer, 'on_tokens_accepted'):
+                scorer.on_tokens_accepted(accepted_tokens)
 
             # Check for EOS and add accepted tokens
             should_stop = False

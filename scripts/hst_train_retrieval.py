@@ -7,7 +7,7 @@ It has its own learned embedding layer that captures token co-occurrence pattern
 Two-phase training:
 1. Phase 1 - Pretraining (1B tokens from FineWeb-Edu):
    - Extract (context_token_ids, next_token_id) pairs by sliding window
-   - Train the embedding layer + MLP-Mixer end-to-end
+   - Train the embedding layer + 3-layer MLP end-to-end
    - Loss: Cross-entropy with label smoothing (0.1)
 
 2. Phase 2 - Fine-tuning (100k samples from WildChat distillations):
@@ -105,22 +105,16 @@ def parse_args():
         help="Base model (used for tokenizer only)",
     )
     parser.add_argument(
-        "--embed-dim",
+        "--hidden-dim",
         type=int,
-        default=256,
-        help="Internal embedding dimension for retrieval module",
+        default=128,
+        help="Hidden dimension for 3-layer MLP",
     )
     parser.add_argument(
         "--context-window",
         type=int,
         default=4,
         help="Number of context tokens (K)",
-    )
-    parser.add_argument(
-        "--num-layers",
-        type=int,
-        default=2,
-        help="Number of MLP-Mixer layers",
     )
     parser.add_argument(
         "--svd-rank",
@@ -377,15 +371,13 @@ class WildChatDataset(IterableDataset):
 
 def create_retrieval_module(args, vocab_size: int):
     """Create and initialize the retrieval module."""
-    from nanochat.hst.retrieval import RetrievalMixer, load_svd_basis
+    from nanochat.hst.retrieval import RetrievalMLP, load_svd_basis
 
-    module = RetrievalMixer(
+    module = RetrievalMLP(
         vocab_size=vocab_size,
-        embed_dim=args.embed_dim,
+        hidden_dim=args.hidden_dim,
         context_window=args.context_window,
-        num_layers=args.num_layers,
         svd_rank=args.svd_rank,
-        input_mode="last_k",
     )
 
     # Load SVD to initialize the tied embedding (will be fine-tuned during training)
