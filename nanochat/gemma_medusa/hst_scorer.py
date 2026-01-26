@@ -477,7 +477,7 @@ class HSTScorer:
         retrieval_logits = self.retrieval_module(context_tensor)[0]  # [vocab_size]
 
         # Scale by beta weight - this determines how much retrieval influences selection
-        # Use a larger multiplier since we're adding to logits, not mixing probabilities
-        logit_boost = retrieval_logits * self.beta * 5.0  # Amplify effect
+        # Start with a gentle influence to avoid overwhelming MTP predictions
+        logit_boost = retrieval_logits * self.beta
 
         return logit_boost
