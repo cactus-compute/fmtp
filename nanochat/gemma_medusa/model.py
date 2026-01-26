@@ -1560,7 +1560,8 @@ class GemmaMedusaModel(nn.Module):
         buffers: Dict[str, torch.Tensor],
         topk: int = 10,
         temperature: float = 0.0,
-        logit_boost: Optional[torch.Tensor] = None,
+        retrieval_logits: Optional[torch.Tensor] = None,
+        retrieval_weight: float = 0.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate candidate token sequences from model predictions.
@@ -1572,7 +1573,8 @@ class GemmaMedusaModel(nn.Module):
             buffers: Tree attention buffers
             topk: Number of top-k predictions per head
             temperature: Sampling temperature (0.0 = greedy)
-            logit_boost: Optional (vocab_size,) tensor to add to logits before topk selection
+            retrieval_logits: Optional (vocab_size,) retrieval model logits for blending
+            retrieval_weight: Weight for retrieval (alpha in: (1-α)*medusa + α*retrieval)
 
         Returns:
             candidates: (num_candidates, max_depth) Candidate token sequences
@@ -1596,10 +1598,14 @@ class GemmaMedusaModel(nn.Module):
         required_topk = max(topk, (max_tree_idx + num_heads - 1) // num_heads)  # ceiling division
 
         # Get top-k from each Medusa head: (num_heads, required_topk)
-        # Apply logit boost if provided (from HST retrieval scoring)
+        # Blend with retrieval logits if provided: (1-α)*medusa + α*retrieval
         medusa_logits_for_topk = medusa_logits[:, 0, :]
-        if logit_boost is not None:
-            medusa_logits_for_topk = medusa_logits_for_topk + logit_boost.unsqueeze(0)
+        if retrieval_logits is not None and retrieval_weight > 0:
+            # Blend: new_logits = (1 - α) * medusa_logits + α * retrieval_logits
+            medusa_logits_for_topk = (
+                (1 - retrieval_weight) * medusa_logits_for_topk +
+                retrieval_weight * retrieval_logits.unsqueeze(0)
+            )
         medusa_topk = torch.topk(medusa_logits_for_topk, required_topk, dim=-1).indices
 
         # Build flat candidate array: [base_token, head0_topk, head1_topk, ...]
@@ -1987,16 +1993,19 @@ class GemmaMedusaModel(nn.Module):
         last_medusa = medusa_logits[:, :, 0, :]
 
         while num_generated < max_new_tokens:
-            # Get logit boost from scorer if available (influences candidate selection)
-            logit_boost = None
+            # Get retrieval logits for blending if scorer provides them
+            retrieval_logits = None
+            retrieval_weight = 0.0
             if scorer is not None:
-                get_boost_fn = getattr(scorer, 'get_logit_boost', None)
-                if get_boost_fn is not None:
-                    logit_boost = get_boost_fn(current_tokens)
+                get_retrieval_fn = getattr(scorer, 'get_retrieval_logits', None)
+                if get_retrieval_fn is not None:
+                    retrieval_logits = get_retrieval_fn(current_tokens)
+                    retrieval_weight = getattr(scorer, 'retrieval_blend_weight', 0.0)
 
             # Generate candidates (vectorized, fast)
             candidates, tree_candidates = self._generate_candidates(
-                last_main, last_medusa, buffers, topk, temperature, logit_boost
+                last_main, last_medusa, buffers, topk, temperature,
+                retrieval_logits, retrieval_weight
             )
 
             # Apply custom scoring if scorer is provided
@@ -2191,12 +2200,14 @@ class GemmaMedusaModel(nn.Module):
         last_medusa = medusa_logits[:, :, 0, :]
 
         while num_generated < max_new_tokens:
-            # Get logit boost from scorer if available (influences candidate selection)
-            logit_boost = None
+            # Get retrieval logits for blending if scorer provides them
+            retrieval_logits = None
+            retrieval_weight = 0.0
             if scorer is not None:
-                get_boost_fn = getattr(scorer, 'get_logit_boost', None)
-                if get_boost_fn is not None:
-                    logit_boost = get_boost_fn(current_tokens)
+                get_retrieval_fn = getattr(scorer, 'get_retrieval_logits', None)
+                if get_retrieval_fn is not None:
+                    retrieval_logits = get_retrieval_fn(current_tokens)
+                    retrieval_weight = getattr(scorer, 'retrieval_blend_weight', 0.0)
 
             # Generate candidates (vectorized, fast)
             if collect_timing and is_cuda:
@@ -2204,7 +2215,8 @@ class GemmaMedusaModel(nn.Module):
             if collect_timing:
                 t0 = time.perf_counter()
             candidates, tree_candidates = self._generate_candidates(
-                last_main, last_medusa, buffers, topk, temperature, logit_boost
+                last_main, last_medusa, buffers, topk, temperature,
+                retrieval_logits, retrieval_weight
             )
 
             # Apply custom scoring if scorer is provided

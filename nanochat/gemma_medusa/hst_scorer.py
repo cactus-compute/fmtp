@@ -448,22 +448,21 @@ class HSTScorer:
         self.suffix_matcher.append(token_ids)
 
     @torch.inference_mode()
-    def get_logit_boost(self, context_tokens: List[int]) -> torch.Tensor:
+    def get_retrieval_logits(self, context_tokens: List[int]) -> torch.Tensor:
         """
-        Get retrieval-based logit boost for candidate generation.
+        Get retrieval model logits for blending with MTP head logits.
 
-        This returns full vocabulary logits from the retrieval model that can be
-        added to MTP head logits before topk selection, effectively boosting
-        candidates that the retrieval model predicts are likely.
+        The caller should combine using:
+            blended = (1 - alpha) * medusa_logits + alpha * retrieval_logits
 
         Args:
             context_tokens: Current context token IDs
 
         Returns:
-            logit_boost: [vocab_size] Retrieval logits scaled by beta weight
+            retrieval_logits: [vocab_size] Raw retrieval model logits
         """
         if not self._enabled:
-            return torch.zeros(self.vocab_size, device=self.device)
+            return None
 
         # Use last K tokens for retrieval
         K = self.retrieval_context_window
@@ -473,11 +472,12 @@ class HSTScorer:
             [retrieval_context], device=self.device, dtype=torch.long
         )
 
-        # Get full vocab retrieval logits
+        # Get full vocab retrieval logits (raw, unscaled)
         retrieval_logits = self.retrieval_module(context_tensor)[0]  # [vocab_size]
 
-        # Scale by beta weight - this determines how much retrieval influences selection
-        # Start with a gentle influence to avoid overwhelming MTP predictions
-        logit_boost = retrieval_logits * self.beta
+        return retrieval_logits
 
-        return logit_boost
+    @property
+    def retrieval_blend_weight(self) -> float:
+        """Weight for blending retrieval into MTP logits (the 'alpha' in the formula)."""
+        return self.beta  # Use beta as the retrieval blend weight
