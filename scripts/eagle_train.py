@@ -290,7 +290,7 @@ def parse_args():
                         help="Warmdown start ratio")
     parser.add_argument("--num-iterations", type=int, default=-1,
                         help="Number of iterations (-1 = use num_epochs)")
-    parser.add_argument("--num-epochs", type=int, default=40,
+    parser.add_argument("--num-epochs", type=int, default=1,
                         help="Number of epochs")
     parser.add_argument("--num-steps", type=int, default=7,
                         help="Number of prediction steps per forward")
