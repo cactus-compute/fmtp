@@ -1560,6 +1560,7 @@ class GemmaMedusaModel(nn.Module):
         buffers: Dict[str, torch.Tensor],
         topk: int = 10,
         temperature: float = 0.0,
+        logit_boost: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate candidate token sequences from model predictions.
@@ -1571,6 +1572,7 @@ class GemmaMedusaModel(nn.Module):
             buffers: Tree attention buffers
             topk: Number of top-k predictions per head
             temperature: Sampling temperature (0.0 = greedy)
+            logit_boost: Optional (vocab_size,) tensor to add to logits before topk selection
 
         Returns:
             candidates: (num_candidates, max_depth) Candidate token sequences
@@ -1594,7 +1596,11 @@ class GemmaMedusaModel(nn.Module):
         required_topk = max(topk, (max_tree_idx + num_heads - 1) // num_heads)  # ceiling division
 
         # Get top-k from each Medusa head: (num_heads, required_topk)
-        medusa_topk = torch.topk(medusa_logits[:, 0, :], required_topk, dim=-1).indices
+        # Apply logit boost if provided (from HST retrieval scoring)
+        medusa_logits_for_topk = medusa_logits[:, 0, :]
+        if logit_boost is not None:
+            medusa_logits_for_topk = medusa_logits_for_topk + logit_boost.unsqueeze(0)
+        medusa_topk = torch.topk(medusa_logits_for_topk, required_topk, dim=-1).indices
 
         # Build flat candidate array: [base_token, head0_topk, head1_topk, ...]
         flat_candidates = torch.cat([base_token.unsqueeze(0), medusa_topk.view(-1)])
@@ -1981,9 +1987,16 @@ class GemmaMedusaModel(nn.Module):
         last_medusa = medusa_logits[:, :, 0, :]
 
         while num_generated < max_new_tokens:
+            # Get logit boost from scorer if available (influences candidate selection)
+            logit_boost = None
+            if scorer is not None:
+                get_boost_fn = getattr(scorer, 'get_logit_boost', None)
+                if get_boost_fn is not None:
+                    logit_boost = get_boost_fn(current_tokens)
+
             # Generate candidates (vectorized, fast)
             candidates, tree_candidates = self._generate_candidates(
-                last_main, last_medusa, buffers, topk, temperature
+                last_main, last_medusa, buffers, topk, temperature, logit_boost
             )
 
             # Apply custom scoring if scorer is provided
@@ -2178,13 +2191,20 @@ class GemmaMedusaModel(nn.Module):
         last_medusa = medusa_logits[:, :, 0, :]
 
         while num_generated < max_new_tokens:
+            # Get logit boost from scorer if available (influences candidate selection)
+            logit_boost = None
+            if scorer is not None:
+                get_boost_fn = getattr(scorer, 'get_logit_boost', None)
+                if get_boost_fn is not None:
+                    logit_boost = get_boost_fn(current_tokens)
+
             # Generate candidates (vectorized, fast)
             if collect_timing and is_cuda:
                 torch.cuda.synchronize()
             if collect_timing:
                 t0 = time.perf_counter()
             candidates, tree_candidates = self._generate_candidates(
-                last_main, last_medusa, buffers, topk, temperature
+                last_main, last_medusa, buffers, topk, temperature, logit_boost
             )
 
             # Apply custom scoring if scorer is provided

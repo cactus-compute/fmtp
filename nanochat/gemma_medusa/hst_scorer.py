@@ -446,3 +446,38 @@ class HSTScorer:
             token_ids: List of accepted token IDs
         """
         self.suffix_matcher.append(token_ids)
+
+    @torch.inference_mode()
+    def get_logit_boost(self, context_tokens: List[int]) -> torch.Tensor:
+        """
+        Get retrieval-based logit boost for candidate generation.
+
+        This returns full vocabulary logits from the retrieval model that can be
+        added to MTP head logits before topk selection, effectively boosting
+        candidates that the retrieval model predicts are likely.
+
+        Args:
+            context_tokens: Current context token IDs
+
+        Returns:
+            logit_boost: [vocab_size] Retrieval logits scaled by beta weight
+        """
+        if not self._enabled:
+            return torch.zeros(self.vocab_size, device=self.device)
+
+        # Use last K tokens for retrieval
+        K = self.retrieval_context_window
+        retrieval_context = context_tokens[-K:] if len(context_tokens) >= K else context_tokens
+
+        context_tensor = torch.tensor(
+            [retrieval_context], device=self.device, dtype=torch.long
+        )
+
+        # Get full vocab retrieval logits
+        retrieval_logits = self.retrieval_module(context_tensor)[0]  # [vocab_size]
+
+        # Scale by beta weight - this determines how much retrieval influences selection
+        # Use a larger multiplier since we're adding to logits, not mixing probabilities
+        logit_boost = retrieval_logits * self.beta * 5.0  # Amplify effect
+
+        return logit_boost
