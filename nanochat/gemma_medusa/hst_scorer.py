@@ -448,21 +448,28 @@ class HSTScorer:
         self.suffix_matcher.append(token_ids)
 
     @torch.inference_mode()
-    def get_retrieval_logits(self, context_tokens: List[int]) -> torch.Tensor:
+    def blend_medusa_logits(
+        self,
+        medusa_logits: torch.Tensor,
+        context_tokens: List[int],
+    ) -> torch.Tensor:
         """
-        Get retrieval model logits for blending with MTP head logits.
+        Blend Medusa logits with retrieval logits using convex combination.
 
-        The caller should combine using:
-            blended = (1 - alpha) * medusa_logits + alpha * retrieval_logits
+        This method encapsulates all HST-specific blending logic so the model
+        doesn't need to know about retrieval weights or blending formulas.
+
+        Formula: blended = (1 - β) * medusa_logits + β * retrieval_logits
 
         Args:
+            medusa_logits: [num_heads, vocab_size] or [num_heads, B, vocab_size] Medusa head logits
             context_tokens: Current context token IDs
 
         Returns:
-            retrieval_logits: [vocab_size] Raw retrieval model logits
+            blended_logits: Same shape as medusa_logits, with retrieval blended in
         """
-        if not self._enabled:
-            return None
+        if not self._enabled or self.beta <= 0:
+            return medusa_logits
 
         # Use last K tokens for retrieval
         K = self.retrieval_context_window
@@ -472,12 +479,16 @@ class HSTScorer:
             [retrieval_context], device=self.device, dtype=torch.long
         )
 
-        # Get full vocab retrieval logits (raw, unscaled)
+        # Get full vocab retrieval logits
         retrieval_logits = self.retrieval_module(context_tensor)[0]  # [vocab_size]
 
-        return retrieval_logits
+        # Handle different input shapes
+        # medusa_logits could be [num_heads, vocab_size] or [num_heads, B, vocab_size]
+        if medusa_logits.dim() == 2:
+            # [num_heads, vocab_size] - broadcast retrieval to all heads
+            blended = (1 - self.beta) * medusa_logits + self.beta * retrieval_logits.unsqueeze(0)
+        else:
+            # [num_heads, B, vocab_size] - broadcast retrieval to all heads and batches
+            blended = (1 - self.beta) * medusa_logits + self.beta * retrieval_logits.unsqueeze(0).unsqueeze(1)
 
-    @property
-    def retrieval_blend_weight(self) -> float:
-        """Weight for blending retrieval into MTP logits (the 'alpha' in the formula)."""
-        return self.beta  # Use beta as the retrieval blend weight
+        return blended
