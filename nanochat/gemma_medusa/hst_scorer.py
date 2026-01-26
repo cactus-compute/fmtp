@@ -70,6 +70,8 @@ class HSTScorer:
         score_threshold: float = 0.01,  # Minimum score to keep candidate
         # Blending mode
         blend_mode: str = "agreement",  # "convex" or "agreement"
+        # Rolling context mode
+        use_rolling_context: bool = True,  # Use speculative path in retrieval context
     ):
         """
         Initialize the HST scorer.
@@ -106,6 +108,7 @@ class HSTScorer:
         self.agreement_bonus = agreement_bonus
         self.score_threshold = score_threshold
         self.blend_mode = blend_mode
+        self.use_rolling_context = use_rolling_context
 
         # Context window for retrieval
         self.retrieval_context_window = retrieval_context_window
@@ -397,6 +400,8 @@ class HSTScorer:
         medusa_logits: torch.Tensor,
         tree_candidates: torch.Tensor,
         context_tokens: List[int],
+        use_rolling_context: Optional[bool] = None,
+        topk: int = 10,
     ) -> torch.Tensor:
         """
         Score tree candidates using HST hybrid scoring.
@@ -408,6 +413,8 @@ class HSTScorer:
             medusa_logits: [num_heads, vocab_size] Medusa head logits
             tree_candidates: [tree_len] Candidate tokens in tree structure
             context_tokens: List[int] Current context token IDs
+            use_rolling_context: If True, use speculative path in retrieval context
+            topk: Number of candidates per head (for parsing tree structure)
 
         Returns:
             scores: [tree_len] HST scores for each tree position
@@ -419,23 +426,65 @@ class HSTScorer:
         tree_len = tree_candidates.shape[0]
         num_heads = medusa_logits.shape[0]
 
-        # Get unique candidates for efficient scoring
-        unique_candidates = tree_candidates.unique()
+        # Use instance default if not overridden
+        if use_rolling_context is None:
+            use_rolling_context = self.use_rolling_context
 
-        # Score all unique candidates at root level (depth 0)
-        root_scores = self.score_candidates(
+        if not use_rolling_context:
+            # Simple mode: score all candidates with just committed context
+            unique_candidates = tree_candidates.unique()
+            root_scores = self.score_candidates(
+                main_logits,
+                unique_candidates,
+                context_tokens,
+                speculative_path=None,
+            )
+            score_lookup = torch.zeros(self.vocab_size, device=self.device)
+            score_lookup[unique_candidates] = root_scores
+            return score_lookup[tree_candidates]
+
+        # Rolling context mode: score each depth with speculative path
+        tree_scores = torch.zeros(tree_len, device=self.device)
+
+        # Position 0 is always root (base model prediction)
+        root_token = tree_candidates[0]
+        root_score = self.score_candidates(
             main_logits,
-            unique_candidates,
+            root_token.unsqueeze(0),
             context_tokens,
             speculative_path=None,
         )
+        tree_scores[0] = root_score[0]
 
-        # Build score lookup table
-        score_lookup = torch.zeros(self.vocab_size, device=self.device)
-        score_lookup[unique_candidates] = root_scores
+        # Score each depth level with appropriate speculative context
+        # Tree structure: [root, head0_k0...head0_k(topk-1), head1_k0..., ...]
+        for depth in range(num_heads):
+            start_idx = 1 + depth * topk
+            end_idx = min(start_idx + topk, tree_len)
 
-        # Map scores to tree positions
-        tree_scores = score_lookup[tree_candidates]
+            if start_idx >= tree_len:
+                break
+
+            depth_candidates = tree_candidates[start_idx:end_idx]
+            if len(depth_candidates) == 0:
+                continue
+
+            # Build speculative path: tokens from previous depths
+            # For simplicity, use the first (highest-scoring) candidate from each depth
+            spec_path = []
+            for d in range(depth):
+                d_start = 1 + d * topk
+                if d_start < tree_len:
+                    spec_path.append(int(tree_candidates[d_start].item()))
+
+            # Score candidates at this depth using rolling context
+            depth_scores = self.score_candidates(
+                medusa_logits[depth] if depth < num_heads else main_logits,
+                depth_candidates,
+                context_tokens,
+                speculative_path=spec_path if spec_path else None,
+            )
+            tree_scores[start_idx:end_idx] = depth_scores
 
         return tree_scores
 
