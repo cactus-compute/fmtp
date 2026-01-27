@@ -1361,6 +1361,166 @@ class GemmaMedusaModel(nn.Module):
 
         return main_loss, medusa_losses
 
+    @torch.compiler.disable  # Variable seq lengths cause excessive recompilations
+    def _compute_losses_chunked_kl(
+        self,
+        hidden_states: torch.Tensor,
+        targets: torch.Tensor,
+        loss_reduction: str = 'mean',
+        chunk_size: int = 128,
+        multi_layer_hidden: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Compute KL divergence losses for Medusa heads using base model's distribution as target.
+
+        Instead of CE loss against ground truth tokens, this computes KL divergence between
+        each Medusa head's output distribution and the base model's output distribution.
+        This is similar to how EAGLE trains its draft model.
+
+        Key insight: Medusa head k predicts token at position t+k+2, so we compare:
+        - Medusa head k's logits at position t
+        - Base model's logits at position t+k+1 (which predicts token at t+k+2)
+
+        Args:
+            hidden_states: (B, T, hidden_size) from transformer (final layer)
+            targets: (B, T) target token IDs (used only for loss mask from -1 positions)
+            loss_reduction: 'mean' or 'none'
+            chunk_size: Number of sequence positions to process at once
+            multi_layer_hidden: (B, T, 3*hidden_size) concatenated multi-layer hidden states.
+
+        Returns:
+            main_loss: scalar CE loss for main head (unchanged from CE mode)
+            medusa_losses: list of scalar KL losses for each Medusa head
+        """
+        B, T, hidden_size = hidden_states.shape
+        num_heads = len(self.medusa_heads)
+        lm_head = self.base_model.lm_head
+        device = hidden_states.device
+
+        # Apply multi-layer fusion if enabled (shared preprocessing for all heads)
+        if self.use_multi_layer and multi_layer_hidden is not None and self.multi_layer_fusion is not None:
+            head_input = self.multi_layer_fusion(multi_layer_hidden, hidden_states)  # (B, T, hidden_size)
+        else:
+            head_input = hidden_states
+
+        # Step 1: Compute base model logits for the full sequence (target distribution)
+        with torch.no_grad():
+            base_target_logits = lm_head(hidden_states)  # (B, T, vocab)
+
+        # Step 2: Compute ResBlocks for all heads (small memory: num_heads * B * T * hidden)
+        resblock_outputs = []
+        for head in self.medusa_heads:
+            x = head_input
+            for block in head.blocks:
+                x = block(x)
+            resblock_outputs.append(x)
+        stacked_resblock = torch.stack(resblock_outputs, dim=0)  # (num_heads, B, T, hidden)
+
+        # Step 2.5: Apply cross-head mixer if enabled
+        if self.use_head_mixer:
+            if self.mixer_type == "mlp" and self.head_mixer_fc1 is not None and self.head_mixer_fc2 is not None:
+                for layer_idx in range(len(self.head_mixer_fc1)):
+                    stacked_resblock = MedusaLoRAHeadWithMixer.apply_mixer(
+                        stacked_resblock,
+                        self.head_mixer_fc1[layer_idx],
+                        self.head_mixer_fc2[layer_idx],
+                        self.channel_mixer_fc[layer_idx],
+                    )
+            elif self.mixer_type == "attention" and self.head_attention is not None:
+                stacked_resblock = self.head_attention(stacked_resblock)
+                if self.channel_mixer_fc is not None:
+                    stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
+
+        # Step 3: Compute LoRA projections
+        stacked_lora_a = torch.stack([h.lora_A.weight for h in self.medusa_heads], dim=0)
+        stacked_lora_b = torch.stack([h.lora_B.weight for h in self.medusa_heads], dim=0)
+        scalings = torch.tensor([h.scaling for h in self.medusa_heads], device=device, dtype=self._dtype)
+
+        # lora_A: (num_heads, B, T, hidden) @ (num_heads, rank, hidden).T -> (num_heads, B, T, rank)
+        lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
+
+        # Step 4: Compute main CE loss (unchanged)
+        main_chunk_losses = []
+        total_valid = (targets != -1).sum()
+
+        for t_start in range(0, T, chunk_size):
+            t_end = min(t_start + chunk_size, T)
+            chunk_hidden = hidden_states[:, t_start:t_end, :]
+            chunk_logits = lm_head(chunk_hidden)
+            chunk_targets = targets[:, t_start:t_end]
+
+            chunk_loss = F.cross_entropy(
+                chunk_logits.reshape(-1, chunk_logits.shape[-1]),
+                chunk_targets.reshape(-1),
+                ignore_index=-1,
+                reduction='sum',
+            )
+            main_chunk_losses.append(chunk_loss)
+
+        if total_valid > 0:
+            main_loss = sum(main_chunk_losses) / total_valid
+        else:
+            main_loss = sum(main_chunk_losses)
+
+        # Step 5: Compute KL divergence loss for each Medusa head
+        # Head k predicts token at position t+k+2, so we need:
+        # - Medusa head k's logits at position t (predicting t+k+2)
+        # - Base model's logits at position t+k+1 (also predicting t+k+2)
+        medusa_losses = []
+        for k in range(num_heads):
+            shift = k + 1  # Base model shift: we compare against base logits at position t+shift
+            head_shift = k + 2  # Target token position shift (for mask)
+
+            if shift >= T or head_shift >= T:
+                medusa_losses.append(hidden_states.new_zeros((), requires_grad=True) * 0)
+                continue
+
+            # Effective sequence length for this head
+            T_eff = T - head_shift
+            head_kl_losses = []
+
+            # Create loss mask from targets (use shifted targets to know which positions are valid)
+            loss_mask = (targets[:, head_shift:] != -1).float()  # (B, T_eff)
+            head_valid = loss_mask.sum()
+
+            for t_start in range(0, T_eff, chunk_size):
+                t_end = min(t_start + chunk_size, T_eff)
+
+                # Get chunk of ResBlock output and LoRA-A output
+                chunk_resblock = stacked_resblock[k, :, t_start:t_end, :]  # (B, chunk, hidden)
+                chunk_lora_a = lora_a_out[k, :, t_start:t_end, :]  # (B, chunk, rank)
+
+                # Compute Medusa head logits for this chunk
+                chunk_base_logits = lm_head(chunk_resblock)
+                chunk_lora_delta = torch.einsum('btr,vr->btv', chunk_lora_a, stacked_lora_b[k]) * scalings[k]
+                chunk_medusa_logits = chunk_base_logits + chunk_lora_delta  # (B, chunk, vocab)
+
+                # Get target distribution from base model at shifted position
+                # Base model at position t+shift predicts token at t+shift+1 = t+k+2
+                chunk_target_logits = base_target_logits[:, t_start + shift:t_end + shift, :]  # (B, chunk, vocab)
+
+                # Get loss mask for this chunk
+                chunk_mask = loss_mask[:, t_start:t_end]  # (B, chunk)
+
+                # Compute KL divergence: -sum(p_target * log(p_medusa))
+                with torch.no_grad():
+                    chunk_target_p = F.softmax(chunk_target_logits, dim=-1)
+
+                chunk_log_p = F.log_softmax(chunk_medusa_logits.float(), dim=-1)
+
+                # KL loss for this chunk
+                chunk_kl = -torch.sum(chunk_target_p * chunk_log_p, dim=-1)  # (B, chunk)
+                chunk_kl_loss = (chunk_kl * chunk_mask).sum()
+                head_kl_losses.append(chunk_kl_loss)
+
+            # Compute mean loss for this head
+            if head_valid > 0:
+                medusa_losses.append(sum(head_kl_losses) / head_valid)
+            else:
+                medusa_losses.append(sum(head_kl_losses))
+
+        return main_loss, medusa_losses
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1370,6 +1530,7 @@ class GemmaMedusaModel(nn.Module):
         return_medusa: bool = False,
         last_only: bool = False,
         use_chunked_loss: bool = False,
+        use_kl_loss: bool = False,
         chunk_size: int = 128,
     ):
         """
@@ -1383,9 +1544,12 @@ class GemmaMedusaModel(nn.Module):
             return_medusa: Whether to return Medusa outputs
             last_only: If True, only compute logits for the last token position.
                        Use this during generation for efficiency.
-            use_chunked_loss: If True, compute losses in chunks to reduce memory.
+            use_chunked_loss: If True, compute CE losses in chunks to reduce memory.
                               Reduces peak memory from O(B*T*vocab) to O(B*chunk*vocab).
-            chunk_size: Sequence chunk size when use_chunked_loss=True.
+            use_kl_loss: If True, use KL divergence loss from base model's distribution
+                         instead of CE loss against ground truth tokens. This is similar
+                         to how EAGLE trains its draft model. Requires return_medusa=True.
+            chunk_size: Sequence chunk size when use_chunked_loss=True or use_kl_loss=True.
 
         Returns:
             If targets is None:
@@ -1407,8 +1571,13 @@ class GemmaMedusaModel(nn.Module):
             multi_layer_hidden = None
 
         # Use chunked loss computation for memory efficiency during training
-        if use_chunked_loss and targets is not None and return_medusa:
-            return self._compute_losses_chunked(hidden_states, targets, loss_reduction, chunk_size, multi_layer_hidden)
+        if targets is not None and return_medusa:
+            if use_kl_loss:
+                # KL divergence loss: distill from base model's distribution
+                return self._compute_losses_chunked_kl(hidden_states, targets, loss_reduction, chunk_size, multi_layer_hidden)
+            elif use_chunked_loss:
+                # Standard CE loss with chunking
+                return self._compute_losses_chunked(hidden_states, targets, loss_reduction, chunk_size, multi_layer_hidden)
 
         # Standard path: compute logits then losses
         main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa, last_only, multi_layer_hidden)

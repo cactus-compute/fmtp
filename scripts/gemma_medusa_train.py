@@ -331,6 +331,9 @@ if __name__ == "__main__":
                         help="Skip dataset filtering (use if data is pre-filtered)")
     parser.add_argument("--use-chunked-loss", action="store_true", default=True,
                         help="Compute loss in chunks to reduce memory (allows larger batch sizes)")
+    parser.add_argument("--use-kl-loss", action="store_true",
+                        help="Use KL divergence loss from base model's distribution instead of CE loss. "
+                             "Similar to EAGLE training - distills from base model rather than ground truth.")
     parser.add_argument("--chunk-size", type=int, default=128,
                         help="Chunk size for chunked loss computation (default: 128)")
 
@@ -416,8 +419,10 @@ if __name__ == "__main__":
     print0(f"Medusa parameters: {num_medusa_params:,}")
     print0(f"Trainable parameters: {trainable_params:,}")
     print0(f"Vocab size: {tokenizer.get_vocab_size()}")
-    if args.use_chunked_loss:
-        print0(f"Using chunked loss (chunk_size={args.chunk_size}) for memory efficiency")
+    if args.use_kl_loss:
+        print0(f"Using KL divergence loss (distilling from base model's distribution)")
+    elif args.use_chunked_loss:
+        print0(f"Using chunked CE loss (chunk_size={args.chunk_size}) for memory efficiency")
 
     # Optional torch.compile
     if args.compile:
@@ -592,7 +597,8 @@ if __name__ == "__main__":
                 with torch.no_grad(), autocast_ctx:
                     main_loss, head_losses = model(
                         val_inputs, val_targets, return_medusa=True,
-                        use_chunked_loss=args.use_chunked_loss, chunk_size=args.chunk_size
+                        use_chunked_loss=args.use_chunked_loss, use_kl_loss=args.use_kl_loss,
+                        chunk_size=args.chunk_size
                     )
                     total_loss = main_loss.clone()
                     for k, head_loss in enumerate(head_losses):
@@ -662,7 +668,8 @@ if __name__ == "__main__":
             with autocast_ctx:
                 main_loss, head_losses = model(
                     train_inputs, train_targets, return_medusa=True,
-                    use_chunked_loss=args.use_chunked_loss, chunk_size=args.chunk_size
+                    use_chunked_loss=args.use_chunked_loss, use_kl_loss=args.use_kl_loss,
+                    chunk_size=args.chunk_size
                 )
 
                 # Compute total loss with weighting
