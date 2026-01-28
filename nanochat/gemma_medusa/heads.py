@@ -4,7 +4,7 @@ Medusa head implementations for multi-token prediction.
 Contains all Medusa head variants:
 - MedusaResBlock: Residual block with SiLU activation
 - MedusaHead: Full projection head (hidden -> vocab)
-- MedusaLoRAHead: Low-rank adapter head (hidden -> rank -> vocab)
+- MedusaLoRAHead: Low-rank adapter head (hidden -> rank -> vocab), or ResBlock-only when lora_rank=0
 - MedusaLoRAHeadWithMixer: MedusaLoRAHead with cross-head MLP mixing
 - MedusaDeltaHead: Hidden-space delta head (reuses lm_head)
 - IndependentMedusaHead: Deprecated, use MedusaDeltaHead instead
@@ -40,41 +40,133 @@ class MedusaHead(nn.Module):
         return self.proj(x)
 
 
+def setup_medusa_head(
+    hidden_size: int,
+    vocab_size: int,
+    num_layers: int,
+    lora_rank: int,
+    lora_alpha: int | None = None,
+    zero_init_mlp: bool = False,
+) -> tuple[nn.ModuleList, nn.Linear | None, nn.Linear | None, float]:
+    """
+    Setup components for a Medusa head.
+
+    This is the common setup function that handles both LoRA and non-LoRA cases.
+
+    Args:
+        hidden_size: Hidden dimension of the model
+        vocab_size: Vocabulary size (only used if lora_rank > 0)
+        num_layers: Number of ResBlock layers
+        lora_rank: LoRA rank. If 0, no LoRA projections are created.
+        lora_alpha: LoRA alpha scaling (defaults to lora_rank)
+        zero_init_mlp: Whether to zero-init ResBlock weights
+
+    Returns:
+        blocks: ModuleList of ResBlocks
+        lora_A: LoRA down-projection (None if lora_rank == 0)
+        lora_B: LoRA up-projection (None if lora_rank == 0)
+        scaling: LoRA scaling factor (0.0 if lora_rank == 0)
+    """
+    blocks = nn.ModuleList([MedusaResBlock(hidden_size, zero_init=zero_init_mlp) for _ in range(num_layers)])
+
+    if lora_rank > 0:
+        alpha = lora_alpha if lora_alpha is not None else lora_rank
+        scaling = alpha / lora_rank
+        lora_A = nn.Linear(hidden_size, lora_rank, bias=False)
+        lora_B = nn.Linear(lora_rank, vocab_size, bias=False)
+        # Standard LoRA init: A gets default Kaiming, B gets zeros
+        nn.init.zeros_(lora_B.weight)
+    else:
+        scaling = 0.0
+        lora_A = None
+        lora_B = None
+
+    return blocks, lora_A, lora_B, scaling
+
+
+def apply_medusa_head(
+    x: torch.Tensor,
+    blocks: nn.ModuleList,
+    lora_A: nn.Linear | None,
+    lora_B: nn.Linear | None,
+    scaling: float,
+) -> torch.Tensor:
+    """
+    Apply a Medusa head to hidden states.
+
+    This is the common forward function that handles both LoRA and non-LoRA cases.
+
+    Args:
+        x: Input hidden states (B, T, hidden_size)
+        blocks: ResBlock modules
+        lora_A: LoRA down-projection (None if no LoRA)
+        lora_B: LoRA up-projection (None if no LoRA)
+        scaling: LoRA scaling factor
+
+    Returns:
+        If lora_rank > 0: LoRA delta to add to lm_head(x) - shape (B, T, vocab)
+        If lora_rank == 0: Transformed hidden states for lm_head - shape (B, T, hidden)
+    """
+    for block in blocks:
+        x = block(x)
+
+    if lora_A is not None and lora_B is not None:
+        # LoRA mode: return delta to add to lm_head output
+        return scaling * lora_B(lora_A(x))
+    else:
+        # No LoRA: return transformed hidden states (caller applies lm_head)
+        return x
+
+
 class MedusaLoRAHead(nn.Module):
     """
     Medusa head using LoRA adapter over the shared lm_head.
 
-    Instead of a full (vocab_size, n_embd) projection, uses:
-    - lora_A: (hidden_size -> rank) down-projection
-    - lora_B: (rank -> vocab_size) up-projection
+    When lora_rank > 0:
+        Uses low-rank adaptation:
+        - lora_A: (hidden_size -> rank) down-projection
+        - lora_B: (rank -> vocab_size) up-projection
+        Output = lm_head(ResBlocks(x)) + (alpha / rank) * lora_B(lora_A(ResBlocks(x)))
 
-    Output = lm_head(x) + (alpha / rank) * lora_B(lora_A(x))
+    When lora_rank == 0:
+        No LoRA projections, just ResBlocks:
+        Output = lm_head(ResBlocks(x))
+        This mode relies entirely on the shared lm_head for vocab projection.
 
     The alpha/rank scaling keeps the adapter contribution stable across different ranks.
     """
     def __init__(self, hidden_size, vocab_size, num_layers, lora_rank, lora_alpha=None, zero_init_mlp=False):
         super().__init__()
-        self.blocks = nn.ModuleList([MedusaResBlock(hidden_size, zero_init=zero_init_mlp) for _ in range(num_layers)])
+        self.blocks, self.lora_A, self.lora_B, self.scaling = setup_medusa_head(
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            num_layers=num_layers,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            zero_init_mlp=zero_init_mlp,
+        )
         self.lora_rank = lora_rank
-        self.lora_alpha = lora_alpha if lora_alpha is not None else lora_rank  # default: alpha = rank (scaling = 1)
-        self.scaling = self.lora_alpha / self.lora_rank
-        self.lora_A = nn.Linear(hidden_size, lora_rank, bias=False)
-        self.lora_B = nn.Linear(lora_rank, vocab_size, bias=False)
-        # Standard LoRA init: A gets default Kaiming, B gets zeros
-        # This ensures LoRA contribution starts at zero
-        nn.init.zeros_(self.lora_B.weight)
+        self.lora_alpha = lora_alpha if lora_alpha is not None else lora_rank
+
+    @property
+    def has_lora(self) -> bool:
+        """Returns True if this head has LoRA projections."""
+        return self.lora_rank > 0
 
     def forward(self, x):
         """
-        Compute LoRA delta for inference.
-        Returns the delta to be added to lm_head(x).
+        Apply the head to hidden states.
+
+        Returns:
+            If lora_rank > 0: LoRA delta to add to lm_head(x)
+            If lora_rank == 0: Transformed hidden states (caller applies lm_head)
         """
-        for block in self.blocks:
-            x = block(x)
-        return self.scaling * self.lora_B(self.lora_A(x))
+        return apply_medusa_head(x, self.blocks, self.lora_A, self.lora_B, self.scaling)
 
     def get_merged_weight(self, lm_head_weight):
         """Merge LoRA weights for fused CE: W_merged = W_base + scaling * B @ A"""
+        if not self.has_lora:
+            return lm_head_weight
         return lm_head_weight + self.scaling * (self.lora_B.weight @ self.lora_A.weight)
 
 

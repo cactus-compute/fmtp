@@ -16,3 +16,5 @@ wandb/
 vm_exec.sh
 docs/
 checkpoints/
+results/
+data/wildchat_100k.jsonl

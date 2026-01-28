@@ -24,6 +24,8 @@ from .heads import (
     IndependentMedusaHead,
     MultiLayerFusion,
     compute_multi_layer_indices,
+    setup_medusa_head,
+    apply_medusa_head,
 )
 from .hst_scorer import HSTScorer
 
@@ -44,12 +46,16 @@ __all__ = [
     "MedusaLoRAHeadWithMixer",
     "MedusaHeadAttention",
     "MedusaResBlock",
+    "MedusaResBlockOnlyHead",
     "MedusaHead",
     "MedusaDeltaHead",
     "IndependentMedusaHead",
     # Multi-layer fusion
     "MultiLayerFusion",
     "compute_multi_layer_indices",
+    # Head utilities
+    "setup_medusa_head",
+    "apply_medusa_head",
     # HST scoring
     "HSTScorer",
 ]

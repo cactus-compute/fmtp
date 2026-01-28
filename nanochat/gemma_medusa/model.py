@@ -731,7 +731,7 @@ class GemmaMedusaModel(nn.Module):
             self._multi_layer_indices = None
             self.multi_layer_fusion = None
 
-        # Create standard Medusa LoRA heads (same heads used with or without multi-layer)
+        # Create Medusa heads (MedusaLoRAHead handles both lora_rank > 0 and lora_rank == 0)
         self.medusa_heads = nn.ModuleList([
             MedusaLoRAHead(hidden_size, vocab_size, medusa_num_layers, lora_rank,
                           lora_alpha=self.lora_alpha, zero_init_mlp=zero_init_mlp)
@@ -946,7 +946,8 @@ class GemmaMedusaModel(nn.Module):
 
     def _cache_stacked_weights(self):
         """Pre-stack LoRA weights and scalings for efficient batched forward pass."""
-        if len(self.medusa_heads) == 0:
+        if len(self.medusa_heads) == 0 or self.lora_rank == 0:
+            # No LoRA weights to cache
             self._stacked_lora_a = None
             self._stacked_lora_b = None
             self._scalings = None
@@ -1127,53 +1128,57 @@ class GemmaMedusaModel(nn.Module):
                 if self.channel_mixer_fc is not None:
                     stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
-        # During training, stack weights fresh each forward to capture gradient updates
-        # During inference, use pre-cached weights for efficiency
-        if self.training:
-            stacked_lora_a = torch.stack([head.lora_A.weight for head in self.medusa_heads], dim=0)
-            stacked_lora_b = torch.stack([head.lora_B.weight for head in self.medusa_heads], dim=0)
-            scalings = torch.tensor([head.scaling for head in self.medusa_heads],
-                                    device=self._device, dtype=self._dtype)
-        else:
-            stacked_lora_a = self._stacked_lora_a
-            stacked_lora_b = self._stacked_lora_b
-            scalings = self._scalings
+        # Check if heads have LoRA (lora_rank > 0)
+        has_lora = self.lora_rank > 0
 
-        # lora_A projection: (num_heads, rank, hidden)
-        lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
+        if has_lora:
+            # During training, stack weights fresh each forward to capture gradient updates
+            # During inference, use pre-cached weights for efficiency
+            if self.training:
+                stacked_lora_a = torch.stack([head.lora_A.weight for head in self.medusa_heads], dim=0)
+                stacked_lora_b = torch.stack([head.lora_B.weight for head in self.medusa_heads], dim=0)
+                scalings = torch.tensor([head.scaling for head in self.medusa_heads],
+                                        device=self._device, dtype=self._dtype)
+            else:
+                stacked_lora_a = self._stacked_lora_a
+                stacked_lora_b = self._stacked_lora_b
+                scalings = self._scalings
 
-        # NaN/Inf detection after lora_A
-        if self.training:
-            if torch.isnan(lora_a_out).any():
-                print(f"[NaN DEBUG] NaN after lora_A projection!", flush=True)
-                print(f"[NaN DEBUG]   stacked_resblock has NaN: {torch.isnan(stacked_resblock).any()}", flush=True)
-                print(f"[NaN DEBUG]   stacked_lora_a has NaN: {torch.isnan(stacked_lora_a).any()}", flush=True)
-            if torch.isinf(lora_a_out).any():
-                print(f"[NaN DEBUG] Inf after lora_A projection! max={lora_a_out.max().item()}, min={lora_a_out.min().item()}", flush=True)
-            for i, head in enumerate(self.medusa_heads):
-                w_max = head.lora_A.weight.abs().max().item()
-                if w_max > 1e4:
-                    print(f"[NaN DEBUG]   head{i} lora_A weight max: {w_max:.4f} (LARGE!)", flush=True)
+            # lora_A projection: (num_heads, rank, hidden)
+            lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
 
-        # Step 3: Batched lora_B projection
-        # (num_heads, B, T, rank) @ (num_heads, vocab, rank).T -> (num_heads, B, T, vocab)
-        lora_deltas = torch.einsum('hbtr,hvr->hbtv', lora_a_out, stacked_lora_b)
+            # NaN/Inf detection after lora_A
+            if self.training:
+                if torch.isnan(lora_a_out).any():
+                    print(f"[NaN DEBUG] NaN after lora_A projection!", flush=True)
+                    print(f"[NaN DEBUG]   stacked_resblock has NaN: {torch.isnan(stacked_resblock).any()}", flush=True)
+                    print(f"[NaN DEBUG]   stacked_lora_a has NaN: {torch.isnan(stacked_lora_a).any()}", flush=True)
+                if torch.isinf(lora_a_out).any():
+                    print(f"[NaN DEBUG] Inf after lora_A projection! max={lora_a_out.max().item()}, min={lora_a_out.min().item()}", flush=True)
+                for i, head in enumerate(self.medusa_heads):
+                    w_max = head.lora_A.weight.abs().max().item()
+                    if w_max > 1e4:
+                        print(f"[NaN DEBUG]   head{i} lora_A weight max: {w_max:.4f} (LARGE!)", flush=True)
 
-        # NaN/Inf detection after lora_B
-        if self.training:
-            if torch.isnan(lora_deltas).any():
-                print(f"[NaN DEBUG] NaN after lora_B projection!", flush=True)
-                print(f"[NaN DEBUG]   lora_a_out has NaN: {torch.isnan(lora_a_out).any()}", flush=True)
-                print(f"[NaN DEBUG]   stacked_lora_b has NaN: {torch.isnan(stacked_lora_b).any()}", flush=True)
-            if torch.isinf(lora_deltas).any():
-                print(f"[NaN DEBUG] Inf after lora_B projection! max={lora_deltas.max().item()}, min={lora_deltas.min().item()}", flush=True)
-            for i, head in enumerate(self.medusa_heads):
-                w_max = head.lora_B.weight.abs().max().item()
-                if w_max > 1e4:
-                    print(f"[NaN DEBUG]   head{i} lora_B weight max: {w_max:.4f} (LARGE!)", flush=True)
+            # Step 3: Batched lora_B projection
+            # (num_heads, B, T, rank) @ (num_heads, vocab, rank).T -> (num_heads, B, T, vocab)
+            lora_deltas = torch.einsum('hbtr,hvr->hbtv', lora_a_out, stacked_lora_b)
 
-        # Step 4: Apply per-head scaling
-        lora_deltas = lora_deltas * scalings.view(num_heads, 1, 1, 1)
+            # NaN/Inf detection after lora_B
+            if self.training:
+                if torch.isnan(lora_deltas).any():
+                    print(f"[NaN DEBUG] NaN after lora_B projection!", flush=True)
+                    print(f"[NaN DEBUG]   lora_a_out has NaN: {torch.isnan(lora_a_out).any()}", flush=True)
+                    print(f"[NaN DEBUG]   stacked_lora_b has NaN: {torch.isnan(stacked_lora_b).any()}", flush=True)
+                if torch.isinf(lora_deltas).any():
+                    print(f"[NaN DEBUG] Inf after lora_B projection! max={lora_deltas.max().item()}, min={lora_deltas.min().item()}", flush=True)
+                for i, head in enumerate(self.medusa_heads):
+                    w_max = head.lora_B.weight.abs().max().item()
+                    if w_max > 1e4:
+                        print(f"[NaN DEBUG]   head{i} lora_B weight max: {w_max:.4f} (LARGE!)", flush=True)
+
+            # Step 4: Apply per-head scaling
+            lora_deltas = lora_deltas * scalings.view(num_heads, 1, 1, 1)
 
         # Step 5: Batched lm_head projection for main + all heads
         all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)  # (num_heads+1, B, T, hidden)
@@ -1189,7 +1194,11 @@ class GemmaMedusaModel(nn.Module):
                 print(f"[NaN DEBUG]   all_hiddens has Inf: {torch.isinf(all_hiddens).any()}", flush=True)
                 print(f"[NaN DEBUG]   lm_head weight max: {self.base_model.lm_head.weight.abs().max().item():.4f}", flush=True)
 
-        medusa_logits = base_logits[1:] + lora_deltas  # (num_heads, B, T, vocab)
+        # Compute Medusa logits: with LoRA add deltas, without LoRA just use lm_head output
+        if has_lora:
+            medusa_logits = base_logits[1:] + lora_deltas  # (num_heads, B, T, vocab)
+        else:
+            medusa_logits = base_logits[1:]  # (num_heads, B, T, vocab)
 
         # For ablation testing: slice to only use first N heads during inference
         effective_heads = self.medusa_num_heads
@@ -1265,14 +1274,16 @@ class GemmaMedusaModel(nn.Module):
                 if self.channel_mixer_fc is not None:
                     stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
-        # Step 2: Compute LoRA projections (small memory: num_heads * B * T * rank)
-        # Stack weights for batched computation
-        stacked_lora_a = torch.stack([h.lora_A.weight for h in self.medusa_heads], dim=0)
-        stacked_lora_b = torch.stack([h.lora_B.weight for h in self.medusa_heads], dim=0)
-        scalings = torch.tensor([h.scaling for h in self.medusa_heads], device=self._device, dtype=self._dtype)
+        # Step 2: Compute LoRA projections if lora_rank > 0
+        has_lora = self.lora_rank > 0
+        if has_lora:
+            # Stack weights for batched computation
+            stacked_lora_a = torch.stack([h.lora_A.weight for h in self.medusa_heads], dim=0)
+            stacked_lora_b = torch.stack([h.lora_B.weight for h in self.medusa_heads], dim=0)
+            scalings = torch.tensor([h.scaling for h in self.medusa_heads], device=self._device, dtype=self._dtype)
 
-        # lora_A: (num_heads, B, T, hidden) @ (num_heads, rank, hidden).T -> (num_heads, B, T, rank)
-        lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
+            # lora_A: (num_heads, B, T, hidden) @ (num_heads, rank, hidden).T -> (num_heads, B, T, rank)
+            lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
 
         # Step 3: Chunked loss computation
         # For main loss, we need full sequence. For medusa, we need shifted sequences.
@@ -1328,19 +1339,25 @@ class GemmaMedusaModel(nn.Module):
             for t_start in range(0, T_eff, chunk_size):
                 t_end = min(t_start + chunk_size, T_eff)
 
-                # Get chunk of ResBlock output and LoRA-A output
+                # Get chunk of ResBlock output
                 chunk_resblock = stacked_resblock[k, :, t_start:t_end, :]  # (B, chunk, hidden)
-                chunk_lora_a = lora_a_out[k, :, t_start:t_end, :]  # (B, chunk, rank)
 
                 # Compute lm_head(resblock) for this chunk
                 chunk_base_logits = lm_head(chunk_resblock)  # (B, chunk, vocab)
 
-                # Compute LoRA delta: lora_B(lora_a) * scaling
-                # (B, chunk, rank) @ (vocab, rank).T -> (B, chunk, vocab)
-                chunk_lora_delta = torch.einsum('btr,vr->btv', chunk_lora_a, stacked_lora_b[k]) * scalings[k]
+                if has_lora:
+                    # Get LoRA-A output for this chunk
+                    chunk_lora_a = lora_a_out[k, :, t_start:t_end, :]  # (B, chunk, rank)
 
-                # Full logits for this head
-                chunk_logits = chunk_base_logits + chunk_lora_delta  # (B, chunk, vocab)
+                    # Compute LoRA delta: lora_B(lora_a) * scaling
+                    # (B, chunk, rank) @ (vocab, rank).T -> (B, chunk, vocab)
+                    chunk_lora_delta = torch.einsum('btr,vr->btv', chunk_lora_a, stacked_lora_b[k]) * scalings[k]
+
+                    # Full logits for this head
+                    chunk_logits = chunk_base_logits + chunk_lora_delta  # (B, chunk, vocab)
+                else:
+                    # No LoRA: just use lm_head output
+                    chunk_logits = chunk_base_logits
 
                 # Targets are shifted
                 chunk_targets = targets[:, t_start + shift:t_end + shift]  # (B, chunk)
@@ -1431,13 +1448,15 @@ class GemmaMedusaModel(nn.Module):
                 if self.channel_mixer_fc is not None:
                     stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
-        # Step 3: Compute LoRA projections
-        stacked_lora_a = torch.stack([h.lora_A.weight for h in self.medusa_heads], dim=0)
-        stacked_lora_b = torch.stack([h.lora_B.weight for h in self.medusa_heads], dim=0)
-        scalings = torch.tensor([h.scaling for h in self.medusa_heads], device=device, dtype=self._dtype)
+        # Step 3: Compute LoRA projections if lora_rank > 0
+        has_lora = self.lora_rank > 0
+        if has_lora:
+            stacked_lora_a = torch.stack([h.lora_A.weight for h in self.medusa_heads], dim=0)
+            stacked_lora_b = torch.stack([h.lora_B.weight for h in self.medusa_heads], dim=0)
+            scalings = torch.tensor([h.scaling for h in self.medusa_heads], device=device, dtype=self._dtype)
 
-        # lora_A: (num_heads, B, T, hidden) @ (num_heads, rank, hidden).T -> (num_heads, B, T, rank)
-        lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
+            # lora_A: (num_heads, B, T, hidden) @ (num_heads, rank, hidden).T -> (num_heads, B, T, rank)
+            lora_a_out = torch.einsum('hbti,hri->hbtr', stacked_resblock, stacked_lora_a)
 
         # Step 4: Compute main CE loss (unchanged)
         main_chunk_losses = []
@@ -1486,14 +1505,20 @@ class GemmaMedusaModel(nn.Module):
             for t_start in range(0, T_eff, chunk_size):
                 t_end = min(t_start + chunk_size, T_eff)
 
-                # Get chunk of ResBlock output and LoRA-A output
+                # Get chunk of ResBlock output
                 chunk_resblock = stacked_resblock[k, :, t_start:t_end, :]  # (B, chunk, hidden)
-                chunk_lora_a = lora_a_out[k, :, t_start:t_end, :]  # (B, chunk, rank)
 
                 # Compute Medusa head logits for this chunk
                 chunk_base_logits = lm_head(chunk_resblock)
-                chunk_lora_delta = torch.einsum('btr,vr->btv', chunk_lora_a, stacked_lora_b[k]) * scalings[k]
-                chunk_medusa_logits = chunk_base_logits + chunk_lora_delta  # (B, chunk, vocab)
+
+                if has_lora:
+                    # Get LoRA-A output for this chunk
+                    chunk_lora_a = lora_a_out[k, :, t_start:t_end, :]  # (B, chunk, rank)
+                    chunk_lora_delta = torch.einsum('btr,vr->btv', chunk_lora_a, stacked_lora_b[k]) * scalings[k]
+                    chunk_medusa_logits = chunk_base_logits + chunk_lora_delta  # (B, chunk, vocab)
+                else:
+                    # No LoRA: just use lm_head output
+                    chunk_medusa_logits = chunk_base_logits
 
                 # Get target distribution from base model at shifted position
                 # Base model at position t+shift predicts token at t+shift+1 = t+k+2
@@ -2726,10 +2751,10 @@ class GemmaMedusaModel(nn.Module):
             # ResBlock linear weights -> Muon
             for block in head.blocks:
                 medusa_matrix_params.append(block.linear.weight)
-            # LoRA A and B -> AdamW (user requested LoRA uses AdamW, not Muon)
-            if hasattr(head, 'lora_A'):
+            # LoRA A and B -> AdamW (only if lora_rank > 0)
+            if head.lora_A is not None:
                 medusa_proj_params.append(head.lora_A.weight)
-            if hasattr(head, 'lora_B'):
+            if head.lora_B is not None:
                 medusa_proj_params.append(head.lora_B.weight)
 
         # Add mixer params (supports multiple stacked layers as ModuleLists)
