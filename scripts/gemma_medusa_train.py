@@ -299,8 +299,8 @@ if __name__ == "__main__":
                         help="Number of training epochs (used if num_iterations=-1)")
 
     # Optimization
-    parser.add_argument("--device-batch-size", type=int, default=4,
-                        help="Per-device batch size (4 works for A100-40GB with seq_len=1024)")
+    parser.add_argument("--device-batch-size", type=int, default=2,
+                        help="Per-device batch size (2 works for A100-40GB with seq_len=1024)")
     parser.add_argument("--total-batch-size", type=int, default=96,
                         help="Total batch size (examples) for gradient accumulation")
     parser.add_argument("--matrix-lr", type=float, default=0.01,
@@ -329,9 +329,9 @@ if __name__ == "__main__":
                         help="Path to validation data (optional)")
     parser.add_argument("--skip-filter", action="store_true",
                         help="Skip dataset filtering (use if data is pre-filtered)")
-    parser.add_argument("--use-chunked-loss", action="store_true", default=True,
+    parser.add_argument("--use-chunked-loss", action="store_true",
                         help="Compute loss in chunks to reduce memory (allows larger batch sizes)")
-    parser.add_argument("--use-kl-loss", action="store_true",
+    parser.add_argument("--use-kl-loss", action="store_true", default=True,
                         help="Use KL divergence loss from base model's distribution instead of CE loss. "
                              "Similar to EAGLE training - distills from base model rather than ground truth.")
     parser.add_argument("--chunk-size", type=int, default=128,
