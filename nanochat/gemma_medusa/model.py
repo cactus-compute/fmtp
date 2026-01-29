@@ -1539,36 +1539,33 @@ class GemmaMedusaModel(nn.Module):
                 chunk_mask = loss_mask[:, t_start:t_end]  # (B, chunk)
 
                 # Compute KL divergence: -sum(p_target * log(p_medusa))
-                with torch.no_grad():
-                    chunk_target_p = F.softmax(chunk_target_logits, dim=-1)
-
-                    # Apply top-p filtering if specified
-                    if kl_top_p is not None and kl_top_p < 1.0:
-                        # Sort probabilities in descending order
+                # Apply top-p filtering if specified
+                if kl_top_p is not None and kl_top_p < 1.0:
+                    with torch.no_grad():
+                        chunk_target_p = F.softmax(chunk_target_logits, dim=-1)
+                        # Sort target probs and get indices
                         sorted_probs, sorted_indices = torch.sort(chunk_target_p, dim=-1, descending=True)
                         cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
 
-                        # Create mask for tokens within top-p (include the token that crosses threshold)
-                        # Shift cumsum right so we include the token that crosses the threshold
-                        cumsum_shifted = torch.cat([
-                            torch.zeros_like(cumsum_probs[..., :1]),
-                            cumsum_probs[..., :-1]
-                        ], dim=-1)
+                        # Create mask: include token that crosses threshold
+                        cumsum_shifted = F.pad(cumsum_probs[..., :-1], (1, 0), value=0.0)
                         top_p_mask = cumsum_shifted < kl_top_p  # (B, chunk, vocab)
 
-                        # Zero out probabilities outside top-p
-                        sorted_probs_filtered = sorted_probs * top_p_mask.float()
+                        # Filter and renormalize target probs in sorted order
+                        sorted_probs_filtered = sorted_probs * top_p_mask
+                        sorted_probs_filtered = sorted_probs_filtered / (sorted_probs_filtered.sum(dim=-1, keepdim=True) + 1e-10)
 
-                        # Scatter back to original order
-                        chunk_target_p = torch.zeros_like(chunk_target_p).scatter_(-1, sorted_indices, sorted_probs_filtered)
+                    # Gather medusa log_probs in same sorted order (avoids expensive scatter)
+                    chunk_log_p = F.log_softmax(chunk_medusa_logits.float(), dim=-1)
+                    sorted_log_p = torch.gather(chunk_log_p, -1, sorted_indices)
 
-                        # Renormalize the distribution
-                        chunk_target_p = chunk_target_p / (chunk_target_p.sum(dim=-1, keepdim=True) + 1e-10)
-
-                chunk_log_p = F.log_softmax(chunk_medusa_logits.float(), dim=-1)
-
-                # KL loss for this chunk
-                chunk_kl = -torch.sum(chunk_target_p * chunk_log_p, dim=-1)  # (B, chunk)
+                    # KL in sorted space: -sum(p_filtered * log_p_sorted)
+                    chunk_kl = -torch.sum(sorted_probs_filtered * sorted_log_p, dim=-1)  # (B, chunk)
+                else:
+                    with torch.no_grad():
+                        chunk_target_p = F.softmax(chunk_target_logits, dim=-1)
+                    chunk_log_p = F.log_softmax(chunk_medusa_logits.float(), dim=-1)
+                    chunk_kl = -torch.sum(chunk_target_p * chunk_log_p, dim=-1)  # (B, chunk)
                 chunk_kl_loss = (chunk_kl * chunk_mask).sum()
                 head_kl_losses.append(chunk_kl_loss)
 
