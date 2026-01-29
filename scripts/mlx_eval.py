@@ -105,7 +105,7 @@ Complete this Python function:
 {code_prompt}"""
 
 
-def run_gsm8k_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int, use_speculation: bool):
+def run_gsm8k_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int, use_speculation: bool, spec_tokens: int = 2):
     """Run GSM8K evaluation."""
     task = GSM8K(subset="main", split="test")
 
@@ -132,11 +132,18 @@ def run_gsm8k_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int, use
         if use_speculation:
             input_ids = model.tokenizer.encode(prompt)
             start = time.perf_counter()
-            output_tokens, stats = model.generate_simple_speculation(
-                input_ids=input_ids,
-                max_new_tokens=max_tokens,
-                eos_token_id=model.tokenizer.eos_token_id,
-            )
+            if spec_tokens == 3:
+                output_tokens, stats = model.generate_simple_speculation_3tok(
+                    input_ids=input_ids,
+                    max_new_tokens=max_tokens,
+                    eos_token_id=model.tokenizer.eos_token_id,
+                )
+            else:
+                output_tokens, stats = model.generate_simple_speculation(
+                    input_ids=input_ids,
+                    max_new_tokens=max_tokens,
+                    eos_token_id=model.tokenizer.eos_token_id,
+                )
             elapsed = time.perf_counter() - start
             # Decode response (only new tokens)
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
@@ -197,7 +204,7 @@ def run_gsm8k_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int, use
     }
 
 
-def run_humaneval_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int, use_speculation: bool):
+def run_humaneval_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int, use_speculation: bool, spec_tokens: int = 2):
     """Run HumanEval evaluation."""
     task = HumanEval()
 
@@ -224,11 +231,18 @@ def run_humaneval_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int,
         if use_speculation:
             input_ids = model.tokenizer.encode(prompt)
             start = time.perf_counter()
-            output_tokens, stats = model.generate_simple_speculation(
-                input_ids=input_ids,
-                max_new_tokens=max_tokens,
-                eos_token_id=model.tokenizer.eos_token_id,
-            )
+            if spec_tokens == 3:
+                output_tokens, stats = model.generate_simple_speculation_3tok(
+                    input_ids=input_ids,
+                    max_new_tokens=max_tokens,
+                    eos_token_id=model.tokenizer.eos_token_id,
+                )
+            else:
+                output_tokens, stats = model.generate_simple_speculation(
+                    input_ids=input_ids,
+                    max_new_tokens=max_tokens,
+                    eos_token_id=model.tokenizer.eos_token_id,
+                )
             elapsed = time.perf_counter() - start
             # Decode response (only new tokens)
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
@@ -302,6 +316,8 @@ def main():
                         help="Medusa checkpoint path")
     parser.add_argument("--baseline-only", action="store_true", help="Only run baseline")
     parser.add_argument("--speculation-only", action="store_true", help="Only run speculation")
+    parser.add_argument("--spec-tokens", type=int, default=2, choices=[2, 3],
+                        help="Number of tokens to speculate (2 or 3)")
     args = parser.parse_args()
 
     # Expand checkpoint path
@@ -326,7 +342,7 @@ def main():
             r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=False)
             results.append(r)
         if run_speculation:
-            r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=True)
+            r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=args.spec_tokens)
             results.append(r)
 
     if args.task in ["humaneval", "both"]:
@@ -334,7 +350,7 @@ def main():
             r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=False)
             results.append(r)
         if run_speculation:
-            r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=True)
+            r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=args.spec_tokens)
             results.append(r)
 
     # Summary
