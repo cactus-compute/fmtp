@@ -28,6 +28,7 @@ def extract_program(completion):
     Handles various output formats:
     - Code wrapped in ```python ... ``` or ``` ... ``` blocks
     - Plain code without markdown blocks
+    - Code that ends with ``` (closing a block started in the prompt)
     - Extra text before/after code blocks
 
     Returns the first code block if found, otherwise returns the whole completion.
@@ -40,6 +41,13 @@ def extract_program(completion):
     if matches:
         # Return the first code block found
         return matches[0].strip()
+
+    # Check if the completion ends with ``` (closing a block started in prompt)
+    # This happens when the prompt already starts with ```python
+    if '```' in completion:
+        # Take everything before the first ```
+        code = completion.split('```')[0]
+        return code.rstrip()
 
     # No code blocks found, return the whole completion
     return completion.strip()
