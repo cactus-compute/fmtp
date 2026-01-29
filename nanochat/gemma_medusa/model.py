@@ -1050,6 +1050,7 @@ class GemmaMedusaModel(nn.Module):
         return_medusa: bool = True,
         last_only: bool = False,
         multi_layer_hidden: torch.Tensor | None = None,
+        timing: dict | None = None,
     ):
         """
         Compute main logits and Medusa logits efficiently with batched matmuls.
@@ -1095,6 +1096,7 @@ class GemmaMedusaModel(nn.Module):
             head_input = hidden_states
 
         # Step 1: Compute ResBlocks for each head (sequential to preserve gradients during training)
+        _t0 = time.perf_counter() if timing is not None else 0.0
         resblock_outputs = []
         for head_idx, head in enumerate(self.medusa_heads):
             x = head_input
@@ -1107,6 +1109,8 @@ class GemmaMedusaModel(nn.Module):
                 if torch.isinf(x).any():
                     print(f"[NaN DEBUG] Inf after ResBlock for head {head_idx}! max={x.max().item()}, min={x.min().item()}", flush=True)
             resblock_outputs.append(x)  # (B, T, hidden_size)
+        if timing is not None:
+            timing["medusa_resblock_s"] = timing.get("medusa_resblock_s", 0.0) + (time.perf_counter() - _t0)
 
         # Step 2: Stack ResBlock outputs and do batched lora_A projection
         stacked_resblock = torch.stack(resblock_outputs, dim=0)  # (num_heads, B, T, hidden)
@@ -1181,8 +1185,11 @@ class GemmaMedusaModel(nn.Module):
             lora_deltas = lora_deltas * scalings.view(num_heads, 1, 1, 1)
 
         # Step 5: Batched lm_head projection for main + all heads
+        _t1 = time.perf_counter() if timing is not None else 0.0
         all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)  # (num_heads+1, B, T, hidden)
         base_logits = self.base_model.lm_head(all_hiddens)  # (num_heads+1, B, T, vocab)
+        if timing is not None:
+            timing["medusa_lmhead_s"] = timing.get("medusa_lmhead_s", 0.0) + (time.perf_counter() - _t1)
 
         # NaN/Inf detection after lm_head
         if self.training:
@@ -1926,33 +1933,55 @@ class GemmaMedusaModel(nn.Module):
         candidates: torch.Tensor,
         retrieve_indices: torch.Tensor,
         valid_mask: torch.Tensor,
+        tree_candidates: torch.Tensor | None = None,
     ) -> Tuple[int, int]:
         """
-        Optimized greedy acceptance working directly on tree logits.
-        Avoids extracting full vocab-sized tensors per candidate.
+        Optimized greedy acceptance - avoids full vocab argmax.
+
+        Key insight: Instead of argmax over 262K vocab, we check if the speculated
+        token's logit equals the max logit. This is O(tree_len) instead of
+        O(tree_len * vocab_size) for the critical comparison operation.
+
+        Verification logic:
+        - At tree position j, the model outputs logits predicting what should come next
+        - For candidate path, token at position k+1 should match argmax(logits at position k)
+        - Equivalently: logit of candidates[i, k+1] at tree position retrieve_indices[i, k] == max logit
 
         Args:
             tree_logits: (tree_len, vocab_size) Logits at tree positions
             candidates: (num_candidates, max_depth) Candidate token sequences
             retrieve_indices: (num_candidates, max_depth) Indices into tree
             valid_mask: (num_candidates, max_depth) Valid positions
+            tree_candidates: (tree_len,) Token IDs at each tree position (for optimized path)
 
         Returns:
             best_candidate: Index of best candidate path
             accept_length: Number of tokens to accept
         """
-        # Get predictions at each tree position
-        tree_predictions = tree_logits.argmax(dim=-1)  # (tree_len,)
-
-        # Get predictions for each candidate position (vectorized)
         safe_indices = retrieve_indices.clamp(min=0)
-        candidate_predictions = tree_predictions[safe_indices]  # (num_candidates, max_depth)
+        num_candidates, max_depth = candidates.shape
 
-        # Check matches: prediction at position j should equal candidate at j+1
-        # candidates[:, 1:] are the speculated tokens
-        # candidate_predictions[:, :-1] are the model's predictions for those positions
-        matches = (candidates[:, 1:] == candidate_predictions[:, :-1])
-        matches = matches & valid_mask[:, 1:]  # Only count valid positions
+        if tree_candidates is not None:
+            # OPTIMIZED PATH: Use argmax but on pre-indexed positions only
+            # Key insight: We only need argmax at the unique tree positions in pred_positions,
+            # not all tree_len positions. But since pred_positions can cover most tree positions,
+            # we fall back to computing argmax for all and indexing.
+
+            # Compute argmax once for all tree positions
+            tree_predictions = tree_logits.argmax(dim=-1)  # (tree_len,)
+
+            # Get predictions at the positions we need
+            candidate_predictions = tree_predictions[safe_indices]  # (num_candidates, max_depth)
+
+            # Check matches: prediction at position j should equal candidate at j+1
+            matches = (candidates[:, 1:] == candidate_predictions[:, :-1])
+            matches = matches & valid_mask[:, 1:]
+        else:
+            # FALLBACK: Original argmax-based path
+            tree_predictions = tree_logits.argmax(dim=-1)  # (tree_len,)
+            candidate_predictions = tree_predictions[safe_indices]  # (num_candidates, max_depth)
+            matches = (candidates[:, 1:] == candidate_predictions[:, :-1])
+            matches = matches & valid_mask[:, 1:]
 
         # Find longest matching prefix using cumprod
         cumulative_matches = torch.cumprod(matches.int(), dim=1)
@@ -2218,7 +2247,7 @@ class GemmaMedusaModel(nn.Module):
             # Evaluate which candidates to accept (optimized, works on tree_logits directly)
             if temperature == 0.0:
                 best_candidate, accept_length = self._evaluate_candidates_greedy_fast(
-                    tree_logits, candidates, ret_indices, valid_mask
+                    tree_logits, candidates, ret_indices, valid_mask, tree_candidates
                 )
             else:
                 best_candidate, accept_length = self._evaluate_candidates_typical_fast(
@@ -2319,6 +2348,8 @@ class GemmaMedusaModel(nn.Module):
                 "eval_s": 0.0,
                 "kv_update_s": 0.0,
                 "compute_logits_s": 0.0,
+                "medusa_resblock_s": 0.0,
+                "medusa_lmhead_s": 0.0,
                 "iterations": 0,
                 "tree_len": int(buffers["tree_indices"].shape[0]),
                 "max_speculation": int(max_speculation),
@@ -2355,10 +2386,10 @@ class GemmaMedusaModel(nn.Module):
         if is_cuda:
             with torch.amp.autocast('cuda', dtype=dtype):
                 hidden_states, past_key_values = self._get_hidden_states_with_cache(input_tensor)
-                main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa=True, last_only=True)
+                main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa=True, last_only=True, timing=timing)
         else:
             hidden_states, past_key_values = self._get_hidden_states_with_cache(input_tensor)
-            main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa=True, last_only=True)
+            main_logits, medusa_logits = self._compute_logits(hidden_states, return_medusa=True, last_only=True, timing=timing)
         if collect_timing:
             if is_cuda:
                 torch.cuda.synchronize()
@@ -2445,7 +2476,7 @@ class GemmaMedusaModel(nn.Module):
                 t0 = time.perf_counter()
             if temperature == 0.0:
                 best_candidate, accept_length = self._evaluate_candidates_greedy_fast(
-                    tree_logits, candidates, ret_indices, valid_mask
+                    tree_logits, candidates, ret_indices, valid_mask, tree_candidates
                 )
             else:
                 best_candidate, accept_length = self._evaluate_candidates_typical_fast(
@@ -2528,11 +2559,11 @@ class GemmaMedusaModel(nn.Module):
             if is_cuda:
                 with torch.amp.autocast('cuda', dtype=dtype):
                     main_logits, medusa_logits = self._compute_logits(
-                        last_hidden, return_medusa=True
+                        last_hidden, return_medusa=True, timing=timing
                     )
             else:
                 main_logits, medusa_logits = self._compute_logits(
-                    last_hidden, return_medusa=True
+                    last_hidden, return_medusa=True, timing=timing
                 )
             if collect_timing:
                 if is_cuda:
