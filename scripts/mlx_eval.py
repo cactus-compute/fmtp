@@ -113,8 +113,7 @@ def run_gsm8k_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int, use
     total = 0
     total_tokens = 0
     total_time = 0.0
-    total_accepted = 0
-    total_proposed = 0
+    total_forward_passes = 0
 
     n_samples = min(n_samples, task.num_examples())
 
@@ -148,8 +147,7 @@ def run_gsm8k_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int, use
             # Decode response (only new tokens)
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
             n_tokens = len(output_tokens) - len(input_ids)
-            total_accepted += stats.total_accepted
-            total_proposed += stats.total_proposed
+            total_forward_passes += stats.forward_passes
         else:
             start = time.perf_counter()
             response, n_tokens, _ = model.generate_standard(
@@ -187,10 +185,8 @@ def run_gsm8k_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int, use
     print(f"  Total tokens: {total_tokens}")
     print(f"  Total time: {total_time:.2f}s")
     if use_speculation:
-        accept_rate = total_accepted / total_proposed if total_proposed > 0 else 0
-        avg_tok_iter = total_accepted / (total_proposed / 2) if total_proposed > 0 else 0
-        print(f"  Accept rate: {total_accepted}/{total_proposed} = {accept_rate*100:.1f}%")
-        print(f"  Avg tok/iter: {avg_tok_iter:.2f}")
+        mean_accepted = total_tokens / total_forward_passes if total_forward_passes > 0 else 0
+        print(f"  Mean accepted: {mean_accepted:.2f} tokens/iter")
 
     return {
         "task": "gsm8k",
@@ -212,8 +208,7 @@ def run_humaneval_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int,
     total = 0
     total_tokens = 0
     total_time = 0.0
-    total_accepted = 0
-    total_proposed = 0
+    total_forward_passes = 0
 
     n_samples = min(n_samples, task.num_examples())
 
@@ -247,8 +242,7 @@ def run_humaneval_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int,
             # Decode response (only new tokens)
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
             n_tokens = len(output_tokens) - len(input_ids)
-            total_accepted += stats.total_accepted
-            total_proposed += stats.total_proposed
+            total_forward_passes += stats.forward_passes
         else:
             start = time.perf_counter()
             response, n_tokens, _ = model.generate_standard(
@@ -288,10 +282,8 @@ def run_humaneval_eval(model: GemmaMedusaModel, n_samples: int, max_tokens: int,
     print(f"  Total tokens: {total_tokens}")
     print(f"  Total time: {total_time:.2f}s")
     if use_speculation:
-        accept_rate = total_accepted / total_proposed if total_proposed > 0 else 0
-        avg_tok_iter = total_accepted / (total_proposed / 2) if total_proposed > 0 else 0
-        print(f"  Accept rate: {total_accepted}/{total_proposed} = {accept_rate*100:.1f}%")
-        print(f"  Avg tok/iter: {avg_tok_iter:.2f}")
+        mean_accepted = total_tokens / total_forward_passes if total_forward_passes > 0 else 0
+        print(f"  Mean accepted: {mean_accepted:.2f} tokens/iter")
 
     return {
         "task": "humaneval",

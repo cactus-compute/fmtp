@@ -429,7 +429,8 @@ if __name__ == "__main__":
     print0(f"Trainable parameters: {trainable_params:,}")
     print0(f"Vocab size: {tokenizer.get_vocab_size()}")
     if args.use_kl_loss:
-        print0(f"Using KL divergence loss (distilling from base model's distribution)")
+        kl_top_p_str = f", top-p={args.kl_top_p}" if args.kl_top_p is not None else ""
+        print0(f"Using KL divergence loss (distilling from base model's distribution{kl_top_p_str})")
     elif args.use_chunked_loss:
         print0(f"Using chunked CE loss (chunk_size={args.chunk_size}) for memory efficiency")
 

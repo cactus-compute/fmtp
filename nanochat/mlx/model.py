@@ -290,6 +290,21 @@ def apply_rope_fused_qk_kernel(
 # Compiled Pure Functions for MTP
 # ============================================================================
 
+def trim_cache(cache: List, n_trim: int) -> None:
+    """
+    Efficiently trim the last n_trim tokens from all cache layers.
+
+    This is faster than the naive loop because it batches the slice operations.
+    """
+    for layer_cache in cache:
+        if layer_cache.keys is not None:
+            layer_cache.keys = layer_cache.keys[:, :, :-n_trim, :]
+            layer_cache.values = layer_cache.values[:, :, :-n_trim, :]
+            layer_cache.offset -= n_trim
+            if hasattr(layer_cache, '_idx'):
+                layer_cache._idx -= n_trim
+
+
 @mx.compile
 def _compiled_get_top2(logits: mx.array) -> Tuple[mx.array, mx.array]:
     """
@@ -435,34 +450,45 @@ def apply_rope_with_positions_kernel(
     return outputs[0]
 
 
+_TREE_MASK_CACHE: Dict[Tuple[int, int], mx.array] = {}
+
+
 def build_tree_attention_mask_mlx(
-    tree_attn_mask: mx.array,
+    tree_attn_mask_bool: mx.array,
     cache_len: int,
 ) -> mx.array:
     """
     Build full attention mask for tree verification with KV cache.
+
+    Uses caching to avoid repeated allocations for common cache lengths.
 
     The mask allows:
     - All tree positions to attend to all cached positions (causal wrt cache)
     - Tree positions to attend to ancestors according to tree_attn_mask
 
     Args:
-        tree_attn_mask: (1, 1, tree_len, tree_len) with 1 = attend, 0 = block
+        tree_attn_mask_bool: (1, 1, tree_len, tree_len) boolean mask (pre-converted)
         cache_len: Length of cached prefix
 
     Returns:
         full_mask: (1, 1, tree_len, cache_len + tree_len) boolean mask
     """
-    tree_len = tree_attn_mask.shape[-1]
+    tree_len = tree_attn_mask_bool.shape[-1]
 
-    # Cache part: all tree positions attend to all cache positions
-    cache_mask = mx.ones((1, 1, tree_len, cache_len), dtype=mx.bool_)
-
-    # Tree part: convert tree_attn_mask to boolean
-    tree_mask = tree_attn_mask > 0.5
+    # Check cache for pre-allocated ones mask of this size
+    cache_key = (tree_len, cache_len)
+    if cache_key not in _TREE_MASK_CACHE:
+        # Only cache for common sizes to avoid memory bloat
+        if cache_len <= 512:
+            _TREE_MASK_CACHE[cache_key] = mx.ones((1, 1, tree_len, cache_len), dtype=mx.bool_)
+            cache_mask = _TREE_MASK_CACHE[cache_key]
+        else:
+            cache_mask = mx.ones((1, 1, tree_len, cache_len), dtype=mx.bool_)
+    else:
+        cache_mask = _TREE_MASK_CACHE[cache_key]
 
     # Concatenate: [cache_mask | tree_mask]
-    full_mask = mx.concatenate([cache_mask, tree_mask], axis=-1)
+    full_mask = mx.concatenate([cache_mask, tree_attn_mask_bool], axis=-1)
 
     return full_mask
 
@@ -528,8 +554,11 @@ def generate_tree_buffers(
             node_idx = sorted_choices.index(partial_choice) + 1
             retrieve_indices[candidate_idx, depth + 1] = node_idx
 
+    # Pre-convert to boolean for faster mask building
+    tree_attn_mask_bool = mx.array(attn_mask[None, None, :, :] > 0.5)
+
     return {
-        "tree_attn_mask": mx.array(attn_mask[None, None, :, :]),  # (1, 1, tree_len, tree_len)
+        "tree_attn_mask": tree_attn_mask_bool,  # (1, 1, tree_len, tree_len) boolean
         "tree_indices": mx.array(tree_indices),
         "tree_position_ids": mx.array(position_ids),
         "retrieve_indices": mx.array(retrieve_indices),
@@ -1455,12 +1484,7 @@ class GemmaMedusaModel:
                 medusa_logits = new_medusa[:, :, 1:2, :]
             else:
                 # Only token1 accepted - trim the second token from cache
-                for layer_cache in cache:
-                    layer_cache.keys = layer_cache.keys[:, :, :-1, :]
-                    layer_cache.values = layer_cache.values[:, :, :-1, :]
-                    layer_cache.offset -= 1
-                    if hasattr(layer_cache, '_idx'):
-                        layer_cache._idx -= 1
+                trim_cache(cache, 1)
 
                 output_tokens.append(token1)
                 num_generated += 1
@@ -1573,12 +1597,7 @@ class GemmaMedusaModel:
 
             elif verified_token2 == token2:
                 # token1 and token2 accepted, token3 rejected - trim 1 from cache
-                for layer_cache in cache:
-                    layer_cache.keys = layer_cache.keys[:, :, :-1, :]
-                    layer_cache.values = layer_cache.values[:, :, :-1, :]
-                    layer_cache.offset -= 1
-                    if hasattr(layer_cache, '_idx'):
-                        layer_cache._idx -= 1
+                trim_cache(cache, 1)
 
                 output_tokens.extend([token1, token2])
                 num_generated += 2
@@ -1594,12 +1613,7 @@ class GemmaMedusaModel:
 
             else:
                 # Only token1 accepted - trim 2 from cache
-                for layer_cache in cache:
-                    layer_cache.keys = layer_cache.keys[:, :, :-2, :]
-                    layer_cache.values = layer_cache.values[:, :, :-2, :]
-                    layer_cache.offset -= 2
-                    if hasattr(layer_cache, '_idx'):
-                        layer_cache._idx -= 2
+                trim_cache(cache, 2)
 
                 output_tokens.append(token1)
                 num_generated += 1
