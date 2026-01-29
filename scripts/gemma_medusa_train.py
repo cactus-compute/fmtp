@@ -334,6 +334,10 @@ if __name__ == "__main__":
     parser.add_argument("--use-kl-loss", action="store_true", default=True,
                         help="Use KL divergence loss from base model's distribution instead of CE loss. "
                              "Similar to EAGLE training - distills from base model rather than ground truth.")
+    parser.add_argument("--kl-top-p", type=float, default=None,
+                        help="If set (requires --use-kl-loss), only train on tokens within the top-p "
+                             "cumulative probability mass of the target distribution. E.g., 0.9 trains "
+                             "only on the most likely tokens covering 90%% of probability mass.")
     parser.add_argument("--chunk-size", type=int, default=128,
                         help="Chunk size for chunked loss computation (default: 128)")
 
@@ -356,6 +360,11 @@ if __name__ == "__main__":
                         help="Resume from checkpoint directory")
 
     args = parser.parse_args()
+
+    # Validate --kl-top-p requires --use-kl-loss
+    if args.kl_top_p is not None and not args.use_kl_loss:
+        parser.error("--kl-top-p requires --use-kl-loss to be set")
+
     user_config = vars(args).copy()
 
     # -----------------------------------------------------------------------------
@@ -598,7 +607,7 @@ if __name__ == "__main__":
                     main_loss, head_losses = model(
                         val_inputs, val_targets, return_medusa=True,
                         use_chunked_loss=args.use_chunked_loss, use_kl_loss=args.use_kl_loss,
-                        chunk_size=args.chunk_size
+                        chunk_size=args.chunk_size, kl_top_p=args.kl_top_p
                     )
                     total_loss = main_loss.clone()
                     for k, head_loss in enumerate(head_losses):
@@ -669,7 +678,7 @@ if __name__ == "__main__":
                 main_loss, head_losses = model(
                     train_inputs, train_targets, return_medusa=True,
                     use_chunked_loss=args.use_chunked_loss, use_kl_loss=args.use_kl_loss,
-                    chunk_size=args.chunk_size
+                    chunk_size=args.chunk_size, kl_top_p=args.kl_top_p
                 )
 
                 # Compute total loss with weighting

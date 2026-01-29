@@ -1393,6 +1393,7 @@ class GemmaMedusaModel(nn.Module):
         loss_reduction: str = 'mean',
         chunk_size: int = 128,
         multi_layer_hidden: torch.Tensor | None = None,
+        kl_top_p: float | None = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Compute KL divergence losses for Medusa heads using base model's distribution as target.
@@ -1411,6 +1412,9 @@ class GemmaMedusaModel(nn.Module):
             loss_reduction: 'mean' or 'none'
             chunk_size: Number of sequence positions to process at once
             multi_layer_hidden: (B, T, 3*hidden_size) concatenated multi-layer hidden states.
+            kl_top_p: If set, only train on tokens in the top-p cumulative probability mass
+                      of the target distribution. Tokens outside top-p are zeroed out and
+                      the distribution is renormalized.
 
         Returns:
             main_loss: scalar CE loss for main head (unchanged from CE mode)
@@ -1538,6 +1542,29 @@ class GemmaMedusaModel(nn.Module):
                 with torch.no_grad():
                     chunk_target_p = F.softmax(chunk_target_logits, dim=-1)
 
+                    # Apply top-p filtering if specified
+                    if kl_top_p is not None and kl_top_p < 1.0:
+                        # Sort probabilities in descending order
+                        sorted_probs, sorted_indices = torch.sort(chunk_target_p, dim=-1, descending=True)
+                        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+
+                        # Create mask for tokens within top-p (include the token that crosses threshold)
+                        # Shift cumsum right so we include the token that crosses the threshold
+                        cumsum_shifted = torch.cat([
+                            torch.zeros_like(cumsum_probs[..., :1]),
+                            cumsum_probs[..., :-1]
+                        ], dim=-1)
+                        top_p_mask = cumsum_shifted < kl_top_p  # (B, chunk, vocab)
+
+                        # Zero out probabilities outside top-p
+                        sorted_probs_filtered = sorted_probs * top_p_mask.float()
+
+                        # Scatter back to original order
+                        chunk_target_p = torch.zeros_like(chunk_target_p).scatter_(-1, sorted_indices, sorted_probs_filtered)
+
+                        # Renormalize the distribution
+                        chunk_target_p = chunk_target_p / (chunk_target_p.sum(dim=-1, keepdim=True) + 1e-10)
+
                 chunk_log_p = F.log_softmax(chunk_medusa_logits.float(), dim=-1)
 
                 # KL loss for this chunk
@@ -1564,6 +1591,7 @@ class GemmaMedusaModel(nn.Module):
         use_chunked_loss: bool = False,
         use_kl_loss: bool = False,
         chunk_size: int = 128,
+        kl_top_p: float | None = None,
     ):
         """
         Forward pass with optional Medusa head computation.
@@ -1582,6 +1610,8 @@ class GemmaMedusaModel(nn.Module):
                          instead of CE loss against ground truth tokens. This is similar
                          to how EAGLE trains its draft model. Requires return_medusa=True.
             chunk_size: Sequence chunk size when use_chunked_loss=True or use_kl_loss=True.
+            kl_top_p: If set (requires use_kl_loss=True), only train on tokens in the top-p
+                      cumulative probability mass of the target distribution.
 
         Returns:
             If targets is None:
@@ -1606,7 +1636,7 @@ class GemmaMedusaModel(nn.Module):
         if targets is not None and return_medusa:
             if use_kl_loss:
                 # KL divergence loss: distill from base model's distribution
-                return self._compute_losses_chunked_kl(hidden_states, targets, loss_reduction, chunk_size, multi_layer_hidden)
+                return self._compute_losses_chunked_kl(hidden_states, targets, loss_reduction, chunk_size, multi_layer_hidden, kl_top_p)
             elif use_chunked_loss:
                 # Standard CE loss with chunking
                 return self._compute_losses_chunked(hidden_states, targets, loss_reduction, chunk_size, multi_layer_hidden)
