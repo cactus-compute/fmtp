@@ -454,6 +454,83 @@ def compute_multi_layer_indices(n_layers: int) -> list[int]:
 
     return [first_idx, middle_idx, last_idx]
 
+class MedusaFullLMHead(nn.Module):
+    """
+    Medusa head with a full, independently trained LM head (no LoRA).
+
+    Architecture:
+        input hidden states -> ResBlocks -> full_lm_head -> logits
+
+    This is a more expressive alternative to MedusaLoRAHead that uses a complete
+    copy of the base model's LM head instead of low-rank adaptation. The LM head
+    is initialized from the base model's weights and trained independently.
+
+    Benefits:
+    - More expressive than LoRA (full-rank updates)
+    - Each head has its own independent projection to vocab
+
+    Drawbacks:
+    - Much more parameters (hidden_size * vocab_size per head vs. lora_rank * (hidden_size + vocab_size))
+    - Slower training due to more parameters
+
+    Args:
+        hidden_size: Hidden dimension of the model
+        vocab_size: Vocabulary size
+        num_layers: Number of ResBlock layers
+        zero_init_mlp: Whether to zero-init ResBlock weights
+        base_lm_head_weight: Optional weight tensor to initialize the lm_head from
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        vocab_size: int,
+        num_layers: int,
+        zero_init_mlp: bool = False,
+        base_lm_head_weight: torch.Tensor | None = None,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+
+        # ResBlocks for feature transformation
+        self.blocks = nn.ModuleList([
+            MedusaResBlock(hidden_size, zero_init=zero_init_mlp)
+            for _ in range(num_layers)
+        ])
+
+        # Full LM head (vocab projection)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+        # Initialize from base model's LM head if provided
+        if base_lm_head_weight is not None:
+            self.lm_head.weight.data.copy_(base_lm_head_weight)
+
+        # For compatibility with code that checks for LoRA
+        self.lora_rank = 0
+        self.lora_A = None
+        self.lora_B = None
+        self.scaling = 0.0
+
+    @property
+    def has_lora(self) -> bool:
+        """Returns False - this head does not use LoRA."""
+        return False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the head to hidden states.
+
+        Args:
+            x: (B, T, hidden_size) input hidden states
+
+        Returns:
+            (B, T, vocab_size) logits (NOT a delta - these are the full logits)
+        """
+        for block in self.blocks:
+            x = block(x)
+        return self.lm_head(x)
+
+
 class MultiLayerFusion(nn.Module):
     """
     Preprocessor that fuses hidden states from multiple transformer layers.

@@ -1040,8 +1040,8 @@ class GemmaMedusaModel:
         # Get lm_head from base model
         lm_head = self.base_model.lm_head
 
-        if not return_medusa or len(self.medusa_heads) == 0:
-            # Just compute main logits
+        if not return_medusa or len(self.medusa_heads) == 0 or num_active_heads == 0:
+            # Just compute main logits (no Medusa heads)
             main_logits = lm_head(hidden_states)
             return main_logits, None
 
@@ -1189,6 +1189,7 @@ class GemmaMedusaModel:
         topk: int = 10,
         tree_choices: Optional[List[Tuple[int, ...]]] = None,
         eos_token_id: Optional[int] = None,
+        stop_token_ids: Optional[set] = None,
         use_tree_attention: bool = False,
         use_compiled: bool = True,
         num_active_heads: Optional[int] = None,
@@ -1206,7 +1207,8 @@ class GemmaMedusaModel:
             temperature: Sampling temperature (0.0 = greedy)
             topk: Number of top-k predictions per Medusa head
             tree_choices: Tree structure for speculation (None = default)
-            eos_token_id: EOS token ID for stopping
+            eos_token_id: EOS token ID for stopping (deprecated, use stop_token_ids)
+            stop_token_ids: Set of token IDs that should stop generation
             use_tree_attention: If True, use tree attention masking and cache compaction
                 to avoid re-processing. If False (default), use simpler re-processing
                 approach.
@@ -1218,8 +1220,28 @@ class GemmaMedusaModel:
         Returns:
             Tuple of (generated_token_ids, stats)
         """
+        # Build stop token set from both parameters for backwards compatibility
+        stop_tokens = set()
+        if stop_token_ids is not None:
+            stop_tokens.update(stop_token_ids)
+        if eos_token_id is not None:
+            stop_tokens.add(eos_token_id)
+
         if self.medusa_num_heads == 0:
             raise ValueError("Model has no Medusa heads - cannot use MTP generation")
+
+        # Check for sliding window attention - tree attention is incompatible
+        inner_model = self.base_model.model if hasattr(self.base_model, 'model') else self.base_model
+        has_sliding_window = False
+        if hasattr(inner_model, 'args'):
+            sliding_window = getattr(inner_model.args, 'sliding_window', None)
+            if sliding_window is not None and sliding_window > 0:
+                has_sliding_window = True
+
+        if use_tree_attention and has_sliding_window:
+            # Fall back to re-processing mode for models with sliding window attention
+            # because different layers have different cache sizes
+            use_tree_attention = False
 
         # Determine number of active heads
         active_heads = num_active_heads if num_active_heads is not None else self.medusa_num_heads
@@ -1267,14 +1289,18 @@ class GemmaMedusaModel:
 
         stats.forward_passes += 1  # Count prefill
 
-        # Track current cache length
-        cache_len = len(input_ids)
-
         # ===== DECODE PHASE =====
         # Extract buffers for compiled functions
         tree_indices = buffers["tree_indices"]
 
         while num_generated < max_new_tokens:
+            # Get cache length from layer 0 (used for mask building)
+            if cache[0].keys is not None:
+                mx.eval(cache[0].keys)
+                cache_len = cache[0].keys.shape[2]
+            else:
+                cache_len = 0
+
             # Generate candidate tree from current predictions
             if use_compiled and temperature == 0.0:
                 # Use compiled version (greedy only)
@@ -1350,9 +1376,6 @@ class GemmaMedusaModel:
 
                 # Compact cache: keep only accepted tree positions
                 self._compact_cache(cache, accepted_tree_positions, cache_len, tree_len)
-
-                # Update cache length
-                cache_len += num_accepted
             else:
                 # Trim cache: remove ALL tree tokens
                 for layer_cache in cache:
@@ -1362,7 +1385,7 @@ class GemmaMedusaModel:
             should_stop = False
             tokens_added = 0
             for token in accepted_tokens:
-                if eos_token_id is not None and token == eos_token_id:
+                if stop_tokens and token in stop_tokens:
                     should_stop = True
                     break
 
@@ -1414,6 +1437,7 @@ class GemmaMedusaModel:
         input_ids: List[int],
         max_new_tokens: int = 100,
         eos_token_id: Optional[int] = None,
+        stop_token_ids: Optional[set] = None,
     ) -> Tuple[List[int], MTPStats]:
         """
         Simple 2-token speculation: predict main + medusa[0], verify both, accept 1 or 2.
@@ -1425,11 +1449,19 @@ class GemmaMedusaModel:
         Args:
             input_ids: Initial prompt as list of token IDs
             max_new_tokens: Maximum new tokens to generate
-            eos_token_id: EOS token ID for stopping
+            eos_token_id: EOS token ID for stopping (deprecated, use stop_token_ids)
+            stop_token_ids: Set of token IDs that should stop generation
 
         Returns:
             Tuple of (generated_token_ids, stats)
         """
+        # Build stop token set from both parameters for backwards compatibility
+        stop_tokens = set()
+        if stop_token_ids is not None:
+            stop_tokens.update(stop_token_ids)
+        if eos_token_id is not None:
+            stop_tokens.add(eos_token_id)
+
         if self.medusa_num_heads == 0:
             raise ValueError("Model has no Medusa heads - cannot use speculation")
 
@@ -1453,8 +1485,8 @@ class GemmaMedusaModel:
             token1 = int(mx.argmax(main_logits[0, 0]).item())
             token2 = int(mx.argmax(medusa_logits[0, 0, 0]).item())
 
-            # Check EOS
-            if eos_token_id is not None and token1 == eos_token_id:
+            # Check stop tokens
+            if stop_tokens and token1 in stop_tokens:
                 break
 
             # Forward both tokens with standard causal attention
@@ -1470,14 +1502,18 @@ class GemmaMedusaModel:
             verified_token2 = int(mx.argmax(verify_logits[0, 0]).item())
 
             if verified_token2 == token2:
-                # Both accepted
+                # Check stop tokens before adding
+                if stop_tokens and token2 in stop_tokens:
+                    # token2 is stop - add both and stop
+                    output_tokens.extend([token1, token2])
+                    num_generated += 2
+                    total_accepted += 2
+                    break
+
+                # Both accepted, no stop token
                 output_tokens.extend([token1, token2])
                 num_generated += 2
                 total_accepted += 2
-
-                # Check EOS for token2
-                if eos_token_id is not None and token2 == eos_token_id:
-                    break
 
                 # Use logits from position 1 for next iteration
                 main_logits = verify_logits[:, 1:2, :]
@@ -1489,6 +1525,10 @@ class GemmaMedusaModel:
                 output_tokens.append(token1)
                 num_generated += 1
                 total_accepted += 1
+
+                # Check if the model wanted to generate a stop token after token1
+                if stop_tokens and verified_token2 in stop_tokens:
+                    break
 
                 # Use logits from position 0 for next iteration
                 main_logits = verify_logits[:, 0:1, :]
@@ -1509,6 +1549,7 @@ class GemmaMedusaModel:
         input_ids: List[int],
         max_new_tokens: int = 100,
         eos_token_id: Optional[int] = None,
+        stop_token_ids: Optional[set] = None,
     ) -> Tuple[List[int], MTPStats]:
         """
         Simple 3-token speculation using 1 head: predict main + top-2 from medusa[0].
@@ -1525,11 +1566,19 @@ class GemmaMedusaModel:
         Args:
             input_ids: Initial prompt as list of token IDs
             max_new_tokens: Maximum new tokens to generate
-            eos_token_id: EOS token ID for stopping
+            eos_token_id: EOS token ID for stopping (deprecated, use stop_token_ids)
+            stop_token_ids: Set of token IDs that should stop generation
 
         Returns:
             Tuple of (generated_token_ids, stats)
         """
+        # Build stop token set from both parameters for backwards compatibility
+        stop_tokens = set()
+        if stop_token_ids is not None:
+            stop_tokens.update(stop_token_ids)
+        if eos_token_id is not None:
+            stop_tokens.add(eos_token_id)
+
         if self.medusa_num_heads == 0:
             raise ValueError("Model has no Medusa heads - cannot use speculation")
 
@@ -1560,8 +1609,8 @@ class GemmaMedusaModel:
             token2 = int(token2_arr.item())
             token3 = int(token3_arr.item())
 
-            # Check EOS
-            if eos_token_id is not None and token1 == eos_token_id:
+            # Check stop tokens
+            if stop_tokens and token1 in stop_tokens:
                 break
 
             # Forward all 3 tokens with standard causal attention
@@ -1582,14 +1631,26 @@ class GemmaMedusaModel:
             total_proposed += 3
 
             if verified_token2 == token2 and verified_token3 == token3:
-                # All 3 accepted
+                # Check stop tokens before adding - don't add tokens after stop
+                if stop_tokens and token2 in stop_tokens:
+                    # token2 is stop - only add token1 and token2, discard token3
+                    output_tokens.extend([token1, token2])
+                    num_generated += 2
+                    total_accepted += 2
+                    trim_cache(cache, 1)  # Remove token3 from cache
+                    break
+
+                if stop_tokens and token3 in stop_tokens:
+                    # token3 is stop - add all 3 and stop
+                    output_tokens.extend([token1, token2, token3])
+                    num_generated += 3
+                    total_accepted += 3
+                    break
+
+                # All 3 accepted, no stop token
                 output_tokens.extend([token1, token2, token3])
                 num_generated += 3
                 total_accepted += 3
-
-                # Check EOS
-                if eos_token_id is not None and (token2 == eos_token_id or token3 == eos_token_id):
-                    break
 
                 # Use logits from position 2 for next iteration
                 main_logits = verify_logits[:, 2:3, :]
@@ -1603,8 +1664,8 @@ class GemmaMedusaModel:
                 num_generated += 2
                 total_accepted += 2
 
-                # Check EOS
-                if eos_token_id is not None and token2 == eos_token_id:
+                # Check stop - either token2 is stop, or model wants to generate stop after token2
+                if stop_tokens and (token2 in stop_tokens or verified_token3 in stop_tokens):
                     break
 
                 # Use logits from position 1 for next iteration
@@ -1619,6 +1680,11 @@ class GemmaMedusaModel:
                 num_generated += 1
                 total_accepted += 1
 
+                # Check if the model wanted to generate a stop token after token1
+                # (verified_token2 is what model actually predicts after token1)
+                if stop_tokens and verified_token2 in stop_tokens:
+                    break
+
                 # Use logits from position 0 for next iteration
                 main_logits = verify_logits[:, 0:1, :]
                 medusa_logits = new_medusa[:, :, 0:1, :]
@@ -1626,6 +1692,149 @@ class GemmaMedusaModel:
         stats = MTPStats(
             tokens_generated=num_generated,
             forward_passes=num_iterations + 1,  # +1 for prefill
+            total_proposed=total_proposed,
+            total_accepted=total_accepted,
+        )
+        return output_tokens, stats
+
+    def generate_depth2_speculation(
+        self,
+        input_ids: List[int],
+        max_new_tokens: int = 100,
+        eos_token_id: Optional[int] = None,
+        stop_token_ids: Optional[set] = None,
+    ) -> Tuple[List[int], MTPStats]:
+        """
+        Optimized 3-token speculation using 2 Medusa heads.
+
+        Uses head0 for position +1 and head1 for position +2.
+        This is more accurate than generate_simple_speculation_3tok which
+        uses only head0 for both positions.
+
+        Equivalent to tree structure [(0,), (0, 0)] but without tree overhead.
+
+        Args:
+            input_ids: Initial prompt as list of token IDs
+            max_new_tokens: Maximum new tokens to generate
+            eos_token_id: EOS token ID for stopping (deprecated, use stop_token_ids)
+            stop_token_ids: Set of token IDs that should stop generation
+
+        Returns:
+            Tuple of (generated_token_ids, stats)
+        """
+        # Build stop token set
+        stop_tokens = set()
+        if stop_token_ids is not None:
+            stop_tokens.update(stop_token_ids)
+        if eos_token_id is not None:
+            stop_tokens.add(eos_token_id)
+
+        if self.medusa_num_heads < 2:
+            raise ValueError("Need at least 2 Medusa heads for depth-2 speculation")
+
+        cache = self.base_model.make_cache()
+
+        # Prefill - need 2 heads
+        input_array = mx.array([input_ids], dtype=mx.int32)
+        h = self._get_hidden_states(input_array, cache=cache)
+        main_logits, medusa_logits = self._compute_logits(
+            h, return_medusa=True, last_only=True, num_active_heads=2
+        )
+        mx.eval(main_logits, medusa_logits)
+
+        output_tokens = list(input_ids)
+        num_generated = 0
+        num_iterations = 0
+        total_accepted = 0
+        total_proposed = 0
+
+        while num_generated < max_new_tokens:
+            # Get predictions:
+            # - token1: argmax of main model (position +0)
+            # - token2: argmax of head0 (position +1)
+            # - token3: argmax of head1 (position +2)
+            token1 = int(mx.argmax(main_logits[0, 0]).item())
+            token2 = int(mx.argmax(medusa_logits[0, 0, 0]).item())  # head0
+            token3 = int(mx.argmax(medusa_logits[1, 0, 0]).item())  # head1
+
+            # Check stop tokens
+            if stop_tokens and token1 in stop_tokens:
+                break
+
+            # Forward all 3 tokens
+            spec_input = mx.array([[token1, token2, token3]], dtype=mx.int32)
+            h = self._get_hidden_states(spec_input, cache=cache)
+            verify_logits, new_medusa = self._compute_logits(
+                h, return_medusa=True, last_only=False, num_active_heads=2
+            )
+            mx.eval(verify_logits, new_medusa)
+
+            # Verify:
+            # verify_logits[0, 0] predicts what should come after token1 -> should be token2
+            # verify_logits[0, 1] predicts what should come after token2 -> should be token3
+            verified_token2 = int(mx.argmax(verify_logits[0, 0]).item())
+            verified_token3 = int(mx.argmax(verify_logits[0, 1]).item())
+
+            num_iterations += 1
+            total_proposed += 3
+
+            if verified_token2 == token2 and verified_token3 == token3:
+                # Check stop tokens before adding
+                if stop_tokens and token2 in stop_tokens:
+                    output_tokens.extend([token1, token2])
+                    num_generated += 2
+                    total_accepted += 2
+                    trim_cache(cache, 1)
+                    break
+
+                if stop_tokens and token3 in stop_tokens:
+                    output_tokens.extend([token1, token2, token3])
+                    num_generated += 3
+                    total_accepted += 3
+                    break
+
+                # All 3 accepted
+                output_tokens.extend([token1, token2, token3])
+                num_generated += 3
+                total_accepted += 3
+
+                # Use logits from position 2 for next iteration
+                main_logits = verify_logits[:, 2:3, :]
+                medusa_logits = new_medusa[:, :, 2:3, :]
+
+            elif verified_token2 == token2:
+                # token1 and token2 accepted, token3 rejected
+                trim_cache(cache, 1)
+
+                output_tokens.extend([token1, token2])
+                num_generated += 2
+                total_accepted += 2
+
+                if stop_tokens and (token2 in stop_tokens or verified_token3 in stop_tokens):
+                    break
+
+                # Use logits from position 1
+                main_logits = verify_logits[:, 1:2, :]
+                medusa_logits = new_medusa[:, :, 1:2, :]
+
+            else:
+                # Only token1 accepted
+                trim_cache(cache, 2)
+
+                output_tokens.append(token1)
+                num_generated += 1
+                total_accepted += 1
+
+                if stop_tokens and verified_token2 in stop_tokens:
+                    break
+
+                # Use logits from position 0
+                main_logits = verify_logits[:, 0:1, :]
+                medusa_logits = new_medusa[:, :, 0:1, :]
+
+        stats = MTPStats(
+            tokens_generated=num_generated,
+            forward_passes=num_iterations + 1,
             total_proposed=total_proposed,
             total_accepted=total_accepted,
         )
@@ -1641,22 +1850,19 @@ class GemmaMedusaModel:
         """
         Compact KV cache after tree verification to keep only accepted path.
 
-        Uses gather operation to select and reorder cache entries. This is the
-        correct approach in MLX since slice assignment doesn't work as expected.
+        Uses concatenation to build the compacted cache (more reliable than gather
+        with MLX's lazy evaluation).
+
+        Note: Different layers may have different cache lengths (e.g., global attention
+        layers in Gemma). We use each layer's actual size to find where tree tokens are.
 
         Args:
             cache: List of layer caches
             accepted_tree_positions: Tree indices of accepted tokens (e.g., [0, 1, 11])
-            cache_len: Current cache length before tree tokens
+            cache_len: Current cache length before tree tokens (for layer 0)
             tree_len: Number of tree tokens added during verification
         """
         num_accepted = len(accepted_tree_positions)
-        final_len = cache_len + num_accepted
-
-        # Build gather indices: [0, 1, ..., cache_len-1, cache_len+pos0, cache_len+pos1, ...]
-        cache_indices = list(range(cache_len))
-        tree_indices = [cache_len + pos for pos in accepted_tree_positions]
-        keep_indices = mx.array(cache_indices + tree_indices)
 
         for layer_cache in cache:
             keys = layer_cache.keys
@@ -1665,12 +1871,39 @@ class GemmaMedusaModel:
             if keys is None:
                 continue
 
-            # Gather to compact: keys[:, :, keep_indices, :]
-            layer_cache.keys = keys[:, :, keep_indices, :]
-            layer_cache.values = values[:, :, keep_indices, :]
+            # Get this layer's actual cache length (may differ from cache_len for global attention layers)
+            layer_total_len = keys.shape[2]
+            layer_cache_len = layer_total_len - tree_len  # Tree tokens were appended at the end
 
-            # Update cache internal state
-            layer_cache.offset = final_len
+            # Extract prefix (original cache before tree tokens)
+            prefix_keys = keys[:, :, :layer_cache_len, :]
+            prefix_values = values[:, :, :layer_cache_len, :]
+
+            # Extract accepted tree positions and concatenate
+            layer_final_len = layer_cache_len + num_accepted
+            if num_accepted > 0:
+                accepted_keys = mx.concatenate([
+                    keys[:, :, layer_cache_len + pos:layer_cache_len + pos + 1, :]
+                    for pos in accepted_tree_positions
+                ], axis=2)
+                accepted_values = mx.concatenate([
+                    values[:, :, layer_cache_len + pos:layer_cache_len + pos + 1, :]
+                    for pos in accepted_tree_positions
+                ], axis=2)
+                layer_cache.keys = mx.concatenate([prefix_keys, accepted_keys], axis=2)
+                layer_cache.values = mx.concatenate([prefix_values, accepted_values], axis=2)
+            else:
+                layer_cache.keys = prefix_keys
+                layer_cache.values = prefix_values
+
+            # Update cache internal state (use layer-specific length)
+            layer_cache.offset = layer_final_len
             # For RotatingKVCache, also update _idx
             if hasattr(layer_cache, '_idx'):
-                layer_cache._idx = final_len
+                layer_cache._idx = layer_final_len
+
+        # Force evaluation of ALL layers to ensure cache state is fully updated
+        for layer_cache in cache:
+            if layer_cache.keys is not None:
+                mx.eval(layer_cache.keys, layer_cache.values)
+        print(f"DEBUG compact: expected={final_len}, actual={cache[0].keys.shape[2]}, offset={cache[0].offset}")

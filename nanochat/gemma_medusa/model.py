@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoConfig
 
 from .config import GemmaConfigWrapper, GemmaMedusaConfig
-from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaHeadAttention, MedusaResBlock
+from .heads import MedusaLoRAHead, MedusaLoRAHeadWithMixer, MedusaHeadAttention, MedusaResBlock, MedusaFullLMHead
 from nanochat.gemma_common.speculative import (
     build_tree_attention_mask,
     update_kv_cache_from_tree,
@@ -654,6 +654,7 @@ class GemmaMedusaModel(nn.Module):
         attn_num_layers: int = 1,  # Number of attention blocks for attention mixer
         causal_attn: bool = False,  # Use causal attention for attention mixer (default: bidirectional)
         use_multi_layer: bool = False,  # Use multi-layer hidden state fusion
+        use_full_lm: bool = False,  # Use full LM heads instead of LoRA (more params, more expressive)
     ):
         super().__init__()
         self.model_name = model_name
@@ -670,6 +671,7 @@ class GemmaMedusaModel(nn.Module):
         self.attn_num_layers = attn_num_layers
         self.causal_attn = causal_attn
         self.use_multi_layer = use_multi_layer
+        self.use_full_lm = use_full_lm
 
         # Determine device and dtype
         if device is None:
@@ -731,12 +733,25 @@ class GemmaMedusaModel(nn.Module):
             self._multi_layer_indices = None
             self.multi_layer_fusion = None
 
-        # Create Medusa heads (MedusaLoRAHead handles both lora_rank > 0 and lora_rank == 0)
-        self.medusa_heads = nn.ModuleList([
-            MedusaLoRAHead(hidden_size, vocab_size, medusa_num_layers, lora_rank,
-                          lora_alpha=self.lora_alpha, zero_init_mlp=zero_init_mlp)
-            for _ in range(medusa_num_heads)
-        ])
+        # Create Medusa heads
+        if use_full_lm:
+            # Full LM heads: each head has its own complete lm_head, initialized from base model
+            base_lm_weight = self.base_model.lm_head.weight.data.clone()
+            self.medusa_heads = nn.ModuleList([
+                MedusaFullLMHead(
+                    hidden_size, vocab_size, medusa_num_layers,
+                    zero_init_mlp=zero_init_mlp,
+                    base_lm_head_weight=base_lm_weight,
+                )
+                for _ in range(medusa_num_heads)
+            ])
+        else:
+            # LoRA heads (MedusaLoRAHead handles both lora_rank > 0 and lora_rank == 0)
+            self.medusa_heads = nn.ModuleList([
+                MedusaLoRAHead(hidden_size, vocab_size, medusa_num_layers, lora_rank,
+                              lora_alpha=self.lora_alpha, zero_init_mlp=zero_init_mlp)
+                for _ in range(medusa_num_heads)
+            ])
         # Move heads to device and dtype
         self.medusa_heads = self.medusa_heads.to(device=device, dtype=dtype)
 
@@ -945,21 +960,38 @@ class GemmaMedusaModel(nn.Module):
         return warnings
 
     def _cache_stacked_weights(self):
-        """Pre-stack LoRA weights and scalings for efficient batched forward pass."""
-        if len(self.medusa_heads) == 0 or self.lora_rank == 0:
-            # No LoRA weights to cache
+        """Pre-stack LoRA or full LM weights for efficient batched forward pass."""
+        if len(self.medusa_heads) == 0:
             self._stacked_lora_a = None
             self._stacked_lora_b = None
             self._scalings = None
+            self._stacked_full_lm_weights = None
             return
 
-        # Stack lora_A weights: (num_heads, rank, hidden)
-        self._stacked_lora_a = torch.stack([head.lora_A.weight for head in self.medusa_heads], dim=0)
-        # Stack lora_B weights: (num_heads, vocab, rank)
-        self._stacked_lora_b = torch.stack([head.lora_B.weight for head in self.medusa_heads], dim=0)
-        # Pre-compute scalings tensor: (num_heads,)
-        self._scalings = torch.tensor([head.scaling for head in self.medusa_heads],
-                                      device=self._device, dtype=self._dtype)
+        if self.use_full_lm:
+            # Full LM mode: cache stacked lm_head weights
+            self._stacked_full_lm_weights = torch.stack(
+                [head.lm_head.weight for head in self.medusa_heads], dim=0
+            )
+            self._stacked_lora_a = None
+            self._stacked_lora_b = None
+            self._scalings = None
+        elif self.lora_rank > 0:
+            # LoRA mode: cache LoRA weights
+            # Stack lora_A weights: (num_heads, rank, hidden)
+            self._stacked_lora_a = torch.stack([head.lora_A.weight for head in self.medusa_heads], dim=0)
+            # Stack lora_B weights: (num_heads, vocab, rank)
+            self._stacked_lora_b = torch.stack([head.lora_B.weight for head in self.medusa_heads], dim=0)
+            # Pre-compute scalings tensor: (num_heads,)
+            self._scalings = torch.tensor([head.scaling for head in self.medusa_heads],
+                                          device=self._device, dtype=self._dtype)
+            self._stacked_full_lm_weights = None
+        else:
+            # No LoRA, no full LM
+            self._stacked_lora_a = None
+            self._stacked_lora_b = None
+            self._scalings = None
+            self._stacked_full_lm_weights = None
 
     def _get_hidden_states(
         self, input_ids: torch.Tensor
@@ -1132,10 +1164,41 @@ class GemmaMedusaModel(nn.Module):
                 if self.channel_mixer_fc is not None:
                     stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
-        # Check if heads have LoRA (lora_rank > 0)
-        has_lora = self.lora_rank > 0
+        # Check if using full LM heads or LoRA
+        has_lora = self.lora_rank > 0 and not self.use_full_lm
 
-        if has_lora:
+        if self.use_full_lm:
+            # Full LM heads: each head has its own lm_head, use them directly
+            _t1 = time.perf_counter() if timing is not None else 0.0
+
+            # Main logits from base model's lm_head
+            main_logits = self.base_model.lm_head(hidden_states)  # (B, T, vocab)
+
+            # Each head applies its own lm_head to the resblock output
+            # Stack the lm_head weights for batched matmul
+            if self.training:
+                stacked_lm_weights = torch.stack([head.lm_head.weight for head in self.medusa_heads], dim=0)
+            else:
+                # Use cached weights for inference if available
+                if not hasattr(self, '_stacked_full_lm_weights') or self._stacked_full_lm_weights is None:
+                    self._stacked_full_lm_weights = torch.stack([head.lm_head.weight for head in self.medusa_heads], dim=0)
+                stacked_lm_weights = self._stacked_full_lm_weights
+
+            # Batched projection: (num_heads, B, T, hidden) @ (num_heads, vocab, hidden).T -> (num_heads, B, T, vocab)
+            medusa_logits = torch.einsum('hbti,hvi->hbtv', stacked_resblock, stacked_lm_weights)
+
+            if timing is not None:
+                timing["medusa_lmhead_s"] = timing.get("medusa_lmhead_s", 0.0) + (time.perf_counter() - _t1)
+
+            # NaN/Inf detection
+            if self.training:
+                if torch.isnan(medusa_logits).any():
+                    print(f"[NaN DEBUG] NaN after full LM head projection!", flush=True)
+                if torch.isinf(medusa_logits).any():
+                    print(f"[NaN DEBUG] Inf after full LM head projection! max={medusa_logits.max().item()}", flush=True)
+
+        elif has_lora:
+            # LoRA mode: compute deltas and add to base lm_head output
             # During training, stack weights fresh each forward to capture gradient updates
             # During inference, use pre-cached weights for efficiency
             if self.training:
@@ -1184,27 +1247,36 @@ class GemmaMedusaModel(nn.Module):
             # Step 4: Apply per-head scaling
             lora_deltas = lora_deltas * scalings.view(num_heads, 1, 1, 1)
 
-        # Step 5: Batched lm_head projection for main + all heads
-        _t1 = time.perf_counter() if timing is not None else 0.0
-        all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)  # (num_heads+1, B, T, hidden)
-        base_logits = self.base_model.lm_head(all_hiddens)  # (num_heads+1, B, T, vocab)
-        if timing is not None:
-            timing["medusa_lmhead_s"] = timing.get("medusa_lmhead_s", 0.0) + (time.perf_counter() - _t1)
+            # Step 5: Batched lm_head projection for main + all heads
+            _t1 = time.perf_counter() if timing is not None else 0.0
+            all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)  # (num_heads+1, B, T, hidden)
+            base_logits = self.base_model.lm_head(all_hiddens)  # (num_heads+1, B, T, vocab)
+            if timing is not None:
+                timing["medusa_lmhead_s"] = timing.get("medusa_lmhead_s", 0.0) + (time.perf_counter() - _t1)
 
-        # NaN/Inf detection after lm_head
-        if self.training:
-            if torch.isnan(base_logits).any():
-                print(f"[NaN DEBUG] NaN after lm_head projection!", flush=True)
-                print(f"[NaN DEBUG]   all_hiddens has NaN: {torch.isnan(all_hiddens).any()}", flush=True)
-            if torch.isinf(base_logits).any():
-                print(f"[NaN DEBUG] Inf after lm_head projection! max={base_logits.max().item()}, min={base_logits.min().item()}", flush=True)
-                print(f"[NaN DEBUG]   all_hiddens has Inf: {torch.isinf(all_hiddens).any()}", flush=True)
-                print(f"[NaN DEBUG]   lm_head weight max: {self.base_model.lm_head.weight.abs().max().item():.4f}", flush=True)
+            # NaN/Inf detection after lm_head
+            if self.training:
+                if torch.isnan(base_logits).any():
+                    print(f"[NaN DEBUG] NaN after lm_head projection!", flush=True)
+                    print(f"[NaN DEBUG]   all_hiddens has NaN: {torch.isnan(all_hiddens).any()}", flush=True)
+                if torch.isinf(base_logits).any():
+                    print(f"[NaN DEBUG] Inf after lm_head projection! max={base_logits.max().item()}, min={base_logits.min().item()}", flush=True)
+                    print(f"[NaN DEBUG]   all_hiddens has Inf: {torch.isinf(all_hiddens).any()}", flush=True)
+                    print(f"[NaN DEBUG]   lm_head weight max: {self.base_model.lm_head.weight.abs().max().item():.4f}", flush=True)
 
-        # Compute Medusa logits: with LoRA add deltas, without LoRA just use lm_head output
-        if has_lora:
+            # Compute Medusa logits: add LoRA deltas to base lm_head output
+            main_logits = base_logits[0]
             medusa_logits = base_logits[1:] + lora_deltas  # (num_heads, B, T, vocab)
+
         else:
+            # No LoRA, no full LM: just use shared lm_head for all
+            _t1 = time.perf_counter() if timing is not None else 0.0
+            all_hiddens = torch.cat([hidden_states.unsqueeze(0), stacked_resblock], dim=0)  # (num_heads+1, B, T, hidden)
+            base_logits = self.base_model.lm_head(all_hiddens)  # (num_heads+1, B, T, vocab)
+            if timing is not None:
+                timing["medusa_lmhead_s"] = timing.get("medusa_lmhead_s", 0.0) + (time.perf_counter() - _t1)
+
+            main_logits = base_logits[0]
             medusa_logits = base_logits[1:]  # (num_heads, B, T, vocab)
 
         # For ablation testing: slice to only use first N heads during inference
@@ -1212,7 +1284,7 @@ class GemmaMedusaModel(nn.Module):
         if effective_heads < num_heads:
             medusa_logits = medusa_logits[:effective_heads]
 
-        return base_logits[0], medusa_logits
+        return main_logits, medusa_logits
 
     @torch.compiler.disable  # Variable seq lengths cause excessive recompilations
     def _compute_losses_chunked(
@@ -1281,8 +1353,8 @@ class GemmaMedusaModel(nn.Module):
                 if self.channel_mixer_fc is not None:
                     stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
-        # Step 2: Compute LoRA projections if lora_rank > 0
-        has_lora = self.lora_rank > 0
+        # Step 2: Compute LoRA projections if lora_rank > 0 (not in full LM mode)
+        has_lora = self.lora_rank > 0 and not self.use_full_lm
         if has_lora:
             # Stack weights for batched computation
             stacked_lora_a = torch.stack([h.lora_A.weight for h in self.medusa_heads], dim=0)
@@ -1349,10 +1421,13 @@ class GemmaMedusaModel(nn.Module):
                 # Get chunk of ResBlock output
                 chunk_resblock = stacked_resblock[k, :, t_start:t_end, :]  # (B, chunk, hidden)
 
-                # Compute lm_head(resblock) for this chunk
-                chunk_base_logits = lm_head(chunk_resblock)  # (B, chunk, vocab)
+                if self.use_full_lm:
+                    # Full LM mode: use each head's own lm_head directly
+                    chunk_logits = self.medusa_heads[k].lm_head(chunk_resblock)  # (B, chunk, vocab)
+                elif has_lora:
+                    # LoRA mode: compute lm_head(resblock) + lora_delta
+                    chunk_base_logits = lm_head(chunk_resblock)  # (B, chunk, vocab)
 
-                if has_lora:
                     # Get LoRA-A output for this chunk
                     chunk_lora_a = lora_a_out[k, :, t_start:t_end, :]  # (B, chunk, rank)
 
@@ -1363,8 +1438,8 @@ class GemmaMedusaModel(nn.Module):
                     # Full logits for this head
                     chunk_logits = chunk_base_logits + chunk_lora_delta  # (B, chunk, vocab)
                 else:
-                    # No LoRA: just use lm_head output
-                    chunk_logits = chunk_base_logits
+                    # No LoRA, no full LM: just use shared lm_head
+                    chunk_logits = lm_head(chunk_resblock)  # (B, chunk, vocab)
 
                 # Targets are shifted
                 chunk_targets = targets[:, t_start + shift:t_end + shift]  # (B, chunk)
@@ -1459,8 +1534,8 @@ class GemmaMedusaModel(nn.Module):
                 if self.channel_mixer_fc is not None:
                     stacked_resblock = stacked_resblock + F.silu(self.channel_mixer_fc(stacked_resblock))
 
-        # Step 3: Compute LoRA projections if lora_rank > 0
-        has_lora = self.lora_rank > 0
+        # Step 3: Compute LoRA projections if lora_rank > 0 (not in full LM mode)
+        has_lora = self.lora_rank > 0 and not self.use_full_lm
         if has_lora:
             stacked_lora_a = torch.stack([h.lora_A.weight for h in self.medusa_heads], dim=0)
             stacked_lora_b = torch.stack([h.lora_B.weight for h in self.medusa_heads], dim=0)
@@ -1520,16 +1595,19 @@ class GemmaMedusaModel(nn.Module):
                 chunk_resblock = stacked_resblock[k, :, t_start:t_end, :]  # (B, chunk, hidden)
 
                 # Compute Medusa head logits for this chunk
-                chunk_base_logits = lm_head(chunk_resblock)
-
-                if has_lora:
+                if self.use_full_lm:
+                    # Full LM mode: use each head's own lm_head directly
+                    chunk_medusa_logits = self.medusa_heads[k].lm_head(chunk_resblock)
+                elif has_lora:
+                    # LoRA mode: compute lm_head(resblock) + lora_delta
+                    chunk_base_logits = lm_head(chunk_resblock)
                     # Get LoRA-A output for this chunk
                     chunk_lora_a = lora_a_out[k, :, t_start:t_end, :]  # (B, chunk, rank)
                     chunk_lora_delta = torch.einsum('btr,vr->btv', chunk_lora_a, stacked_lora_b[k]) * scalings[k]
                     chunk_medusa_logits = chunk_base_logits + chunk_lora_delta  # (B, chunk, vocab)
                 else:
-                    # No LoRA: just use lm_head output
-                    chunk_medusa_logits = chunk_base_logits
+                    # No LoRA, no full LM: just use shared lm_head
+                    chunk_medusa_logits = lm_head(chunk_resblock)
 
                 # Get target distribution from base model at shifted position
                 # Base model at position t+shift predicts token at t+shift+1 = t+k+2
@@ -1541,26 +1619,30 @@ class GemmaMedusaModel(nn.Module):
                 # Compute KL divergence: -sum(p_target * log(p_medusa))
                 # Apply top-p filtering if specified
                 if kl_top_p is not None and kl_top_p < 1.0:
+                    # Use top-k approximation: for p=0.9, typically ~100-500 tokens suffice
+                    # We use a fixed k that's large enough to cover top-p for most distributions
+                    max_k = min(1024, chunk_target_logits.shape[-1])
+
                     with torch.no_grad():
-                        chunk_target_p = F.softmax(chunk_target_logits, dim=-1)
-                        # Sort target probs and get indices
-                        sorted_probs, sorted_indices = torch.sort(chunk_target_p, dim=-1, descending=True)
-                        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+                        # Get top-k logits and indices (much cheaper than full sort)
+                        topk_target_logits, topk_indices = torch.topk(chunk_target_logits, max_k, dim=-1)
+                        topk_target_p = F.softmax(topk_target_logits, dim=-1)  # (B, chunk, k)
 
-                        # Create mask: include token that crosses threshold
+                        # Compute cumsum to find top-p cutoff within top-k
+                        cumsum_probs = torch.cumsum(topk_target_p, dim=-1)
                         cumsum_shifted = F.pad(cumsum_probs[..., :-1], (1, 0), value=0.0)
-                        top_p_mask = cumsum_shifted < kl_top_p  # (B, chunk, vocab)
+                        top_p_mask = cumsum_shifted < kl_top_p  # (B, chunk, k)
 
-                        # Filter and renormalize target probs in sorted order
-                        sorted_probs_filtered = sorted_probs * top_p_mask
-                        sorted_probs_filtered = sorted_probs_filtered / (sorted_probs_filtered.sum(dim=-1, keepdim=True) + 1e-10)
+                        # Filter and renormalize
+                        topk_probs_filtered = topk_target_p * top_p_mask
+                        topk_probs_filtered = topk_probs_filtered / (topk_probs_filtered.sum(dim=-1, keepdim=True) + 1e-10)
 
-                    # Gather medusa log_probs in same sorted order (avoids expensive scatter)
-                    chunk_log_p = F.log_softmax(chunk_medusa_logits.float(), dim=-1)
-                    sorted_log_p = torch.gather(chunk_log_p, -1, sorted_indices)
+                    # Gather only the top-k medusa logits (small gather, not full vocab)
+                    topk_medusa_logits = torch.gather(chunk_medusa_logits, -1, topk_indices)
+                    topk_log_p = F.log_softmax(topk_medusa_logits.float(), dim=-1)
 
-                    # KL in sorted space: -sum(p_filtered * log_p_sorted)
-                    chunk_kl = -torch.sum(sorted_probs_filtered * sorted_log_p, dim=-1)  # (B, chunk)
+                    # KL over top-k tokens only
+                    chunk_kl = -torch.sum(topk_probs_filtered * topk_log_p, dim=-1)  # (B, chunk)
                 else:
                     with torch.no_grad():
                         chunk_target_p = F.softmax(chunk_target_logits, dim=-1)
@@ -2814,6 +2896,9 @@ class GemmaMedusaModel(nn.Module):
                 medusa_proj_params.append(head.lora_A.weight)
             if head.lora_B is not None:
                 medusa_proj_params.append(head.lora_B.weight)
+            # Full LM head weight -> AdamW (when using full-lm mode)
+            if hasattr(head, 'lm_head') and head.lm_head is not None:
+                medusa_proj_params.append(head.lm_head.weight)
 
         # Add mixer params (supports multiple stacked layers as ModuleLists)
         if self.use_head_mixer:
@@ -2924,15 +3009,16 @@ def load_gemma_medusa_model(
     attn_num_layers: int = 1,
     causal_attn: bool = False,
     use_multi_layer: bool = False,
+    use_full_lm: bool = False,
 ):
     """
-    Load a Gemma model with Medusa LoRA heads.
+    Load a Gemma model with Medusa heads.
 
     Args:
         model_name: HuggingFace model name
         medusa_num_heads: Number of Medusa prediction heads
         medusa_num_layers: Number of ResBlock layers per head
-        lora_rank: Rank for LoRA projections
+        lora_rank: Rank for LoRA projections (ignored if use_full_lm=True)
         lora_alpha: LoRA alpha scaling (defaults to lora_rank)
         device: Device to load model on
         dtype: Data type for model weights
@@ -2946,6 +3032,7 @@ def load_gemma_medusa_model(
         attn_num_layers: Number of attention blocks for attention mixer (default: 1)
         causal_attn: Use causal attention for attention mixer (default: bidirectional)
         use_multi_layer: Use multi-layer hidden state fusion (3 layers: 2 evenly spaced + final)
+        use_full_lm: Use full LM heads instead of LoRA (more params, more expressive)
 
     Returns:
         GemmaMedusaModel instance
@@ -2968,4 +3055,5 @@ def load_gemma_medusa_model(
         attn_num_layers=attn_num_layers,
         causal_attn=causal_attn,
         use_multi_layer=use_multi_layer,
+        use_full_lm=use_full_lm,
     )
