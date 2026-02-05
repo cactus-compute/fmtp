@@ -18,3 +18,4 @@ docs/
 checkpoints/
 results/
 data/wildchat_100k.jsonl
+*.json

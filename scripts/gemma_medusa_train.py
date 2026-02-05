@@ -280,6 +280,9 @@ if __name__ == "__main__":
                         help="Use causal attention for --attn-num-layers (default: bidirectional)")
     parser.add_argument("--use-multi-layer", action="store_true",
                         help="Use multi-layer hidden state fusion (3 layers: 2 evenly spaced + final)")
+    parser.add_argument("--full-lm", action="store_true",
+                        help="Use full LM heads instead of LoRA (more params, more expressive). "
+                             "Each Medusa head gets a full copy of the LM head initialized from the base model.")
 
     # Performance optimization
     parser.add_argument("--compile", action="store_true",
@@ -331,11 +334,11 @@ if __name__ == "__main__":
                         help="Skip dataset filtering (use if data is pre-filtered)")
     parser.add_argument("--use-chunked-loss", action="store_true",
                         help="Compute loss in chunks to reduce memory (allows larger batch sizes)")
-    parser.add_argument("--use-kl-loss", action="store_true", default=True,
-                        help="Use KL divergence loss from base model's distribution instead of CE loss. "
-                             "Similar to EAGLE training - distills from base model rather than ground truth.")
+    parser.add_argument("--use-ce-loss", action="store_true",
+                        help="Use cross-entropy loss against ground truth instead of KL divergence. "
+                             "Default is KL loss which distills from base model's distribution (EAGLE-style).")
     parser.add_argument("--kl-top-p", type=float, default=None,
-                        help="If set (requires --use-kl-loss), only train on tokens within the top-p "
+                        help="If set (requires KL loss, i.e. not --use-ce-loss), only train on tokens within the top-p "
                              "cumulative probability mass of the target distribution. E.g., 0.9 trains "
                              "only on the most likely tokens covering 90%% of probability mass.")
     parser.add_argument("--chunk-size", type=int, default=128,
@@ -361,9 +364,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Validate --kl-top-p requires --use-kl-loss
-    if args.kl_top_p is not None and not args.use_kl_loss:
-        parser.error("--kl-top-p requires --use-kl-loss to be set")
+    # Validate --kl-top-p requires KL loss (not CE loss)
+    if args.kl_top_p is not None and args.use_ce_loss:
+        parser.error("--kl-top-p requires KL loss (cannot be used with --use-ce-loss)")
 
     user_config = vars(args).copy()
 
@@ -395,7 +398,8 @@ if __name__ == "__main__":
     else:
         mixer_str = ""
     multi_layer_str = ", multi_layer" if args.use_multi_layer else ""
-    print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers, lora_rank={args.lora_rank}{mixer_str}{multi_layer_str}")
+    full_lm_str = ", full_lm" if args.full_lm else f", lora_rank={args.lora_rank}"
+    print0(f"Medusa config: {args.medusa_num_heads} heads, {args.medusa_num_layers} layers{full_lm_str}{mixer_str}{multi_layer_str}")
 
     # Determine mixer type for model
     use_head_mixer = args.use_mlp_mixer or args.attn_num_layers > 0
@@ -418,6 +422,7 @@ if __name__ == "__main__":
         attn_num_layers=args.attn_num_layers,
         causal_attn=args.causal_attn,
         use_multi_layer=args.use_multi_layer,
+        use_full_lm=args.full_lm,
     )
     tokenizer = GemmaTokenizerWrapper(args.base_model)
 
@@ -428,10 +433,12 @@ if __name__ == "__main__":
     print0(f"Medusa parameters: {num_medusa_params:,}")
     print0(f"Trainable parameters: {trainable_params:,}")
     print0(f"Vocab size: {tokenizer.get_vocab_size()}")
-    if args.use_kl_loss:
+    if args.use_ce_loss:
+        print0(f"Using cross-entropy loss (ground truth targets)")
+    else:
         kl_top_p_str = f", top-p={args.kl_top_p}" if args.kl_top_p is not None else ""
         print0(f"Using KL divergence loss (distilling from base model's distribution{kl_top_p_str})")
-    elif args.use_chunked_loss:
+    if args.use_chunked_loss:
         print0(f"Using chunked CE loss (chunk_size={args.chunk_size}) for memory efficiency")
 
     # Optional torch.compile
@@ -607,7 +614,7 @@ if __name__ == "__main__":
                 with torch.no_grad(), autocast_ctx:
                     main_loss, head_losses = model(
                         val_inputs, val_targets, return_medusa=True,
-                        use_chunked_loss=args.use_chunked_loss, use_kl_loss=args.use_kl_loss,
+                        use_chunked_loss=args.use_chunked_loss, use_kl_loss=not args.use_ce_loss,
                         chunk_size=args.chunk_size, kl_top_p=args.kl_top_p
                     )
                     total_loss = main_loss.clone()
@@ -678,7 +685,7 @@ if __name__ == "__main__":
             with autocast_ctx:
                 main_loss, head_losses = model(
                     train_inputs, train_targets, return_medusa=True,
-                    use_chunked_loss=args.use_chunked_loss, use_kl_loss=args.use_kl_loss,
+                    use_chunked_loss=args.use_chunked_loss, use_kl_loss=not args.use_ce_loss,
                     chunk_size=args.chunk_size, kl_top_p=args.kl_top_p
                 )
 
@@ -883,14 +890,15 @@ if __name__ == "__main__":
                 "config": {
                     "medusa_num_heads": args.medusa_num_heads,
                     "medusa_num_layers": args.medusa_num_layers,
-                    "lora_rank": args.lora_rank,
-                    "lora_alpha": args.lora_alpha,
+                    "lora_rank": args.lora_rank if not args.full_lm else None,
+                    "lora_alpha": args.lora_alpha if not args.full_lm else None,
                     "use_mlp_mixer": args.use_mlp_mixer,
                     "attn_num_layers": args.attn_num_layers,
                     "causal_attn": args.causal_attn if args.attn_num_layers > 0 else None,
                     "mlp_mixer_hidden": args.mlp_mixer_hidden if args.use_mlp_mixer else None,
                     "mixer_num_layers": args.mixer_num_layers if args.use_mlp_mixer else None,
                     "use_multi_layer": args.use_multi_layer,
+                    "use_full_lm": args.full_lm,
                 },
                 "total_predictions": total_counts,
                 "recall": recall_rates,
