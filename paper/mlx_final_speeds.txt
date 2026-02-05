@@ -1,0 +1,547 @@
+  ~/Documents/Desert/nanochat   master ⇣1⇡1 !35 ?15                                                                 ✘ INT  1m 25s  fmtp-mlx  09:09:30
+❯ SIZE=2
+python -m scripts.mlx_eval --task gsm8k --n 25 --max-tokens 256 --tree-size "$SIZE" \
+&& python -m scripts.mlx_eval --task humaneval --n 25 --max-tokens 256 --tree-size "$SIZE"
+Loading model from /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora...
+Loading MLX base model: mlx-community/gemma-3-270m-it-bf16
+Fetching 8 files: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 8/8 [00:00<00:00, 160547.52it/s]
+Download complete: : 0.00B [00:00, ?B/s]                                                                                               | 0/8 [00:00<?, ?it/s]
+Model dimensions: hidden_size=640, vocab_size=262144
+Loading Medusa heads from: /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora/final/medusa_heads.pt
+Loaded 4 Medusa heads with 2 layers each
+Model loaded!
+Using optimal tree: size=2, depth=1
+Tree nodes: [(0,), (1,)]
+
+Running GSM8K (baseline): 25 samples, max_tokens=256
+------------------------------------------------------------
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+  [1/25] tokens=256, time=1.90s, tok/s=134.4, pred=None, ref=109, ✗
+  [2/25] tokens=256, time=1.56s, tok/s=163.7, pred=None, ref=89, ✗
+  [3/25] tokens=256, time=1.22s, tok/s=209.9, pred=13, ref=13, ✓
+  [4/25] tokens=256, time=1.13s, tok/s=226.8, pred=None, ref=5, ✗
+  [5/25] tokens=255, time=1.12s, tok/s=228.5, pred=10, ref=25, ✗
+  [6/25] tokens=256, time=1.11s, tok/s=230.3, pred=None, ref=452, ✗
+  [7/25] tokens=200, time=0.91s, tok/s=219.1, pred=91, ref=43, ✗
+  [8/25] tokens=164, time=0.76s, tok/s=214.6, pred=22, ref=34, ✗
+  [9/25] tokens=208, time=0.92s, tok/s=225.9, pred=15, ref=120, ✗
+  [10/25] tokens=256, time=1.13s, tok/s=225.6, pred=None, ref=11, ✗
+  [11/25] tokens=256, time=1.17s, tok/s=218.2, pred=None, ref=34, ✗
+  [12/25] tokens=110, time=0.61s, tok/s=181.6, pred=12, ref=12, ✓
+  [13/25] tokens=256, time=1.15s, tok/s=222.2, pred=None, ref=15, ✗
+  [14/25] tokens=256, time=1.14s, tok/s=224.7, pred=None, ref=24, ✗
+  [15/25] tokens=256, time=1.12s, tok/s=228.3, pred=None, ref=105, ✗
+  [16/25] tokens=154, time=0.81s, tok/s=190.6, pred=120, ref=120, ✓
+  [17/25] tokens=149, time=0.88s, tok/s=168.6, pred=19, ref=17, ✗
+  [18/25] tokens=194, time=0.96s, tok/s=202.3, pred=36, ref=36, ✓
+  [19/25] tokens=79, time=0.49s, tok/s=160.6, pred=5, ref=12, ✗
+  [20/25] tokens=256, time=1.12s, tok/s=228.8, pred=None, ref=45, ✗
+  [21/25] tokens=256, time=1.12s, tok/s=227.8, pred=None, ref=45, ✗
+  [22/25] tokens=228, time=1.00s, tok/s=227.7, pred=61, ref=8, ✗
+  [23/25] tokens=170, time=0.80s, tok/s=212.4, pred=54, ref=36, ✗
+  [24/25] tokens=256, time=1.22s, tok/s=209.2, pred=None, ref=1, ✗
+  [25/25] tokens=256, time=1.14s, tok/s=223.9, pred=None, ref=18, ✗
+------------------------------------------------------------
+GSM8K Results (baseline):
+  Accuracy: 4/25 = 16.0%
+  Avg tok/s: 207.2
+  Total tokens: 5495
+  Total time: 26.52s
+
+Running GSM8K (tree-2): 25 samples, max_tokens=256
+  Tree size: 2, depth: 1
+------------------------------------------------------------
+  [1/25] tokens=256, time=2.15s, tok/s=119.0, pred=None, ref=109, ✗
+  [2/25] tokens=256, time=2.14s, tok/s=119.4, pred=None, ref=89, ✗
+  [3/25] tokens=215, time=1.75s, tok/s=122.6, pred=13, ref=13, ✓
+  [4/25] tokens=256, time=2.19s, tok/s=117.1, pred=300, ref=5, ✗
+  [5/25] tokens=255, time=1.97s, tok/s=129.3, pred=10, ref=25, ✗
+  [6/25] tokens=256, time=2.34s, tok/s=109.3, pred=None, ref=452, ✗
+  [7/25] tokens=225, time=2.02s, tok/s=111.5, pred=43, ref=43, ✓
+  [8/25] tokens=254, time=2.67s, tok/s=95.3, pred=20, ref=34, ✗
+  [9/25] tokens=211, time=1.90s, tok/s=111.3, pred=15, ref=120, ✗
+  [10/25] tokens=256, time=2.09s, tok/s=122.6, pred=None, ref=11, ✗
+  [11/25] tokens=256, time=2.03s, tok/s=126.3, pred=None, ref=34, ✗
+  [12/25] tokens=110, time=0.96s, tok/s=114.1, pred=12, ref=12, ✓
+  [13/25] tokens=221, time=1.87s, tok/s=118.2, pred=27, ref=15, ✗
+  [14/25] tokens=144, time=1.36s, tok/s=105.9, pred=8, ref=24, ✗
+  [15/25] tokens=256, time=2.14s, tok/s=119.8, pred=None, ref=105, ✗
+  [16/25] tokens=154, time=1.30s, tok/s=118.0, pred=120, ref=120, ✓
+  [17/25] tokens=149, time=1.28s, tok/s=116.6, pred=19, ref=17, ✗
+  [18/25] tokens=194, time=1.58s, tok/s=122.7, pred=36, ref=36, ✓
+  [19/25] tokens=134, time=1.27s, tok/s=105.2, pred=None, ref=12, ✗
+  [20/25] tokens=256, time=2.21s, tok/s=115.8, pred=None, ref=45, ✗
+  [21/25] tokens=256, time=2.07s, tok/s=123.7, pred=None, ref=45, ✗
+  [22/25] tokens=233, time=2.04s, tok/s=114.1, pred=86.44, ref=8, ✗
+  [23/25] tokens=147, time=1.25s, tok/s=117.8, pred=36, ref=36, ✓
+  [24/25] tokens=256, time=2.21s, tok/s=115.9, pred=None, ref=1, ✗
+  [25/25] tokens=256, time=2.23s, tok/s=115.0, pred=None, ref=18, ✗
+------------------------------------------------------------
+GSM8K Results (tree-2):
+  Accuracy: 6/25 = 24.0%
+  Avg tok/s: 116.2
+  Total tokens: 5462
+  Total time: 47.02s
+  Mean accepted: 1.51 tokens/iter
+
+============================================================
+SUMMARY
+============================================================
+gsm8k (baseline): accuracy=16.0%, tok/s=207.2
+gsm8k (tree-2): accuracy=24.0%, tok/s=116.2
+
+Results saved to mlx_eval_20260205_091111.json
+Loading model from /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora...
+Loading MLX base model: mlx-community/gemma-3-270m-it-bf16
+Fetching 8 files: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 8/8 [00:00<00:00, 40233.13it/s]
+Download complete: : 0.00B [00:00, ?B/s]                                                                                               | 0/8 [00:00<?, ?it/s]
+Model dimensions: hidden_size=640, vocab_size=262144
+Loading Medusa heads from: /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora/final/medusa_heads.pt
+Loaded 4 Medusa heads with 2 layers each
+Model loaded!
+Using optimal tree: size=2, depth=1
+Tree nodes: [(0,), (1,)]
+
+Running HumanEval (baseline): 25 samples, max_tokens=256
+------------------------------------------------------------
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+  [1/25] tokens=23, time=0.50s, tok/s=46.2, ✗
+  [2/25] tokens=60, time=0.68s, tok/s=87.8, ✗
+  [3/25] tokens=59, time=0.64s, tok/s=92.0, ✗
+  [4/25] tokens=37, time=0.56s, tok/s=66.5, ✗
+  [5/25] tokens=119, time=1.00s, tok/s=118.8, ✗
+  [6/25] tokens=41, time=0.64s, tok/s=63.8, ✗
+  [7/25] tokens=55, time=0.64s, tok/s=86.4, ✓
+  [8/25] tokens=139, time=0.93s, tok/s=149.6, ✗
+  [9/25] tokens=53, time=0.65s, tok/s=81.7, ✗
+  [10/25] tokens=58, time=0.66s, tok/s=87.7, ✗
+  [11/25] tokens=59, time=0.72s, tok/s=81.7, ✗
+  [12/25] tokens=111, time=0.88s, tok/s=125.8, ✗
+  [13/25] tokens=57, time=0.62s, tok/s=92.0, ✗
+  [14/25] tokens=77, time=0.74s, tok/s=104.2, ✗
+  [15/25] tokens=121, time=0.85s, tok/s=142.7, ✓
+  [16/25] tokens=38, time=0.56s, tok/s=68.3, ✓
+  [17/25] tokens=92, time=0.74s, tok/s=123.8, ✗
+  [18/25] tokens=88, time=0.82s, tok/s=107.5, ✗
+  [19/25] tokens=39, time=0.89s, tok/s=43.8, ✗
+  [20/25] tokens=90, time=0.85s, tok/s=106.0, ✗
+  [21/25] tokens=26, time=0.61s, tok/s=42.8, ✗
+  [22/25] tokens=57, time=0.72s, tok/s=78.9, ✗
+  [23/25] tokens=55, time=0.70s, tok/s=78.4, ✗
+  [24/25] tokens=47, time=0.58s, tok/s=80.8, ✗
+  [25/25] tokens=53, time=0.67s, tok/s=79.6, ✗
+------------------------------------------------------------
+HumanEval Results (baseline):
+  Accuracy: 3/25 = 12.0%
+  Avg tok/s: 92.7
+  Total tokens: 1654
+  Total time: 17.85s
+
+Running HumanEval (tree-2): 25 samples, max_tokens=256
+  Tree size: 2, depth: 1
+------------------------------------------------------------
+  [1/25] tokens=23, time=0.50s, tok/s=46.4, ✗
+  [2/25] tokens=60, time=0.69s, tok/s=87.5, ✗
+  [3/25] tokens=51, time=0.64s, tok/s=79.9, ✗
+  [4/25] tokens=37, time=0.57s, tok/s=64.5, ✗
+  [5/25] tokens=60, time=0.79s, tok/s=75.5, ✗
+  [6/25] tokens=41, time=0.59s, tok/s=69.4, ✗
+  [7/25] tokens=55, time=0.67s, tok/s=82.6, ✓
+  [8/25] tokens=139, time=1.65s, tok/s=84.4, ✗
+  [9/25] tokens=53, time=0.69s, tok/s=77.3, ✗
+  [10/25] tokens=58, time=0.74s, tok/s=78.0, ✗
+  [11/25] tokens=59, time=0.81s, tok/s=73.1, ✗
+  [12/25] tokens=111, time=1.29s, tok/s=85.9, ✗
+  [13/25] tokens=66, time=0.92s, tok/s=72.1, ✗
+  [14/25] tokens=140, time=1.57s, tok/s=88.9, ✗
+  [15/25] tokens=121, time=1.38s, tok/s=87.9, ✓
+  [16/25] tokens=38, time=0.80s, tok/s=47.5, ✓
+  [17/25] tokens=92, time=1.08s, tok/s=85.1, ✗
+  [18/25] tokens=88, time=1.18s, tok/s=74.4, ✗
+  [19/25] tokens=39, time=0.76s, tok/s=51.5, ✗
+  [20/25] tokens=90, time=1.43s, tok/s=63.1, ✗
+  [21/25] tokens=26, time=0.55s, tok/s=47.1, ✗
+  [22/25] tokens=57, time=1.02s, tok/s=56.0, ✗
+  [23/25] tokens=55, time=1.32s, tok/s=41.8, ✗
+  [24/25] tokens=47, time=1.05s, tok/s=44.6, ✗
+  [25/25] tokens=53, time=0.81s, tok/s=65.1, ✗
+------------------------------------------------------------
+HumanEval Results (tree-2):
+  Accuracy: 3/25 = 12.0%
+  Avg tok/s: 70.6
+  Total tokens: 1659
+  Total time: 23.49s
+  Mean accepted: 1.42 tokens/iter
+
+============================================================
+SUMMARY
+============================================================
+humaneval (baseline): accuracy=12.0%, tok/s=92.7
+humaneval (tree-2): accuracy=12.0%, tok/s=70.6
+
+Results saved to mlx_eval_20260205_091554.json
+  ~/Documents/Desert/nanochat   master ⇣1⇡1 !35 ?15                                                                         6m 8s  fmtp-mlx  09:15:56
+❯ SIZE=2 
+python -m scripts.mlx_eval --task gsm8k --n 25 --max-tokens 128 --tree-size "$SIZE" \
+&& python -m scripts.mlx_eval --task humaneval --n 25 --max-tokens 128 --tree-size "$SIZE"
+Loading model from /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora...
+Loading MLX base model: mlx-community/gemma-3-270m-it-bf16
+Fetching 8 files: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 8/8 [00:00<00:00, 28387.84it/s]
+Download complete: : 0.00B [00:00, ?B/s]                                                                                               | 0/8 [00:00<?, ?it/s]
+Model dimensions: hidden_size=640, vocab_size=262144
+Loading Medusa heads from: /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora/final/medusa_heads.pt
+Loaded 4 Medusa heads with 2 layers each
+Model loaded!
+Using optimal tree: size=2, depth=1
+Tree nodes: [(0,), (1,)]
+
+Running GSM8K (baseline): 25 samples, max_tokens=128
+------------------------------------------------------------
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+  [1/25] tokens=128, time=0.96s, tok/s=133.8, pred=None, ref=109, ✗
+  [2/25] tokens=128, time=0.64s, tok/s=199.1, pred=None, ref=89, ✗
+  [3/25] tokens=128, time=0.63s, tok/s=203.4, pred=None, ref=13, ✗
+  [4/25] tokens=128, time=0.64s, tok/s=201.1, pred=None, ref=5, ✗
+  [5/25] tokens=128, time=0.64s, tok/s=198.7, pred=None, ref=25, ✗
+  [6/25] tokens=128, time=0.67s, tok/s=191.2, pred=None, ref=452, ✗
+  [7/25] tokens=128, time=0.66s, tok/s=193.8, pred=None, ref=43, ✗
+  [8/25] tokens=128, time=0.65s, tok/s=197.5, pred=None, ref=34, ✗
+  [9/25] tokens=128, time=0.65s, tok/s=196.9, pred=None, ref=120, ✗
+  [10/25] tokens=128, time=0.64s, tok/s=200.3, pred=None, ref=11, ✗
+  [11/25] tokens=128, time=0.65s, tok/s=195.8, pred=None, ref=34, ✗
+  [12/25] tokens=110, time=0.57s, tok/s=192.1, pred=12, ref=12, ✓
+  [13/25] tokens=128, time=0.65s, tok/s=198.0, pred=None, ref=15, ✗
+  [14/25] tokens=128, time=0.65s, tok/s=197.3, pred=None, ref=24, ✗
+  [15/25] tokens=128, time=0.64s, tok/s=198.6, pred=None, ref=105, ✗
+  [16/25] tokens=128, time=0.67s, tok/s=192.3, pred=None, ref=120, ✗
+  [17/25] tokens=128, time=0.81s, tok/s=158.7, pred=None, ref=17, ✗
+  [18/25] tokens=128, time=0.74s, tok/s=171.9, pred=None, ref=36, ✗
+  [19/25] tokens=79, time=0.50s, tok/s=157.4, pred=5, ref=12, ✗
+  [20/25] tokens=128, time=0.70s, tok/s=181.7, pred=None, ref=45, ✗
+  [21/25] tokens=128, time=0.74s, tok/s=173.7, pred=None, ref=45, ✗
+  [22/25] tokens=128, time=0.66s, tok/s=193.0, pred=None, ref=8, ✗
+  [23/25] tokens=128, time=0.76s, tok/s=168.8, pred=None, ref=36, ✗
+  [24/25] tokens=128, time=0.97s, tok/s=131.5, pred=None, ref=1, ✗
+  [25/25] tokens=128, time=0.79s, tok/s=162.6, pred=None, ref=18, ✗
+------------------------------------------------------------
+GSM8K Results (baseline):
+  Accuracy: 1/25 = 4.0%
+  Avg tok/s: 181.2
+  Total tokens: 3133
+  Total time: 17.29s
+
+Running GSM8K (tree-2): 25 samples, max_tokens=128
+  Tree size: 2, depth: 1
+------------------------------------------------------------
+  [1/25] tokens=128, time=1.07s, tok/s=119.5, pred=None, ref=109, ✗
+  [2/25] tokens=128, time=1.04s, tok/s=123.4, pred=None, ref=89, ✗
+  [3/25] tokens=128, time=0.98s, tok/s=130.8, pred=None, ref=13, ✗
+  [4/25] tokens=128, time=1.06s, tok/s=120.3, pred=None, ref=5, ✗
+  [5/25] tokens=128, time=0.97s, tok/s=131.3, pred=None, ref=25, ✗
+  [6/25] tokens=128, time=1.15s, tok/s=111.7, pred=None, ref=452, ✗
+  [7/25] tokens=128, time=1.09s, tok/s=117.0, pred=None, ref=43, ✗
+  [8/25] tokens=128, time=1.03s, tok/s=124.7, pred=None, ref=34, ✗
+  [9/25] tokens=128, time=1.20s, tok/s=106.5, pred=None, ref=120, ✗
+  [10/25] tokens=128, time=1.09s, tok/s=117.5, pred=None, ref=11, ✗
+  [11/25] tokens=128, time=1.08s, tok/s=118.9, pred=None, ref=34, ✗
+  [12/25] tokens=110, time=0.98s, tok/s=112.6, pred=12, ref=12, ✓
+  [13/25] tokens=128, time=1.10s, tok/s=116.2, pred=None, ref=15, ✗
+  [14/25] tokens=128, time=1.11s, tok/s=115.4, pred=None, ref=24, ✗
+  [15/25] tokens=128, time=1.07s, tok/s=119.7, pred=None, ref=105, ✗
+  [16/25] tokens=128, time=1.10s, tok/s=116.2, pred=None, ref=120, ✗
+  [17/25] tokens=128, time=1.08s, tok/s=118.0, pred=None, ref=17, ✗
+  [18/25] tokens=128, time=1.05s, tok/s=122.3, pred=None, ref=36, ✗
+  [19/25] tokens=128, time=1.23s, tok/s=103.8, pred=None, ref=12, ✗
+  [20/25] tokens=128, time=1.06s, tok/s=120.6, pred=None, ref=45, ✗
+  [21/25] tokens=128, time=1.10s, tok/s=116.1, pred=None, ref=45, ✗
+  [22/25] tokens=128, time=1.09s, tok/s=117.5, pred=None, ref=8, ✗
+  [23/25] tokens=128, time=0.99s, tok/s=128.8, pred=None, ref=36, ✗
+  [24/25] tokens=128, time=1.09s, tok/s=117.8, pred=None, ref=1, ✗
+  [25/25] tokens=128, time=1.04s, tok/s=123.0, pred=None, ref=18, ✗
+------------------------------------------------------------
+GSM8K Results (tree-2):
+  Accuracy: 1/25 = 4.0%
+  Avg tok/s: 118.5
+  Total tokens: 3182
+  Total time: 26.86s
+  Mean accepted: 1.50 tokens/iter
+
+============================================================
+SUMMARY
+============================================================
+gsm8k (baseline): accuracy=4.0%, tok/s=181.2
+gsm8k (tree-2): accuracy=4.0%, tok/s=118.5
+
+Results saved to mlx_eval_20260205_091708.json
+Loading model from /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora...
+Loading MLX base model: mlx-community/gemma-3-270m-it-bf16
+Fetching 8 files: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 8/8 [00:00<00:00, 47934.90it/s]
+Download complete: : 0.00B [00:00, ?B/s]                                                                                               | 0/8 [00:00<?, ?it/s]
+Model dimensions: hidden_size=640, vocab_size=262144
+Loading Medusa heads from: /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora/final/medusa_heads.pt
+Loaded 4 Medusa heads with 2 layers each
+Model loaded!
+Using optimal tree: size=2, depth=1
+Tree nodes: [(0,), (1,)]
+
+Running HumanEval (baseline): 25 samples, max_tokens=128
+------------------------------------------------------------
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+  [1/25] tokens=23, time=0.58s, tok/s=39.7, ✗
+  [2/25] tokens=60, time=0.77s, tok/s=77.9, ✗
+  [3/25] tokens=59, time=0.60s, tok/s=98.8, ✗
+  [4/25] tokens=37, time=0.55s, tok/s=66.9, ✗
+  [5/25] tokens=119, time=0.91s, tok/s=131.3, ✗
+  [6/25] tokens=41, time=0.69s, tok/s=59.1, ✗
+  [7/25] tokens=55, time=0.74s, tok/s=74.5, ✓
+  [8/25] tokens=128, time=0.99s, tok/s=129.6, ✗
+  [9/25] tokens=53, time=0.78s, tok/s=67.9, ✗
+  [10/25] tokens=58, time=0.68s, tok/s=85.0, ✗
+  [11/25] tokens=59, time=0.66s, tok/s=89.2, ✗
+  [12/25] tokens=111, time=0.85s, tok/s=131.3, ✗
+  [13/25] tokens=57, time=0.72s, tok/s=79.3, ✗
+  [14/25] tokens=77, time=0.80s, tok/s=96.8, ✗
+  [15/25] tokens=121, time=0.99s, tok/s=122.5, ✓
+  [16/25] tokens=38, time=0.68s, tok/s=55.7, ✓
+  [17/25] tokens=92, time=0.85s, tok/s=107.8, ✗
+  [18/25] tokens=88, time=0.81s, tok/s=108.1, ✗
+  [19/25] tokens=39, time=0.59s, tok/s=65.9, ✗
+  [20/25] tokens=90, time=0.78s, tok/s=115.5, ✗
+  [21/25] tokens=26, time=0.56s, tok/s=46.3, ✗
+  [22/25] tokens=57, time=0.84s, tok/s=67.5, ✗
+  [23/25] tokens=55, time=0.89s, tok/s=61.9, ✗
+  [24/25] tokens=47, time=0.69s, tok/s=67.9, ✗
+  [25/25] tokens=53, time=0.85s, tok/s=62.1, ✗
+------------------------------------------------------------
+HumanEval Results (baseline):
+  Accuracy: 3/25 = 12.0%
+  Avg tok/s: 87.1
+  Total tokens: 1643
+  Total time: 18.86s
+
+Running HumanEval (tree-2): 25 samples, max_tokens=128
+  Tree size: 2, depth: 1
+------------------------------------------------------------
+  [1/25] tokens=23, time=0.43s, tok/s=53.3, ✗
+  [2/25] tokens=60, time=0.83s, tok/s=72.0, ✗
+  [3/25] tokens=51, time=0.67s, tok/s=76.4, ✗
+  [4/25] tokens=37, time=0.63s, tok/s=58.5, ✗
+  [5/25] tokens=60, time=1.03s, tok/s=58.2, ✗
+  [6/25] tokens=41, time=0.52s, tok/s=78.5, ✗
+  [7/25] tokens=55, time=0.69s, tok/s=79.9, ✓
+  [8/25] tokens=128, time=1.36s, tok/s=94.3, ✗
+  [9/25] tokens=53, time=0.60s, tok/s=87.9, ✗
+  [10/25] tokens=58, time=0.83s, tok/s=70.0, ✗
+  [11/25] tokens=59, time=0.78s, tok/s=75.3, ✗
+  [12/25] tokens=111, time=1.28s, tok/s=86.7, ✗
+  [13/25] tokens=66, time=0.86s, tok/s=76.5, ✗
+  [14/25] tokens=128, time=1.85s, tok/s=69.2, ✗
+  [15/25] tokens=121, time=1.26s, tok/s=95.8, ✓
+  [16/25] tokens=38, time=0.82s, tok/s=46.2, ✓
+  [17/25] tokens=92, time=1.10s, tok/s=83.7, ✗
+  [18/25] tokens=88, time=1.41s, tok/s=62.6, ✗
+  [19/25] tokens=39, time=0.70s, tok/s=55.6, ✗
+  [20/25] tokens=90, time=1.15s, tok/s=78.0, ✗
+  [21/25] tokens=26, time=0.49s, tok/s=53.1, ✗
+  [22/25] tokens=57, time=0.79s, tok/s=72.2, ✗
+  [23/25] tokens=55, time=0.88s, tok/s=62.4, ✗
+  [24/25] tokens=47, time=0.77s, tok/s=61.0, ✗
+  [25/25] tokens=53, time=0.69s, tok/s=76.5, ✗
+------------------------------------------------------------
+HumanEval Results (tree-2):
+  Accuracy: 3/25 = 12.0%
+  Avg tok/s: 72.9
+  Total tokens: 1636
+  Total time: 22.44s
+  Mean accepted: 1.42 tokens/iter
+
+============================================================
+SUMMARY
+============================================================
+humaneval (baseline): accuracy=12.0%, tok/s=87.1
+humaneval (tree-2): accuracy=12.0%, tok/s=72.9
+
+Results saved to mlx_eval_20260205_092147.json
+  ~/Documents/Desert/nanochat   master ⇣1⇡1 !35 ?15                                                                        5m 33s  fmtp-mlx  09:21:48
+❯ SIZE=1
+python -m scripts.mlx_eval --task gsm8k --n 25 --max-tokens 128 --tree-size "$SIZE" \
+&& python -m scripts.mlx_eval --task humaneval --n 25 --max-tokens 128 --tree-size "$SIZE"
+Loading model from /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora...
+Loading MLX base model: mlx-community/gemma-3-270m-it-bf16
+Fetching 8 files: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 8/8 [00:00<00:00, 122910.01it/s]
+Download complete: : 0.00B [00:00, ?B/s]                                                                                               | 0/8 [00:00<?, ?it/s]
+Model dimensions: hidden_size=640, vocab_size=262144
+Loading Medusa heads from: /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora/final/medusa_heads.pt
+Loaded 4 Medusa heads with 2 layers each
+Model loaded!
+Using optimal tree: size=1, depth=1
+Tree nodes: [(0,)]
+
+Running GSM8K (baseline): 25 samples, max_tokens=128
+------------------------------------------------------------
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+  [1/25] tokens=128, time=0.82s, tok/s=157.0, pred=None, ref=109, ✗
+  [2/25] tokens=128, time=0.65s, tok/s=196.4, pred=None, ref=89, ✗
+  [3/25] tokens=128, time=0.69s, tok/s=186.7, pred=None, ref=13, ✗
+  [4/25] tokens=128, time=0.68s, tok/s=188.9, pred=None, ref=5, ✗
+  [5/25] tokens=128, time=0.65s, tok/s=196.6, pred=None, ref=25, ✗
+  [6/25] tokens=128, time=0.65s, tok/s=197.0, pred=None, ref=452, ✗
+  [7/25] tokens=128, time=0.65s, tok/s=196.2, pred=None, ref=43, ✗
+  [8/25] tokens=128, time=0.65s, tok/s=195.6, pred=None, ref=34, ✗
+  [9/25] tokens=128, time=0.63s, tok/s=203.3, pred=None, ref=120, ✗
+  [10/25] tokens=128, time=0.65s, tok/s=195.9, pred=None, ref=11, ✗
+  [11/25] tokens=128, time=0.66s, tok/s=194.7, pred=None, ref=34, ✗
+  [12/25] tokens=110, time=0.59s, tok/s=187.3, pred=12, ref=12, ✓
+  [13/25] tokens=128, time=0.66s, tok/s=195.1, pred=None, ref=15, ✗
+  [14/25] tokens=128, time=0.65s, tok/s=196.2, pred=None, ref=24, ✗
+  [15/25] tokens=128, time=0.71s, tok/s=180.2, pred=None, ref=105, ✗
+  [16/25] tokens=128, time=0.69s, tok/s=186.1, pred=None, ref=120, ✗
+  [17/25] tokens=128, time=0.65s, tok/s=196.7, pred=None, ref=17, ✗
+  [18/25] tokens=128, time=0.66s, tok/s=193.7, pred=None, ref=36, ✗
+  [19/25] tokens=79, time=0.51s, tok/s=156.4, pred=5, ref=12, ✗
+  [20/25] tokens=128, time=0.66s, tok/s=194.5, pred=None, ref=45, ✗
+  [21/25] tokens=128, time=0.65s, tok/s=196.0, pred=None, ref=45, ✗
+  [22/25] tokens=128, time=0.66s, tok/s=194.3, pred=None, ref=8, ✗
+  [23/25] tokens=128, time=0.65s, tok/s=196.2, pred=None, ref=36, ✗
+  [24/25] tokens=128, time=0.65s, tok/s=196.2, pred=None, ref=1, ✗
+  [25/25] tokens=128, time=0.65s, tok/s=198.0, pred=None, ref=18, ✗
+------------------------------------------------------------
+GSM8K Results (baseline):
+  Accuracy: 1/25 = 4.0%
+  Avg tok/s: 190.9
+  Total tokens: 3133
+  Total time: 16.41s
+
+Running GSM8K (tree-1): 25 samples, max_tokens=128
+  Tree size: 1, depth: 1
+------------------------------------------------------------
+  [1/25] tokens=128, time=1.28s, tok/s=100.3, pred=None, ref=109, ✗
+  [2/25] tokens=128, time=1.12s, tok/s=114.7, pred=None, ref=89, ✗
+  [3/25] tokens=128, time=1.05s, tok/s=121.9, pred=None, ref=13, ✗
+  [4/25] tokens=128, time=1.28s, tok/s=100.0, pred=None, ref=5, ✗
+  [5/25] tokens=128, time=1.04s, tok/s=122.8, pred=None, ref=25, ✗
+  [6/25] tokens=128, time=1.19s, tok/s=107.3, pred=None, ref=452, ✗
+  [7/25] tokens=128, time=1.20s, tok/s=106.2, pred=None, ref=43, ✗
+  [8/25] tokens=128, time=1.16s, tok/s=109.9, pred=None, ref=34, ✗
+  [9/25] tokens=128, time=1.18s, tok/s=108.4, pred=None, ref=120, ✗
+  [10/25] tokens=128, time=1.01s, tok/s=126.6, pred=None, ref=11, ✗
+  [11/25] tokens=128, time=1.04s, tok/s=122.7, pred=None, ref=34, ✗
+  [12/25] tokens=88, time=0.78s, tok/s=112.9, pred=8, ref=12, ✗
+  [13/25] tokens=128, time=1.13s, tok/s=113.2, pred=None, ref=15, ✗
+  [14/25] tokens=128, time=1.11s, tok/s=115.5, pred=None, ref=24, ✗
+  [15/25] tokens=128, time=1.14s, tok/s=111.8, pred=None, ref=105, ✗
+  [16/25] tokens=128, time=1.11s, tok/s=114.8, pred=None, ref=120, ✗
+  [17/25] tokens=128, time=1.21s, tok/s=105.8, pred=None, ref=17, ✗
+  [18/25] tokens=128, time=1.17s, tok/s=109.5, pred=None, ref=36, ✗
+  [19/25] tokens=79, time=0.80s, tok/s=98.1, pred=5, ref=12, ✗
+  [20/25] tokens=128, time=1.10s, tok/s=116.8, pred=None, ref=45, ✗
+  [21/25] tokens=128, time=1.20s, tok/s=106.4, pred=None, ref=45, ✗
+  [22/25] tokens=128, time=1.14s, tok/s=111.9, pred=None, ref=8, ✗
+  [23/25] tokens=128, time=1.11s, tok/s=114.9, pred=None, ref=36, ✗
+  [24/25] tokens=128, time=1.09s, tok/s=117.1, pred=None, ref=1, ✗
+  [25/25] tokens=128, time=1.18s, tok/s=108.8, pred=None, ref=18, ✗
+------------------------------------------------------------
+GSM8K Results (tree-1):
+  Accuracy: 0/25 = 0.0%
+  Avg tok/s: 111.7
+  Total tokens: 3111
+  Total time: 27.85s
+  Mean accepted: 1.39 tokens/iter
+
+============================================================
+SUMMARY
+============================================================
+gsm8k (baseline): accuracy=4.0%, tok/s=190.9
+gsm8k (tree-1): accuracy=0.0%, tok/s=111.7
+
+
+Results saved to mlx_eval_20260205_092302.json
+Loading model from /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora...
+Loading MLX base model: mlx-community/gemma-3-270m-it-bf16
+Fetching 8 files: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 8/8 [00:00<00:00, 112598.77it/s]
+Download complete: : 0.00B [00:00, ?B/s]                                                                                               | 0/8 [00:00<?, ?it/s]
+Model dimensions: hidden_size=640, vocab_size=262144
+Loading Medusa heads from: /Users/noahcylich/.cache/nanochat/gemma_medusa_270m_wildchat_100k_nolora/final/medusa_heads.pt
+Loaded 4 Medusa heads with 2 layers each
+Model loaded!
+Using optimal tree: size=1, depth=1
+Tree nodes: [(0,)]
+
+Running HumanEval (baseline): 25 samples, max_tokens=128
+------------------------------------------------------------
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+  [1/25] tokens=23, time=0.45s, tok/s=50.9, ✗
+  [2/25] tokens=60, time=0.66s, tok/s=90.4, ✗
+  [3/25] tokens=59, time=0.65s, tok/s=90.5, ✗
+  [4/25] tokens=37, time=0.64s, tok/s=57.6, ✗
+  [5/25] tokens=119, time=0.92s, tok/s=129.7, ✗
+  [6/25] tokens=41, time=0.61s, tok/s=67.2, ✗
+  [7/25] tokens=55, time=0.59s, tok/s=93.0, ✓
+  [8/25] tokens=128, time=0.96s, tok/s=133.1, ✗
+  [9/25] tokens=53, time=0.56s, tok/s=94.9, ✗
+  [10/25] tokens=58, time=0.63s, tok/s=92.6, ✗
+  [11/25] tokens=59, time=0.71s, tok/s=83.6, ✗
+  [12/25] tokens=111, time=0.92s, tok/s=120.7, ✗
+  [13/25] tokens=57, time=0.69s, tok/s=83.1, ✗
+  [14/25] tokens=77, time=0.74s, tok/s=104.0, ✗
+  [15/25] tokens=121, time=0.88s, tok/s=137.7, ✓
+  [16/25] tokens=38, time=0.63s, tok/s=60.0, ✓
+  [17/25] tokens=92, time=0.84s, tok/s=109.8, ✗
+  [18/25] tokens=88, time=0.89s, tok/s=99.3, ✗
+  [19/25] tokens=39, time=0.51s, tok/s=75.9, ✗
+  [20/25] tokens=90, time=0.81s, tok/s=110.9, ✗
+  [21/25] tokens=26, time=0.60s, tok/s=43.0, ✗
+  [22/25] tokens=57, time=0.61s, tok/s=92.9, ✗
+  [23/25] tokens=55, time=0.87s, tok/s=62.9, ✗
+  [24/25] tokens=47, time=0.55s, tok/s=85.0, ✗
+  [25/25] tokens=53, time=0.70s, tok/s=75.9, ✗
+------------------------------------------------------------
+HumanEval Results (baseline):
+  Accuracy: 3/25 = 12.0%
+  Avg tok/s: 93.2
+  Total tokens: 1643
+  Total time: 17.63s
+
+Running HumanEval (tree-1): 25 samples, max_tokens=128
+  Tree size: 1, depth: 1
+------------------------------------------------------------
+  [1/25] tokens=23, time=0.42s, tok/s=54.5, ✗
+  [2/25] tokens=60, time=0.70s, tok/s=85.3, ✗
+  [3/25] tokens=51, time=0.68s, tok/s=75.0, ✗
+  [4/25] tokens=37, time=0.53s, tok/s=69.9, ✗
+  [5/25] tokens=60, time=0.82s, tok/s=73.3, ✗
+  [6/25] tokens=41, time=0.51s, tok/s=79.9, ✗
+  [7/25] tokens=55, time=0.79s, tok/s=69.9, ✓
+  [8/25] tokens=128, time=1.47s, tok/s=87.1, ✗
+  [9/25] tokens=53, time=0.61s, tok/s=86.7, ✗
+  [10/25] tokens=58, time=0.81s, tok/s=71.5, ✗
+  [11/25] tokens=60, time=0.64s, tok/s=93.4, ✗
+  [12/25] tokens=111, time=1.27s, tok/s=87.5, ✗
+  [13/25] tokens=55, time=0.77s, tok/s=71.3, ✗
+  [14/25] tokens=128, time=1.34s, tok/s=95.4, ✗
+  [15/25] tokens=121, time=1.28s, tok/s=94.7, ✓
+  [16/25] tokens=38, time=0.54s, tok/s=70.5, ✓
+  [17/25] tokens=92, time=0.94s, tok/s=97.6, ✗
+  [18/25] tokens=88, time=1.05s, tok/s=83.5, ✗
+  [19/25] tokens=43, time=0.65s, tok/s=66.5, ✗
+  [20/25] tokens=90, time=1.21s, tok/s=74.3, ✗
+  [21/25] tokens=26, time=0.51s, tok/s=51.0, ✗
+  [22/25] tokens=57, time=0.69s, tok/s=82.2, ✗
+  [23/25] tokens=55, time=0.83s, tok/s=66.4, ✗
+  [24/25] tokens=47, time=0.65s, tok/s=72.1, ✗
+  [25/25] tokens=53, time=0.70s, tok/s=75.5, ✗
+------------------------------------------------------------
+HumanEval Results (tree-1):
+  Accuracy: 3/25 = 12.0%
+  Avg tok/s: 79.8
+  Total tokens: 1630
+  Total time: 20.43s
+  Mean accepted: 1.33 tokens/iter
+
+============================================================
+SUMMARY
+============================================================
+humaneval (baseline): accuracy=12.0%, tok/s=93.2
+humaneval (tree-1): accuracy=12.0%, tok/s=79.8
+
+Results saved to mlx_eval_20260205_092741.json
