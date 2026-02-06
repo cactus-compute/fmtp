@@ -130,6 +130,65 @@ def compute_entropy(logits: mx.array) -> float:
 
 
 # ============================================================================
+# Profiling Infrastructure for Kernel Optimization
+# ============================================================================
+
+class ProfilingContext:
+    """
+    Context for collecting per-operation timing during speculative decoding.
+
+    Used to identify bottlenecks before implementing Metal kernel fusion.
+    Timing data is aggregated across iterations and reported via MTPStats.timing.
+    """
+
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self.timings: Dict[str, List[float]] = {}
+        self._start_times: Dict[str, float] = {}
+
+    def start(self, name: str) -> None:
+        """Start timing an operation."""
+        if self.enabled:
+            mx.eval()  # Sync GPU before timing
+            self._start_times[name] = time.perf_counter()
+
+    def stop(self, name: str) -> None:
+        """Stop timing an operation and record the elapsed time."""
+        if self.enabled and name in self._start_times:
+            mx.eval()  # Sync GPU after operation
+            elapsed = time.perf_counter() - self._start_times[name]
+            if name not in self.timings:
+                self.timings[name] = []
+            self.timings[name].append(elapsed * 1000)  # Convert to ms
+            del self._start_times[name]
+
+    def get_summary(self) -> Dict[str, float]:
+        """Get summary statistics for all timed operations."""
+        summary = {}
+        for name, times in self.timings.items():
+            if times:
+                summary[f"{name}_mean_ms"] = sum(times) / len(times)
+                summary[f"{name}_total_ms"] = sum(times)
+                summary[f"{name}_count"] = len(times)
+        return summary
+
+
+# Global profiling context (set per generation call)
+_PROFILING_CTX: Optional[ProfilingContext] = None
+
+
+def set_profiling_context(ctx: Optional[ProfilingContext]) -> None:
+    """Set the global profiling context for the current generation."""
+    global _PROFILING_CTX
+    _PROFILING_CTX = ctx
+
+
+def get_profiling_context() -> Optional[ProfilingContext]:
+    """Get the current profiling context."""
+    return _PROFILING_CTX
+
+
+# ============================================================================
 # Custom Metal Kernel for Per-Position RoPE
 # ============================================================================
 
@@ -319,6 +378,162 @@ def apply_rope_fused_qk_kernel(
     )
 
     return outputs[0], outputs[1]
+
+
+# ============================================================================
+# Fused Verification Kernel for Speculative Decoding
+# ============================================================================
+
+_VERIFICATION_KERNEL_CACHE: Dict[str, Any] = {}
+
+
+def _create_fused_verification_kernel():
+    """
+    Create a Metal kernel that fuses comparison + accept_length computation.
+
+    This replaces 5 separate kernel launches with a single fused operation:
+    1. Gather predictions at needed positions
+    2. Compare predictions with candidates
+    3. Apply valid mask (via retrieve_indices < 0 check)
+    4. Cumulative product for matching
+    5. Sum for accept lengths
+
+    Note: argmax is pre-computed using MLX's optimized implementation since
+    inline argmax over large vocabularies (262K) is too slow.
+
+    Expected speedup: 5-10% on verification step.
+    """
+    source = '''
+        uint cand_idx = thread_position_in_grid.x;
+
+        uint num_candidates = dims[0];
+        uint max_depth = dims[1];
+
+        if (cand_idx >= num_candidates) return;
+
+        int accept_len = 0;
+        bool still_matching = true;
+
+        // Iterate through depth positions for this candidate
+        for (uint d = 0; d < max_depth - 1 && still_matching; d++) {
+            // Get retrieve index for this position
+            int ridx = retrieve_indices[cand_idx * max_depth + d];
+
+            // Check if this is a valid position (ridx >= 0)
+            if (ridx < 0) break;
+
+            // Get predicted token at this tree position (pre-computed argmax)
+            int predicted = tree_predictions[ridx];
+
+            // Get expected token from candidates (at position d+1)
+            int expected = candidates[cand_idx * max_depth + d + 1];
+
+            // Check if prediction matches expected
+            if (predicted == expected) {
+                accept_len++;
+            } else {
+                still_matching = false;
+            }
+        }
+
+        accept_lengths[cand_idx] = accept_len;
+    '''
+
+    return mx.fast.metal_kernel(
+        name="fused_verification_v2",
+        input_names=["tree_predictions", "candidates", "retrieve_indices", "dims"],
+        output_names=["accept_lengths"],
+        source=source,
+    )
+
+
+def verify_candidates_fused(
+    tree_logits: mx.array,
+    candidates: mx.array,
+    retrieve_indices: mx.array,
+) -> mx.array:
+    """
+    Fused verification of speculative decoding candidates using Metal kernel.
+
+    This pre-computes argmax using MLX's optimized implementation, then uses
+    a custom Metal kernel to fuse the remaining operations (gather, compare,
+    cumprod, sum) into a single kernel launch.
+
+    Args:
+        tree_logits: (tree_len, vocab_size) Logits at each tree position
+        candidates: (num_candidates, max_depth) Candidate token sequences
+        retrieve_indices: (num_candidates, max_depth) Indices into tree for each candidate
+
+    Returns:
+        accept_lengths: (num_candidates,) Number of tokens accepted for each candidate
+    """
+    if "fused_verification_v2" not in _VERIFICATION_KERNEL_CACHE:
+        _VERIFICATION_KERNEL_CACHE["fused_verification_v2"] = _create_fused_verification_kernel()
+    kernel = _VERIFICATION_KERNEL_CACHE["fused_verification_v2"]
+
+    num_candidates, max_depth = candidates.shape
+
+    # Pre-compute argmax using MLX's optimized implementation
+    # This is much faster than inline argmax in the kernel for large vocab sizes
+    tree_predictions = mx.argmax(tree_logits, axis=-1).astype(mx.int32)
+
+    # Ensure correct dtypes
+    candidates = candidates.astype(mx.int32)
+    retrieve_indices = retrieve_indices.astype(mx.int32)
+
+    dims_arr = mx.array([num_candidates, max_depth], dtype=mx.uint32)
+
+    # One thread per candidate
+    grid_size = num_candidates
+
+    outputs = kernel(
+        inputs=[tree_predictions, candidates, retrieve_indices, dims_arr],
+        grid=(grid_size, 1, 1),
+        threadgroup=(min(256, grid_size), 1, 1),
+        output_shapes=[(num_candidates,)],
+        output_dtypes=[mx.int32],
+    )
+
+    return outputs[0]
+
+
+# ============================================================================
+# Optimized Cache Compaction for Speculative Decoding
+# ============================================================================
+
+
+def compact_cache_tensor_fused(
+    tensor: mx.array,
+    accepted_positions: mx.array,
+    prefix_len: int,
+) -> mx.array:
+    """
+    Optimized cache compaction using gather-based indexing.
+
+    This replaces multiple slice + concatenate operations with a single
+    gather operation. More efficient than a custom kernel because MLX's
+    gather is highly optimized for this access pattern.
+
+    Args:
+        tensor: (batch, n_heads, old_len, head_dim) KV cache tensor
+        accepted_positions: (num_accepted,) positions within tree area to keep
+        prefix_len: Length of prefix to preserve
+
+    Returns:
+        Compacted tensor: (batch, n_heads, prefix_len + num_accepted, head_dim)
+    """
+    num_accepted = accepted_positions.shape[0]
+
+    # Build indices array: [0, 1, ..., prefix_len-1, prefix_len+pos0, prefix_len+pos1, ...]
+    prefix_indices = mx.arange(prefix_len, dtype=mx.int32)
+    accepted_indices = prefix_len + accepted_positions.astype(mx.int32)
+    all_indices = mx.concatenate([prefix_indices, accepted_indices])
+
+    # Use take (gather) along sequence axis
+    # tensor: (batch, n_heads, old_len, head_dim)
+    # all_indices: (new_len,)
+    # Result: (batch, n_heads, new_len, head_dim)
+    return mx.take(tensor, all_indices, axis=2)
 
 
 # ============================================================================
@@ -1141,6 +1356,10 @@ class GemmaMedusaModel:
             candidates: (num_candidates, max_depth) Candidate token sequences
             tree_candidates: (tree_len,) Tokens arranged in tree structure
         """
+        ctx = get_profiling_context()
+        if ctx:
+            ctx.start("candidate_gen")
+
         tree_indices = buffers["tree_indices"]
         retrieve_indices = buffers["retrieve_indices"]
 
@@ -1173,6 +1392,9 @@ class GemmaMedusaModel:
         # Zero out invalid positions
         candidates = candidates * (retrieve_indices >= 0).astype(mx.int32)
 
+        if ctx:
+            ctx.stop("candidate_gen")
+
         return candidates, tree_candidates
 
     def _evaluate_candidates_greedy(
@@ -1181,6 +1403,7 @@ class GemmaMedusaModel:
         candidates: mx.array,
         retrieve_indices: mx.array,
         valid_mask: mx.array,
+        use_fused_kernel: bool = True,
     ) -> Tuple[int, int]:
         """
         Evaluate candidates with greedy acceptance.
@@ -1190,11 +1413,35 @@ class GemmaMedusaModel:
             candidates: (num_candidates, max_depth) Candidate sequences
             retrieve_indices: (num_candidates, max_depth) Indices into tree
             valid_mask: (num_candidates, max_depth) Valid positions
+            use_fused_kernel: If True, try to use fused Metal kernel (default: True)
 
         Returns:
             best_candidate: Index of best candidate path
             accept_length: Number of tokens to accept
         """
+        ctx = get_profiling_context()
+        if ctx:
+            ctx.start("verification")
+
+        # Try fused Metal kernel first (faster, fewer kernel launches)
+        if use_fused_kernel:
+            try:
+                accept_lengths = verify_candidates_fused(
+                    tree_logits, candidates, retrieve_indices
+                )
+                mx.eval(accept_lengths)
+                best_candidate = int(mx.argmax(accept_lengths).item())
+                accept_length = int(accept_lengths[best_candidate].item())
+
+                if ctx:
+                    ctx.stop("verification")
+                return best_candidate, accept_length
+            except Exception as e:
+                # Fall back to Python implementation if kernel fails
+                import warnings
+                warnings.warn(f"Fused verification kernel failed, using fallback: {e}")
+
+        # Python fallback implementation
         safe_indices = mx.clip(retrieve_indices, 0, None)
 
         # Compute argmax for all tree positions
@@ -1214,6 +1461,9 @@ class GemmaMedusaModel:
         best_candidate = int(mx.argmax(accept_lengths).item())
         accept_length = int(accept_lengths[best_candidate].item())
 
+        if ctx:
+            ctx.stop("verification")
+
         return best_candidate, accept_length
 
     def generate_mtp(
@@ -1229,6 +1479,8 @@ class GemmaMedusaModel:
         use_compiled: bool = True,
         num_active_heads: Optional[int] = None,
         use_small_tree: bool = False,
+        profile: bool = False,
+        use_fused_kernels: bool = True,
     ) -> Tuple[List[int], MTPStats]:
         """
         Generate tokens using MTP (Multi-Token Prediction) speculative decoding.
@@ -1251,6 +1503,8 @@ class GemmaMedusaModel:
                 and evaluation to reduce Python overhead.
             num_active_heads: If set, only use first N Medusa heads (default: all)
             use_small_tree: If True, use a smaller tree (~12 positions) for lower overhead
+            profile: If True, collect per-operation timing for kernel optimization
+            use_fused_kernels: If True (default), use fused Metal kernels for verification
 
         Returns:
             Tuple of (generated_token_ids, stats)
@@ -1261,6 +1515,10 @@ class GemmaMedusaModel:
             stop_tokens.update(stop_token_ids)
         if eos_token_id is not None:
             stop_tokens.add(eos_token_id)
+
+        # Set up profiling context if requested
+        profiling_ctx = ProfilingContext(enabled=profile) if profile else None
+        set_profiling_context(profiling_ctx)
 
         if self.medusa_num_heads == 0:
             raise ValueError("Model has no Medusa heads - cannot use MTP generation")
@@ -1348,6 +1606,10 @@ class GemmaMedusaModel:
                     last_main, last_medusa, buffers, topk, temperature
                 )
 
+            # Time the backbone (tree forward pass)
+            if profiling_ctx:
+                profiling_ctx.start("backbone")
+
             if use_tree_attention:
                 # TREE ATTENTION MODE: Use custom attention mask and depth-based RoPE
                 # Build full attention mask: [attend to cache | tree attention]
@@ -1380,6 +1642,9 @@ class GemmaMedusaModel:
                 mx.eval(tree_logits)
                 tree_hidden_states_for_medusa = tree_hidden_states
 
+            if profiling_ctx:
+                profiling_ctx.stop("backbone")
+
             stats.forward_passes += 1
             stats.total_proposed += max_speculation
 
@@ -1395,7 +1660,8 @@ class GemmaMedusaModel:
             else:
                 valid_mask = retrieve_indices >= 0
                 best_candidate, accept_length = self._evaluate_candidates_greedy(
-                    tree_logits, candidates, retrieve_indices, valid_mask
+                    tree_logits, candidates, retrieve_indices, valid_mask,
+                    use_fused_kernel=use_fused_kernels
                 )
 
             # Get accepted token indices and tree positions
@@ -1465,6 +1731,12 @@ class GemmaMedusaModel:
             last_medusa = last_medusa[:, :, 0, :]  # (num_heads, 1, vocab)
 
         stats.tokens_generated = num_generated
+
+        # Collect timing data if profiling was enabled
+        if profiling_ctx:
+            stats.timing = profiling_ctx.get_summary()
+            set_profiling_context(None)  # Clean up
+
         return output_tokens, stats
 
     def generate_simple_speculation(
@@ -1972,8 +2244,9 @@ class GemmaMedusaModel:
         """
         Compact KV cache after tree verification to keep only accepted path.
 
-        Uses concatenation to build the compacted cache (more reliable than gather
-        with MLX's lazy evaluation).
+        Uses optimized single-concatenate to build the compacted cache.
+        Note: A custom Metal kernel was tested but MLX's concatenate is faster
+        for this access pattern due to its optimized memory handling.
 
         Note: Different layers may have different cache lengths (e.g., global attention
         layers in Gemma). We use each layer's actual size to find where tree tokens are.
@@ -1984,6 +2257,10 @@ class GemmaMedusaModel:
             cache_len: Current cache length before tree tokens (for layer 0)
             tree_len: Number of tree tokens added during verification
         """
+        ctx = get_profiling_context()
+        if ctx:
+            ctx.start("cache_compact")
+
         num_accepted = len(accepted_tree_positions)
 
         for layer_cache in cache:
@@ -1996,27 +2273,26 @@ class GemmaMedusaModel:
             # Get this layer's actual cache length (may differ from cache_len for global attention layers)
             layer_total_len = keys.shape[2]
             layer_cache_len = layer_total_len - tree_len  # Tree tokens were appended at the end
-
-            # Extract prefix (original cache before tree tokens)
-            prefix_keys = keys[:, :, :layer_cache_len, :]
-            prefix_values = values[:, :, :layer_cache_len, :]
-
-            # Extract accepted tree positions and concatenate
             layer_final_len = layer_cache_len + num_accepted
+
+            # Optimized single-concatenate implementation
+            # Note: Custom Metal kernel was tested but MLX's concatenate is faster
+            # for this access pattern due to its optimized memory handling.
             if num_accepted > 0:
-                accepted_keys = mx.concatenate([
+                # Build list of slices: prefix + accepted positions
+                key_parts = [keys[:, :, :layer_cache_len, :]] + [
                     keys[:, :, layer_cache_len + pos:layer_cache_len + pos + 1, :]
                     for pos in accepted_tree_positions
-                ], axis=2)
-                accepted_values = mx.concatenate([
+                ]
+                value_parts = [values[:, :, :layer_cache_len, :]] + [
                     values[:, :, layer_cache_len + pos:layer_cache_len + pos + 1, :]
                     for pos in accepted_tree_positions
-                ], axis=2)
-                layer_cache.keys = mx.concatenate([prefix_keys, accepted_keys], axis=2)
-                layer_cache.values = mx.concatenate([prefix_values, accepted_values], axis=2)
+                ]
+                layer_cache.keys = mx.concatenate(key_parts, axis=2)
+                layer_cache.values = mx.concatenate(value_parts, axis=2)
             else:
-                layer_cache.keys = prefix_keys
-                layer_cache.values = prefix_values
+                layer_cache.keys = keys[:, :, :layer_cache_len, :]
+                layer_cache.values = values[:, :, :layer_cache_len, :]
 
             # Update cache internal state (use layer-specific length)
             layer_cache.offset = layer_final_len
@@ -2028,3 +2304,7 @@ class GemmaMedusaModel:
         for layer_cache in cache:
             if layer_cache.keys is not None:
                 mx.eval(layer_cache.keys, layer_cache.values)
+
+        ctx = get_profiling_context()
+        if ctx:
+            ctx.stop("cache_compact")

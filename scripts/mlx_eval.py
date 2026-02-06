@@ -273,6 +273,8 @@ def run_gsm8k_eval(
     skip_eval: bool = False,
     collect_entropy: bool = False,
     entropy_threshold: Optional[float] = None,
+    profile: bool = False,
+    use_fused_kernels: bool = True,
 ):
     """Run GSM8K evaluation."""
     task = GSM8K(subset="main", split="test")
@@ -284,6 +286,7 @@ def run_gsm8k_eval(
     total_forward_passes = 0
     total_skipped = 0  # Track total skipped speculations
     all_entropy_records = []  # Aggregate entropy data from all samples
+    all_timing_data = {}  # Aggregate timing data across samples
 
     n_samples = min(n_samples, task.num_examples())
 
@@ -343,11 +346,22 @@ def run_gsm8k_eval(
                 tree_choices=tree_choices,
                 num_active_heads=depth,
                 use_tree_attention=True,
+                profile=profile,
+                use_fused_kernels=use_fused_kernels,
             )
             elapsed = time.perf_counter() - start
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
             n_tokens = len(output_tokens) - len(input_ids)
             total_forward_passes += stats.forward_passes
+            # Aggregate timing data if profiling
+            if profile and stats.timing:
+                for key, value in stats.timing.items():
+                    if key not in all_timing_data:
+                        all_timing_data[key] = value
+                    elif key.endswith("_total_ms"):
+                        all_timing_data[key] += value
+                    elif key.endswith("_count"):
+                        all_timing_data[key] += value
         elif use_speculation:
             input_ids = model.tokenizer.encode(prompt)
             start = time.perf_counter()
@@ -424,6 +438,22 @@ def run_gsm8k_eval(
             skip_rate = total_skipped / total_forward_passes if total_forward_passes > 0 else 0
             print(f"  Entropy gating: {total_skipped}/{total_forward_passes} skipped ({skip_rate*100:.1f}%)")
 
+    # Print profiling data if collected
+    if profile and all_timing_data:
+        print("\n  Profiling Data (per-operation timing):")
+        # Calculate mean times from totals and counts
+        ops = set(k.replace("_total_ms", "").replace("_count", "").replace("_mean_ms", "") for k in all_timing_data.keys())
+        for op in sorted(ops):
+            total_key = f"{op}_total_ms"
+            count_key = f"{op}_count"
+            if total_key in all_timing_data and count_key in all_timing_data:
+                total_ms = all_timing_data[total_key]
+                count = all_timing_data[count_key]
+                mean_ms = total_ms / count if count > 0 else 0
+                print(f"    {op}: {mean_ms:.3f}ms mean, {total_ms:.1f}ms total ({int(count)} calls)")
+
+    mean_accepted = total_tokens / total_forward_passes if total_forward_passes > 0 else 1.0
+
     return {
         "task": "gsm8k",
         "mode": mode_str,
@@ -433,11 +463,14 @@ def run_gsm8k_eval(
         "avg_tok_s": avg_tok_s,
         "total_tokens": total_tokens,
         "total_time": total_time,
+        "mean_accepted": mean_accepted,
+        "total_forward_passes": total_forward_passes,
         "tree_size": tree_size if tree_choices else None,
         "depth": depth,
         "entropy_threshold": entropy_threshold,
         "speculation_skipped": total_skipped if entropy_threshold else None,
         "entropy_records": [{"entropy": r.entropy, "accept_length": r.accept_length} for r in all_entropy_records] if collect_entropy else None,
+        "timing": all_timing_data if profile else None,
     }
 
 
@@ -453,6 +486,8 @@ def run_humaneval_eval(
     skip_eval: bool = False,
     collect_entropy: bool = False,
     entropy_threshold: Optional[float] = None,
+    profile: bool = False,
+    use_fused_kernels: bool = True,
 ):
     """Run HumanEval evaluation."""
     task = HumanEval()
@@ -464,6 +499,7 @@ def run_humaneval_eval(
     total_forward_passes = 0
     total_skipped = 0  # Track total skipped speculations
     all_entropy_records = []  # Aggregate entropy data from all samples
+    all_timing_data = {}  # Aggregate timing data across samples
 
     n_samples = min(n_samples, task.num_examples())
 
@@ -523,11 +559,22 @@ def run_humaneval_eval(
                 tree_choices=tree_choices,
                 num_active_heads=depth,
                 use_tree_attention=True,
+                profile=profile,
+                use_fused_kernels=use_fused_kernels,
             )
             elapsed = time.perf_counter() - start
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
             n_tokens = len(output_tokens) - len(input_ids)
             total_forward_passes += stats.forward_passes
+            # Aggregate timing data if profiling
+            if profile and stats.timing:
+                for key, value in stats.timing.items():
+                    if key not in all_timing_data:
+                        all_timing_data[key] = value
+                    elif key.endswith("_total_ms"):
+                        all_timing_data[key] += value
+                    elif key.endswith("_count"):
+                        all_timing_data[key] += value
         elif use_speculation:
             input_ids = model.tokenizer.encode(prompt)
             start = time.perf_counter()
@@ -604,6 +651,22 @@ def run_humaneval_eval(
             skip_rate = total_skipped / total_forward_passes if total_forward_passes > 0 else 0
             print(f"  Entropy gating: {total_skipped}/{total_forward_passes} skipped ({skip_rate*100:.1f}%)")
 
+    # Print profiling data if collected
+    if profile and all_timing_data:
+        print("\n  Profiling Data (per-operation timing):")
+        # Calculate mean times from totals and counts
+        ops = set(k.replace("_total_ms", "").replace("_count", "").replace("_mean_ms", "") for k in all_timing_data.keys())
+        for op in sorted(ops):
+            total_key = f"{op}_total_ms"
+            count_key = f"{op}_count"
+            if total_key in all_timing_data and count_key in all_timing_data:
+                total_ms = all_timing_data[total_key]
+                count = all_timing_data[count_key]
+                mean_ms = total_ms / count if count > 0 else 0
+                print(f"    {op}: {mean_ms:.3f}ms mean, {total_ms:.1f}ms total ({int(count)} calls)")
+
+    mean_accepted = total_tokens / total_forward_passes if total_forward_passes > 0 else 1.0
+
     return {
         "task": "humaneval",
         "mode": mode_str,
@@ -613,11 +676,14 @@ def run_humaneval_eval(
         "avg_tok_s": avg_tok_s,
         "total_tokens": total_tokens,
         "total_time": total_time,
+        "mean_accepted": mean_accepted,
+        "total_forward_passes": total_forward_passes,
         "tree_size": tree_size if tree_choices else None,
         "depth": depth,
         "entropy_threshold": entropy_threshold,
         "speculation_skipped": total_skipped if entropy_threshold else None,
         "entropy_records": [{"entropy": r.entropy, "accept_length": r.accept_length} for r in all_entropy_records] if collect_entropy else None,
+        "timing": all_timing_data if profile else None,
     }
 
 
@@ -644,6 +710,14 @@ def main():
                         help="Path to save entropy/acceptance data (JSON) for threshold analysis")
     parser.add_argument("--entropy-threshold", type=float, default=None,
                         help="Skip speculation when main model entropy exceeds this threshold")
+    parser.add_argument("--profile", action="store_true",
+                        help="Collect per-operation timing data for kernel optimization analysis")
+    parser.add_argument("--use-fused-kernels", action="store_true", default=True,
+                        help="Use fused Metal kernels for verification (default: True)")
+    parser.add_argument("--no-fused-kernels", action="store_false", dest="use_fused_kernels",
+                        help="Disable fused Metal kernels (use Python fallback)")
+    parser.add_argument("--results-dir", type=str, default=".",
+                        help="Directory to save results (default: current directory)")
     args = parser.parse_args()
 
     # Expand checkpoint path
@@ -713,7 +787,8 @@ def main():
                                    entropy_threshold=args.entropy_threshold)
             elif tree_choices is not None:
                 r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=False,
-                                   tree_choices=tree_choices, tree_size=args.tree_size, skip_eval=args.skip_eval)
+                                   tree_choices=tree_choices, tree_size=args.tree_size, skip_eval=args.skip_eval,
+                                   profile=args.profile, use_fused_kernels=args.use_fused_kernels)
             else:
                 r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=spec_tokens,
                                    skip_eval=args.skip_eval, collect_entropy=collect_entropy,
@@ -731,7 +806,8 @@ def main():
                                        entropy_threshold=args.entropy_threshold)
             elif tree_choices is not None:
                 r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=False,
-                                       tree_choices=tree_choices, tree_size=args.tree_size, skip_eval=args.skip_eval)
+                                       tree_choices=tree_choices, tree_size=args.tree_size, skip_eval=args.skip_eval,
+                                       profile=args.profile, use_fused_kernels=args.use_fused_kernels)
             else:
                 r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=spec_tokens,
                                        skip_eval=args.skip_eval, collect_entropy=collect_entropy,
@@ -748,7 +824,9 @@ def main():
     # Save results
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"mlx_eval_{timestamp}.json"
+    results_dir = os.path.expanduser(args.results_dir)
+    os.makedirs(results_dir, exist_ok=True)
+    output_file = os.path.join(results_dir, f"mlx_eval_{timestamp}.json")
     with open(output_file, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {output_file}")
