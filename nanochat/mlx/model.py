@@ -75,6 +75,13 @@ SMALL_TREES: Dict[int, List[Tuple[int, ...]]] = {
 
 
 @dataclass
+class EntropyRecord:
+    """Record of entropy and acceptance for a single speculation iteration."""
+    entropy: float  # Entropy of main model logits before speculation
+    accept_length: int  # Number of tokens accepted (1 = only main, 2+ = speculation succeeded)
+
+
+@dataclass
 class MTPStats:
     """Statistics from MTP generation for benchmarking."""
     tokens_generated: int
@@ -82,6 +89,8 @@ class MTPStats:
     total_proposed: int
     total_accepted: int
     timing: Optional[Dict[str, float]] = None
+    entropy_log: Optional[List[EntropyRecord]] = None  # Per-iteration entropy data
+    speculation_skipped: int = 0  # Iterations where speculation was skipped due to entropy gating
 
     @property
     def mean_accepted_length(self) -> float:
@@ -92,6 +101,32 @@ class MTPStats:
     def acceptance_rate(self) -> float:
         """Fraction of proposed tokens that were accepted."""
         return self.total_accepted / max(1, self.total_proposed)
+
+    @property
+    def skip_rate(self) -> float:
+        """Fraction of iterations where speculation was skipped."""
+        return self.speculation_skipped / max(1, self.forward_passes)
+
+
+# ============================================================================
+# Entropy Computation for Adaptive Speculation
+# ============================================================================
+
+def compute_entropy(logits: mx.array) -> float:
+    """
+    Compute entropy of softmax distribution from logits.
+
+    Args:
+        logits: (vocab_size,) logits for single position
+
+    Returns:
+        Scalar entropy value (higher = more uncertain)
+    """
+    probs = mx.softmax(logits, axis=-1)
+    # Avoid log(0) by adding small epsilon
+    log_probs = mx.log(probs + 1e-10)
+    entropy = -mx.sum(probs * log_probs)
+    return float(entropy.item())
 
 
 # ============================================================================
@@ -1438,6 +1473,8 @@ class GemmaMedusaModel:
         max_new_tokens: int = 100,
         eos_token_id: Optional[int] = None,
         stop_token_ids: Optional[set] = None,
+        collect_entropy: bool = False,
+        entropy_threshold: Optional[float] = None,
     ) -> Tuple[List[int], MTPStats]:
         """
         Simple 2-token speculation: predict main + medusa[0], verify both, accept 1 or 2.
@@ -1451,6 +1488,8 @@ class GemmaMedusaModel:
             max_new_tokens: Maximum new tokens to generate
             eos_token_id: EOS token ID for stopping (deprecated, use stop_token_ids)
             stop_token_ids: Set of token IDs that should stop generation
+            collect_entropy: If True, collect per-iteration entropy data for analysis
+            entropy_threshold: If set, skip speculation when entropy exceeds this value
 
         Returns:
             Tuple of (generated_token_ids, stats)
@@ -1466,6 +1505,7 @@ class GemmaMedusaModel:
             raise ValueError("Model has no Medusa heads - cannot use speculation")
 
         cache = self.base_model.make_cache()
+        entropy_log: List[EntropyRecord] = [] if collect_entropy else None
 
         # Prefill
         input_array = mx.array([input_ids], dtype=mx.int32)
@@ -1480,14 +1520,42 @@ class GemmaMedusaModel:
         num_iterations = 0
         total_accepted = 0
 
+        num_skipped = 0  # Track how many times we skipped speculation due to high entropy
+
         while num_generated < max_new_tokens:
-            # Get predictions: main model + medusa head 0
+            # Compute entropy before speculation (if collecting or gating)
+            if collect_entropy or entropy_threshold is not None:
+                entropy = compute_entropy(main_logits[0, 0])
+
+            # Get base token prediction
             token1 = int(mx.argmax(main_logits[0, 0]).item())
-            token2 = int(mx.argmax(medusa_logits[0, 0, 0]).item())
 
             # Check stop tokens
             if stop_tokens and token1 in stop_tokens:
                 break
+
+            # Entropy gating: skip speculation if entropy is too high
+            if entropy_threshold is not None and entropy > entropy_threshold:
+                # High entropy - just forward the single base token (no speculation)
+                num_skipped += 1
+                if collect_entropy:
+                    entropy_log.append(EntropyRecord(entropy=entropy, accept_length=1))
+
+                spec_input = mx.array([[token1]], dtype=mx.int32)
+                h = self._get_hidden_states(spec_input, cache=cache)
+                main_logits, medusa_logits = self._compute_logits(
+                    h, return_medusa=True, last_only=True, num_active_heads=1
+                )
+                mx.eval(main_logits, medusa_logits)
+
+                output_tokens.append(token1)
+                num_generated += 1
+                total_accepted += 1
+                num_iterations += 1
+                continue
+
+            # Get medusa prediction for speculation
+            token2 = int(mx.argmax(medusa_logits[0, 0, 0]).item())
 
             # Forward both tokens with standard causal attention
             spec_input = mx.array([[token1, token2]], dtype=mx.int32)
@@ -1502,6 +1570,10 @@ class GemmaMedusaModel:
             verified_token2 = int(mx.argmax(verify_logits[0, 0]).item())
 
             if verified_token2 == token2:
+                # Log entropy with accept_length=2
+                if collect_entropy:
+                    entropy_log.append(EntropyRecord(entropy=entropy, accept_length=2))
+
                 # Check stop tokens before adding
                 if stop_tokens and token2 in stop_tokens:
                     # token2 is stop - add both and stop
@@ -1519,6 +1591,10 @@ class GemmaMedusaModel:
                 main_logits = verify_logits[:, 1:2, :]
                 medusa_logits = new_medusa[:, :, 1:2, :]
             else:
+                # Log entropy with accept_length=1
+                if collect_entropy:
+                    entropy_log.append(EntropyRecord(entropy=entropy, accept_length=1))
+
                 # Only token1 accepted - trim the second token from cache
                 trim_cache(cache, 1)
 
@@ -1539,8 +1615,10 @@ class GemmaMedusaModel:
         stats = MTPStats(
             tokens_generated=num_generated,
             forward_passes=num_iterations + 1,  # +1 for prefill
-            total_proposed=num_iterations * 2,  # Always propose 2 tokens
+            total_proposed=(num_iterations - num_skipped) * 2 + num_skipped,  # 2 when speculating, 1 when skipped
             total_accepted=total_accepted,
+            entropy_log=entropy_log,
+            speculation_skipped=num_skipped,
         )
         return output_tokens, stats
 
@@ -1703,6 +1781,8 @@ class GemmaMedusaModel:
         max_new_tokens: int = 100,
         eos_token_id: Optional[int] = None,
         stop_token_ids: Optional[set] = None,
+        collect_entropy: bool = False,
+        entropy_threshold: Optional[float] = None,
     ) -> Tuple[List[int], MTPStats]:
         """
         Optimized 3-token speculation using 2 Medusa heads.
@@ -1718,6 +1798,8 @@ class GemmaMedusaModel:
             max_new_tokens: Maximum new tokens to generate
             eos_token_id: EOS token ID for stopping (deprecated, use stop_token_ids)
             stop_token_ids: Set of token IDs that should stop generation
+            collect_entropy: If True, collect per-iteration entropy data for analysis
+            entropy_threshold: If set, skip speculation when entropy exceeds this value
 
         Returns:
             Tuple of (generated_token_ids, stats)
@@ -1733,6 +1815,7 @@ class GemmaMedusaModel:
             raise ValueError("Need at least 2 Medusa heads for depth-2 speculation")
 
         cache = self.base_model.make_cache()
+        entropy_log: List[EntropyRecord] = [] if collect_entropy else None
 
         # Prefill - need 2 heads
         input_array = mx.array([input_ids], dtype=mx.int32)
@@ -1747,19 +1830,44 @@ class GemmaMedusaModel:
         num_iterations = 0
         total_accepted = 0
         total_proposed = 0
+        num_skipped = 0  # Track how many times we skipped speculation due to high entropy
 
         while num_generated < max_new_tokens:
-            # Get predictions:
-            # - token1: argmax of main model (position +0)
-            # - token2: argmax of head0 (position +1)
-            # - token3: argmax of head1 (position +2)
+            # Compute entropy before speculation (if collecting or gating)
+            if collect_entropy or entropy_threshold is not None:
+                entropy = compute_entropy(main_logits[0, 0])
+
+            # Get base token prediction
             token1 = int(mx.argmax(main_logits[0, 0]).item())
-            token2 = int(mx.argmax(medusa_logits[0, 0, 0]).item())  # head0
-            token3 = int(mx.argmax(medusa_logits[1, 0, 0]).item())  # head1
 
             # Check stop tokens
             if stop_tokens and token1 in stop_tokens:
                 break
+
+            # Entropy gating: skip speculation if entropy is too high
+            if entropy_threshold is not None and entropy > entropy_threshold:
+                # High entropy - just forward the single base token (no speculation)
+                num_skipped += 1
+                total_proposed += 1
+                if collect_entropy:
+                    entropy_log.append(EntropyRecord(entropy=entropy, accept_length=1))
+
+                spec_input = mx.array([[token1]], dtype=mx.int32)
+                h = self._get_hidden_states(spec_input, cache=cache)
+                main_logits, medusa_logits = self._compute_logits(
+                    h, return_medusa=True, last_only=True, num_active_heads=2
+                )
+                mx.eval(main_logits, medusa_logits)
+
+                output_tokens.append(token1)
+                num_generated += 1
+                total_accepted += 1
+                num_iterations += 1
+                continue
+
+            # Get medusa predictions for speculation
+            token2 = int(mx.argmax(medusa_logits[0, 0, 0]).item())  # head0
+            token3 = int(mx.argmax(medusa_logits[1, 0, 0]).item())  # head1
 
             # Forward all 3 tokens
             spec_input = mx.array([[token1, token2, token3]], dtype=mx.int32)
@@ -1779,6 +1887,10 @@ class GemmaMedusaModel:
             total_proposed += 3
 
             if verified_token2 == token2 and verified_token3 == token3:
+                # Log entropy with accept_length=3
+                if collect_entropy:
+                    entropy_log.append(EntropyRecord(entropy=entropy, accept_length=3))
+
                 # Check stop tokens before adding
                 if stop_tokens and token2 in stop_tokens:
                     output_tokens.extend([token1, token2])
@@ -1803,6 +1915,10 @@ class GemmaMedusaModel:
                 medusa_logits = new_medusa[:, :, 2:3, :]
 
             elif verified_token2 == token2:
+                # Log entropy with accept_length=2
+                if collect_entropy:
+                    entropy_log.append(EntropyRecord(entropy=entropy, accept_length=2))
+
                 # token1 and token2 accepted, token3 rejected
                 trim_cache(cache, 1)
 
@@ -1818,6 +1934,10 @@ class GemmaMedusaModel:
                 medusa_logits = new_medusa[:, :, 1:2, :]
 
             else:
+                # Log entropy with accept_length=1
+                if collect_entropy:
+                    entropy_log.append(EntropyRecord(entropy=entropy, accept_length=1))
+
                 # Only token1 accepted
                 trim_cache(cache, 2)
 
@@ -1837,6 +1957,8 @@ class GemmaMedusaModel:
             forward_passes=num_iterations + 1,
             total_proposed=total_proposed,
             total_accepted=total_accepted,
+            entropy_log=entropy_log,
+            speculation_skipped=num_skipped,
         )
         return output_tokens, stats
 

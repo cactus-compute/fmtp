@@ -271,6 +271,8 @@ def run_gsm8k_eval(
     tree_size: Optional[int] = None,
     use_depth2: bool = False,
     skip_eval: bool = False,
+    collect_entropy: bool = False,
+    entropy_threshold: Optional[float] = None,
 ):
     """Run GSM8K evaluation."""
     task = GSM8K(subset="main", split="test")
@@ -280,6 +282,8 @@ def run_gsm8k_eval(
     total_tokens = 0
     total_time = 0.0
     total_forward_passes = 0
+    total_skipped = 0  # Track total skipped speculations
+    all_entropy_records = []  # Aggregate entropy data from all samples
 
     n_samples = min(n_samples, task.num_examples())
 
@@ -318,11 +322,16 @@ def run_gsm8k_eval(
                 input_ids=input_ids,
                 max_new_tokens=max_tokens,
                 stop_token_ids=model.tokenizer.eos_token_ids,
+                collect_entropy=collect_entropy,
+                entropy_threshold=entropy_threshold,
             )
             elapsed = time.perf_counter() - start
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
             n_tokens = len(output_tokens) - len(input_ids)
             total_forward_passes += stats.forward_passes
+            total_skipped += stats.speculation_skipped
+            if collect_entropy and stats.entropy_log:
+                all_entropy_records.extend(stats.entropy_log)
         elif tree_choices is not None:
             # Tree-based speculation using generate_mtp with tree attention
             input_ids = model.tokenizer.encode(prompt)
@@ -353,12 +362,17 @@ def run_gsm8k_eval(
                     input_ids=input_ids,
                     max_new_tokens=max_tokens,
                     stop_token_ids=model.tokenizer.eos_token_ids,
+                    collect_entropy=collect_entropy,
+                    entropy_threshold=entropy_threshold,
                 )
             elapsed = time.perf_counter() - start
             # Decode response (only new tokens)
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
             n_tokens = len(output_tokens) - len(input_ids)
             total_forward_passes += stats.forward_passes
+            total_skipped += stats.speculation_skipped
+            if collect_entropy and stats.entropy_log:
+                all_entropy_records.extend(stats.entropy_log)
         else:
             start = time.perf_counter()
             response, n_tokens, _ = model.generate_standard(
@@ -406,6 +420,9 @@ def run_gsm8k_eval(
     if use_speculation or tree_choices or use_depth2:
         mean_accepted = total_tokens / total_forward_passes if total_forward_passes > 0 else 0
         print(f"  Mean accepted: {mean_accepted:.2f} tokens/iter")
+        if entropy_threshold is not None:
+            skip_rate = total_skipped / total_forward_passes if total_forward_passes > 0 else 0
+            print(f"  Entropy gating: {total_skipped}/{total_forward_passes} skipped ({skip_rate*100:.1f}%)")
 
     return {
         "task": "gsm8k",
@@ -418,6 +435,9 @@ def run_gsm8k_eval(
         "total_time": total_time,
         "tree_size": tree_size if tree_choices else None,
         "depth": depth,
+        "entropy_threshold": entropy_threshold,
+        "speculation_skipped": total_skipped if entropy_threshold else None,
+        "entropy_records": [{"entropy": r.entropy, "accept_length": r.accept_length} for r in all_entropy_records] if collect_entropy else None,
     }
 
 
@@ -431,6 +451,8 @@ def run_humaneval_eval(
     tree_size: Optional[int] = None,
     use_depth2: bool = False,
     skip_eval: bool = False,
+    collect_entropy: bool = False,
+    entropy_threshold: Optional[float] = None,
 ):
     """Run HumanEval evaluation."""
     task = HumanEval()
@@ -440,6 +462,8 @@ def run_humaneval_eval(
     total_tokens = 0
     total_time = 0.0
     total_forward_passes = 0
+    total_skipped = 0  # Track total skipped speculations
+    all_entropy_records = []  # Aggregate entropy data from all samples
 
     n_samples = min(n_samples, task.num_examples())
 
@@ -478,11 +502,16 @@ def run_humaneval_eval(
                 input_ids=input_ids,
                 max_new_tokens=max_tokens,
                 stop_token_ids=model.tokenizer.eos_token_ids,
+                collect_entropy=collect_entropy,
+                entropy_threshold=entropy_threshold,
             )
             elapsed = time.perf_counter() - start
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
             n_tokens = len(output_tokens) - len(input_ids)
             total_forward_passes += stats.forward_passes
+            total_skipped += stats.speculation_skipped
+            if collect_entropy and stats.entropy_log:
+                all_entropy_records.extend(stats.entropy_log)
         elif tree_choices is not None:
             # Tree-based speculation using generate_mtp with tree attention
             input_ids = model.tokenizer.encode(prompt)
@@ -513,12 +542,17 @@ def run_humaneval_eval(
                     input_ids=input_ids,
                     max_new_tokens=max_tokens,
                     stop_token_ids=model.tokenizer.eos_token_ids,
+                    collect_entropy=collect_entropy,
+                    entropy_threshold=entropy_threshold,
                 )
             elapsed = time.perf_counter() - start
             # Decode response (only new tokens)
             response = model.tokenizer.decode(output_tokens[len(input_ids):])
             n_tokens = len(output_tokens) - len(input_ids)
             total_forward_passes += stats.forward_passes
+            total_skipped += stats.speculation_skipped
+            if collect_entropy and stats.entropy_log:
+                all_entropy_records.extend(stats.entropy_log)
         else:
             start = time.perf_counter()
             response, n_tokens, _ = model.generate_standard(
@@ -566,6 +600,9 @@ def run_humaneval_eval(
     if use_speculation or tree_choices or use_depth2:
         mean_accepted = total_tokens / total_forward_passes if total_forward_passes > 0 else 0
         print(f"  Mean accepted: {mean_accepted:.2f} tokens/iter")
+        if entropy_threshold is not None:
+            skip_rate = total_skipped / total_forward_passes if total_forward_passes > 0 else 0
+            print(f"  Entropy gating: {total_skipped}/{total_forward_passes} skipped ({skip_rate*100:.1f}%)")
 
     return {
         "task": "humaneval",
@@ -578,6 +615,9 @@ def run_humaneval_eval(
         "total_time": total_time,
         "tree_size": tree_size if tree_choices else None,
         "depth": depth,
+        "entropy_threshold": entropy_threshold,
+        "speculation_skipped": total_skipped if entropy_threshold else None,
+        "entropy_records": [{"entropy": r.entropy, "accept_length": r.accept_length} for r in all_entropy_records] if collect_entropy else None,
     }
 
 
@@ -600,6 +640,10 @@ def main():
                         help="Speculation size: 1=baseline, 2=simple-2tok, 3=depth2, 4+=tree-mtp")
     parser.add_argument("--skip-eval", action="store_true",
                         help="Skip correctness evaluation (for speed benchmarking only)")
+    parser.add_argument("--collect-entropy-data", type=str, default=None,
+                        help="Path to save entropy/acceptance data (JSON) for threshold analysis")
+    parser.add_argument("--entropy-threshold", type=float, default=None,
+                        help="Skip speculation when main model entropy exceeds this threshold")
     args = parser.parse_args()
 
     # Expand checkpoint path
@@ -652,6 +696,7 @@ def main():
                 print(f"Tree nodes: {tree_choices[:10]}..." if len(tree_choices) > 10 else f"Tree nodes: {tree_choices}")
 
     results = []
+    collect_entropy = args.collect_entropy_data is not None
 
     run_baseline = not args.speculation_only
     # For tree-size 1, only run baseline
@@ -664,12 +709,15 @@ def main():
         if run_speculation:
             if use_depth2:
                 r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=False,
-                                   use_depth2=True, skip_eval=args.skip_eval)
+                                   use_depth2=True, skip_eval=args.skip_eval, collect_entropy=collect_entropy,
+                                   entropy_threshold=args.entropy_threshold)
             elif tree_choices is not None:
                 r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=False,
                                    tree_choices=tree_choices, tree_size=args.tree_size, skip_eval=args.skip_eval)
             else:
-                r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=spec_tokens, skip_eval=args.skip_eval)
+                r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=spec_tokens,
+                                   skip_eval=args.skip_eval, collect_entropy=collect_entropy,
+                                   entropy_threshold=args.entropy_threshold)
             results.append(r)
 
     if args.task in ["humaneval", "both"]:
@@ -679,12 +727,15 @@ def main():
         if run_speculation:
             if use_depth2:
                 r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=False,
-                                       use_depth2=True, skip_eval=args.skip_eval)
+                                       use_depth2=True, skip_eval=args.skip_eval, collect_entropy=collect_entropy,
+                                       entropy_threshold=args.entropy_threshold)
             elif tree_choices is not None:
                 r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=False,
                                        tree_choices=tree_choices, tree_size=args.tree_size, skip_eval=args.skip_eval)
             else:
-                r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=spec_tokens, skip_eval=args.skip_eval)
+                r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=spec_tokens,
+                                       skip_eval=args.skip_eval, collect_entropy=collect_entropy,
+                                       entropy_threshold=args.entropy_threshold)
             results.append(r)
 
     # Summary
@@ -701,6 +752,28 @@ def main():
     with open(output_file, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {output_file}")
+
+    # Save entropy data if collected
+    if args.collect_entropy_data:
+        all_entropy_records = []
+        for r in results:
+            if r.get("entropy_records"):
+                for rec in r["entropy_records"]:
+                    rec["task"] = r["task"]
+                    rec["mode"] = r["mode"]
+                    all_entropy_records.append(rec)
+
+        if all_entropy_records:
+            with open(args.collect_entropy_data, "w") as f:
+                json.dump({
+                    "records": all_entropy_records,
+                    "total_iterations": len(all_entropy_records),
+                    "summary": {
+                        "mean_entropy": sum(r["entropy"] for r in all_entropy_records) / len(all_entropy_records),
+                        "mean_accept_length": sum(r["accept_length"] for r in all_entropy_records) / len(all_entropy_records),
+                    }
+                }, f, indent=2)
+            print(f"Entropy data saved to {args.collect_entropy_data} ({len(all_entropy_records)} iterations)")
 
 
 if __name__ == "__main__":
