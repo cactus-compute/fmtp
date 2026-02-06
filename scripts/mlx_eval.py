@@ -597,7 +597,7 @@ def main():
     parser.add_argument("--depth2", action="store_true",
                         help="Use optimized depth-2 speculation (2 heads, 3 tokens)")
     parser.add_argument("--tree-size", type=int, default=None,
-                        help="Tree size for tree-based speculation (overrides --spec-tokens)")
+                        help="Speculation size: 1=baseline, 2=simple-2tok, 3=depth2, 4+=tree-mtp")
     parser.add_argument("--skip-eval", action="store_true",
                         help="Skip correctness evaluation (for speed benchmarking only)")
     args = parser.parse_args()
@@ -613,41 +613,63 @@ def main():
     )
     print("Model loaded!")
 
-    # Generate optimal tree if --tree-size specified
+    # Determine speculation mode based on --tree-size
+    # tree-size 1: baseline (no speculation)
+    # tree-size 2: simple 2-token speculation
+    # tree-size 3: depth-2 speculation (2 heads, 3 tokens)
+    # tree-size 4+: tree-based speculation with generate_mtp
     tree_choices = None
+    use_depth2 = args.depth2
+    spec_tokens = args.spec_tokens
+
     if args.tree_size is not None:
-        head_acc_path = os.path.join(checkpoint_path, "head_acc.json")
-        tree_choices = generate_optimal_tree(
-            head_acc_path=head_acc_path,
-            num_heads=model.medusa_num_heads,
-            tree_size=args.tree_size,
-        )
-        if tree_choices is None:
-            print(f"Warning: Could not load head_acc.json from {head_acc_path}")
-            print("Falling back to simple speculation")
+        if args.tree_size == 1:
+            # Size 1 = baseline (just main model prediction)
+            print("Using tree-size 1: baseline (no speculation)")
+            # Will only run baseline
+        elif args.tree_size == 2:
+            # Size 2 = simple 2-token speculation
+            print("Using tree-size 2: simple 2-token speculation")
+            spec_tokens = 2
+        elif args.tree_size == 3:
+            # Size 3 = depth-2 speculation (2 heads)
+            print("Using tree-size 3: depth-2 speculation (2 heads, 3 tokens)")
+            use_depth2 = True
         else:
-            depth = get_tree_max_depth(tree_choices)
-            print(f"Using optimal tree: size={len(tree_choices)}, depth={depth}")
-            print(f"Tree nodes: {tree_choices[:10]}..." if len(tree_choices) > 10 else f"Tree nodes: {tree_choices}")
+            # Size 4+ = tree-based speculation
+            head_acc_path = os.path.join(checkpoint_path, "head_acc.json")
+            tree_choices = generate_optimal_tree(
+                head_acc_path=head_acc_path,
+                num_heads=model.medusa_num_heads,
+                tree_size=args.tree_size,
+            )
+            if tree_choices is None:
+                print(f"Warning: Could not load head_acc.json from {head_acc_path}")
+                print("Falling back to simple speculation")
+            else:
+                depth = get_tree_max_depth(tree_choices)
+                print(f"Using optimal tree: size={len(tree_choices)}, depth={depth}")
+                print(f"Tree nodes: {tree_choices[:10]}..." if len(tree_choices) > 10 else f"Tree nodes: {tree_choices}")
 
     results = []
 
     run_baseline = not args.speculation_only
-    run_speculation = not args.baseline_only
+    # For tree-size 1, only run baseline
+    run_speculation = not args.baseline_only and args.tree_size != 1
 
     if args.task in ["gsm8k", "both"]:
         if run_baseline:
             r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=False, skip_eval=args.skip_eval)
             results.append(r)
         if run_speculation:
-            if args.depth2:
+            if use_depth2:
                 r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=False,
                                    use_depth2=True, skip_eval=args.skip_eval)
             elif tree_choices is not None:
                 r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=False,
                                    tree_choices=tree_choices, tree_size=args.tree_size, skip_eval=args.skip_eval)
             else:
-                r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=args.spec_tokens, skip_eval=args.skip_eval)
+                r = run_gsm8k_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=spec_tokens, skip_eval=args.skip_eval)
             results.append(r)
 
     if args.task in ["humaneval", "both"]:
@@ -655,14 +677,14 @@ def main():
             r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=False, skip_eval=args.skip_eval)
             results.append(r)
         if run_speculation:
-            if args.depth2:
+            if use_depth2:
                 r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=False,
                                        use_depth2=True, skip_eval=args.skip_eval)
             elif tree_choices is not None:
                 r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=False,
                                        tree_choices=tree_choices, tree_size=args.tree_size, skip_eval=args.skip_eval)
             else:
-                r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=args.spec_tokens, skip_eval=args.skip_eval)
+                r = run_humaneval_eval(model, args.n, args.max_tokens, use_speculation=True, spec_tokens=spec_tokens, skip_eval=args.skip_eval)
             results.append(r)
 
     # Summary

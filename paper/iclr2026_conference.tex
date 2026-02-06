@@ -79,7 +79,7 @@ We report decoding throughput (tokens per second, tps) under single-batch infere
 
 We first validate that multi-token prediction (MTP) provides meaningful throughput gains for small models in the standard GPU setting. We trained Medusa and Eagle variants on our self-distilled trajectories and evaluated them using single-batch decoding throughput \citep{cai2024medusa, li2024eagle}. Across both GSM8K and HumanEval, we observe that stronger draft alignment from KL divergence loss correlates with higher acceptance and higher throughput: switching Medusa to KL-only training increases throughput from 35.9 to 49.5 tps on GSM8K and 33.6 to 49.2 tps on HumanEval (Tables~\ref{tab:gsm8k}--\ref{tab:humaneval}) \citep{cobbe2021gsm8k, chen2021humaneval}.
 
-The Eagle results show a preference for depth. On HumanEval, throughput rose from 34.2 to 50.5 to 56.2 tps with depth of 1, 2, and 3, respectively. However, at this small model, 270M scale, Eagle's superior multi-token prediction performance of 2.4 additional tokens for depth 3, compared to Medusa's approximately 1.0, only translates to a speedup of between 0.0 to 7.0 tps because it's a much heavier prediction module. Even for the high operational intensity A100s, Eagle is heavy.
+The Eagle results show a preference for depth. On HumanEval, throughput rose from 48.5 to 50.5 to 56.2 tps with depth of 1, 2, and 3, respectively. At depth 1, Eagle achieves comparable throughput to Medusa KL-only (48.5 vs 49.2 tps) with similar token acceptance (0.94 vs 0.96 additional tokens). However, at this small model, 270M scale, Eagle's superior multi-token prediction performance of 2.68 additional tokens at depth 3 only translates to a speedup of 7.0 tps over Medusa because it's a much heavier prediction module. Even for the high operational intensity A100s, Eagle is heavy.
 
 \begin{table}[t]
 \caption{GSM8K --- Decoding Throughput}
@@ -93,7 +93,7 @@ The Eagle results show a preference for depth. On HumanEval, throughput rose fro
 Baseline & --- & --- & 35.9 & 1.00$\times$ \\
 Medusa & 270M, 2 layers & 0.54 & 39.2 & 1.09$\times$ \\
 Medusa & Model 1, KL-only & 1.15 & 49.5 & 1.52$\times$ \\
-EAGLE & Depth 1 (Top-k) & 0.61 & 34.3 & 0.96$\times$ \\
+EAGLE & Depth 1 (Top-k) & 0.94 & 49.5 & 1.38$\times$ \\
 EAGLE & Depth 2 & 1.78 & 49.4 & 1.38$\times$ \\
 EAGLE & Depth 3 & 2.42 & 50.7 & 1.52$\times$ \\
 \bottomrule
@@ -113,7 +113,7 @@ EAGLE & Depth 3 & 2.42 & 50.7 & 1.52$\times$ \\
 Baseline & --- & --- & 33.6 & 1.00$\times$ \\
 Medusa & 270M, 2 layers & 0.35 & 34.0 & 1.01$\times$ \\
 Medusa & Model 1, KL-only & 0.96 & 49.2 & 1.47$\times$ \\
-EAGLE & Depth 1 (Top-k) & 0.59 & 34.2 & 1.02$\times$ \\
+EAGLE & Depth 1 (Top-k) & 0.94 & 48.5 & 1.44$\times$ \\
 EAGLE & Depth 2 & 1.89 & 50.5 & 1.50$\times$ \\
 EAGLE & Depth 3 & 2.68 & 56.2 & 1.64$\times$ \\
 \bottomrule
@@ -185,28 +185,5 @@ Consequently, we present a hardware-aware minimalist recipe for on-device infere
 \bibliographystyle{iclr2026_conference}
 
 \appendix
-\section{Detailed Profiling Results}
-
-\begin{table}[h]
-\caption{Average Time (ms) by Context and Tree Size on Apple M4 Pro}
-\label{tab:appendix_time}
-\begin{center}
-\scriptsize
-\begin{tabular}{c|ccccccccccc}
-\toprule
-Ctx$\backslash$Tree & 1 & 2 & 4 & 8 & 16 & 20 & 21 & 40 & 80 \\
-\midrule
-1 & 8.8 & 9.4 & 9.5 & 23.0 & 13.8 & 16.5 & 17.6 & 20.2 & 37.1 \\
-2 & 8.9 & 10.0 & 14.2 & 11.2 & 12.9 & 16.4 & 19.3 & 24.5 & 40.5 \\
-4 & 8.4 & 13.4 & 14.0 & 11.1 & 14.6 & 17.3 & 17.9 & 23.3 & 44.3 \\
-8 & 8.4 & 10.9 & 15.9 & 11.3 & 14.0 & 17.0 & 17.1 & 21.1 & 36.2 \\
-16 & 10.8 & 11.7 & 13.9 & 14.3 & 15.6 & 18.3 & 18.6 & 22.1 & 36.0 \\
-32 & 10.8 & 12.7 & 15.9 & 15.8 & 15.2 & 19.3 & 21.2 & 26.8 & 46.1 \\
-64 & 11.6 & 14.8 & 14.0 & 15.0 & 14.9 & 18.0 & 18.8 & 24.4 & 38.2 \\
-128 & 13.8 & 19.8 & 20.3 & 19.2 & 18.8 & 22.6 & 21.1 & 25.8 & 46.6 \\
-\bottomrule
-\end{tabular}
-\end{center}
-\end{table}
 
 \end{document}

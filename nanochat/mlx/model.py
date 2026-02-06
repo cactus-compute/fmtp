@@ -1906,4 +1906,3 @@ class GemmaMedusaModel:
         for layer_cache in cache:
             if layer_cache.keys is not None:
                 mx.eval(layer_cache.keys, layer_cache.values)
-        print(f"DEBUG compact: expected={final_len}, actual={cache[0].keys.shape[2]}, offset={cache[0].offset}")
