@@ -1,0 +1,87 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{leviathan2023fast,chen2023accelerating}
+\citation{cai2024medusa,li2024eagle}
+\citation{google2024gemma}
+\citation{apple2024m4,hannun2023mlx}
+\citation{miao2024specinfer}
+\citation{williams2009roofline}
+\citation{williams2009roofline}
+\citation{leviathan2023fast,chen2023accelerating,gloeckle2024better}
+\citation{cai2024medusa}
+\citation{li2024eagle}
+\citation{miao2024specinfer}
+\citation{nvidia2020a100}
+\citation{apple2024m4}
+\citation{hannun2023mlx}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Contributions.}{1}{section*.1}\protected@file@percent }
+\citation{cai2024medusa,li2024eagle}
+\citation{cai2024medusa,miao2024specinfer}
+\citation{leviathan2023fast}
+\citation{cai2024medusa}
+\citation{miao2024specinfer}
+\citation{chen2023accelerating}
+\citation{cai2024medusa}
+\citation{li2024eagle}
+\citation{hu2021lora}
+\citation{penedo2024fineweb}
+\citation{teknium2023openhermes}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Parameter overhead on Gemma 3 270M: dense Medusa heads bloat size (256k vocab), while our draft heads add negligible overhead.}}{2}{table.1}\protected@file@percent }
+\newlabel{tab:memory_overhead}{{1}{2}{Parameter overhead on Gemma 3 270M: dense Medusa heads bloat size (256k vocab), while our draft heads add negligible overhead}{table.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Methodology}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Architecture Variants}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Medusa}{2}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Inference Verification}{2}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Eagle}{2}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Ours: Lite MTP}{2}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Training Rigor and Loss}{2}{subsection.2.2}\protected@file@percent }
+\citation{hannun2023mlx}
+\citation{cai2024medusa,li2024eagle}
+\citation{cobbe2021gsm8k,chen2021humaneval}
+\citation{hannun2023mlx}
+\citation{apple2024m4,nvidia2020a100}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Recall@k for Medusa head configurations on the self-distilled dataset. KL loss dramatically outperforms CE, while head type differences are minimal.}}{3}{table.2}\protected@file@percent }
+\newlabel{tab:head_recall}{{2}{3}{Recall@k for Medusa head configurations on the self-distilled dataset. KL loss dramatically outperforms CE, while head type differences are minimal}{table.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces GPU Decoding Throughput on GSM8K (left) and HumanEval (right). Tok/Step is the average total tokens accepted per decoding step (including the 1 token from the backbone). The baseline tok/s are 35.2 and 33.6 for GSM8K and HumanEval respectively. KL divergence training improves Medusa acceptance rates, while Eagle benefits from increased depth and accuracy.}}{3}{table.3}\protected@file@percent }
+\newlabel{tab:gpu_throughput}{{3}{3}{GPU Decoding Throughput on GSM8K (left) and HumanEval (right). Tok/Step is the average total tokens accepted per decoding step (including the 1 token from the backbone). The baseline tok/s are 35.2 and 33.6 for GSM8K and HumanEval respectively. KL divergence training improves Medusa acceptance rates, while Eagle benefits from increased depth and accuracy}{table.3}{}}
+\newlabel{tab:gsm8k}{{3}{3}{GPU Decoding Throughput on GSM8K (left) and HumanEval (right). Tok/Step is the average total tokens accepted per decoding step (including the 1 token from the backbone). The baseline tok/s are 35.2 and 33.6 for GSM8K and HumanEval respectively. KL divergence training improves Medusa acceptance rates, while Eagle benefits from increased depth and accuracy}{table.3}{}}
+\newlabel{tab:humaneval}{{3}{3}{GPU Decoding Throughput on GSM8K (left) and HumanEval (right). Tok/Step is the average total tokens accepted per decoding step (including the 1 token from the backbone). The baseline tok/s are 35.2 and 33.6 for GSM8K and HumanEval respectively. KL divergence training improves Medusa acceptance rates, while Eagle benefits from increased depth and accuracy}{table.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Evaluation Setup}{3}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Experiments \& Results}{3}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}GPU Baseline}{3}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Edge Failure}{3}{subsection.3.2}\protected@file@percent }
+\citation{cobbe2021gsm8k}
+\citation{chen2021humaneval}
+\citation{apple2024m4}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Profiling on MLX (M4 Pro) vs A100: tree size shifts backbone/verification cost.}}{4}{figure.1}\protected@file@percent }
+\newlabel{fig:edge_profile}{{1}{4}{Profiling on MLX (M4 Pro) vs A100: tree size shifts backbone/verification cost}{figure.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces MLX results on GSM8K and HumanEval. Tok/Step = average tokens accepted per decoding step. Lite MTP is fastest.}}{4}{table.4}\protected@file@percent }
+\newlabel{tab:mlx_results}{{4}{4}{MLX results on GSM8K and HumanEval. Tok/Step = average tokens accepted per decoding step. Lite MTP is fastest}{table.4}{}}
+\newlabel{tab:mlx_gsm8k}{{4}{4}{MLX results on GSM8K and HumanEval. Tok/Step = average tokens accepted per decoding step. Lite MTP is fastest}{table.4}{}}
+\newlabel{tab:mlx_humaneval}{{4}{4}{MLX results on GSM8K and HumanEval. Tok/Step = average tokens accepted per decoding step. Lite MTP is fastest}{table.4}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Profiling Comparison (Context = 16). Backbone cost scales 3.17$\times $ on MLX vs 1.12$\times $ on GPU as tree size grows from 1 to 80.}}{4}{table.5}\protected@file@percent }
+\newlabel{tab:profiling}{{5}{4}{Profiling Comparison (Context = 16). Backbone cost scales 3.17$\times $ on MLX vs 1.12$\times $ on GPU as tree size grows from 1 to 80}{table.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Minimalist Speculation}{4}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Conclusion}{4}{section.4}\protected@file@percent }
+\bibdata{references}
+\bibcite{apple2024m4}{{1}{2024}{{Apple}}{{}}}
+\bibcite{cai2024medusa}{{2}{2024}{{Cai et~al.}}{{Cai, Li, Geng, Peng, Lee, Chen, and Dao}}}
+\bibcite{chen2023accelerating}{{3}{2023}{{Chen et~al.}}{{Chen, Borgeaud, Irving, Lespiau, Sifre, and Jumper}}}
+\bibcite{chen2021humaneval}{{4}{2021}{{Chen et~al.}}{{Chen, Tworek, Jun, Yuan, Pinto, Kaplan, Edwards, Burda, Joseph, Brockman, et~al.}}}
+\bibcite{cobbe2021gsm8k}{{5}{2021}{{Cobbe et~al.}}{{Cobbe, Kosaraju, Bavarian, Chen, Jun, Kaiser, Plappert, Tworek, Hilton, Nakano, et~al.}}}
+\bibcite{gloeckle2024better}{{6}{2024}{{Gloeckle et~al.}}{{Gloeckle, Idrissi, Roziere, Lopez-Paz, and Synnaeve}}}
+\bibcite{google2024gemma}{{7}{2024}{{Google DeepMind}}{{}}}
+\bibcite{hannun2023mlx}{{8}{2023}{{Hannun et~al.}}{{}}}
+\bibcite{hu2021lora}{{9}{2021}{{Hu et~al.}}{{Hu, Shen, Wallis, Allen-Zhu, Li, Wang, Wang, and Chen}}}
+\bibcite{leviathan2023fast}{{10}{2023}{{Leviathan et~al.}}{{Leviathan, Kalman, and Matias}}}
+\bibcite{li2024eagle}{{11}{2024}{{Li et~al.}}{{Li, Fan, Chu, and Li}}}
+\bibcite{miao2024specinfer}{{12}{2024}{{Miao et~al.}}{{Miao, Oliaro, Zhang, Cheng, Wang, Zhang, Wong, Zhu, Yang, Shi, et~al.}}}
+\bibcite{nvidia2020a100}{{13}{2020}{{NVIDIA}}{{}}}
+\bibcite{penedo2024fineweb}{{14}{2024}{{Penedo et~al.}}{{Penedo, Kydlicek, Cappelli, Saez~de Ocariz~Borde, Olocco, and Villanova~del Moral}}}
+\bibcite{teknium2023openhermes}{{15}{2023}{{Teknium}}{{}}}
+\bibcite{williams2009roofline}{{16}{2009}{{Williams et~al.}}{{Williams, Waterman, and Patterson}}}
+\bibstyle{iclr2026_conference}
+\gdef \@abspage@last{6}

@@ -29,7 +29,13 @@
 \newif\ificlrfinal
 \iclrfinalfalse
 \def\iclrfinalcopy{\iclrfinaltrue}
-\font\iclrtenhv  = phvb at 8pt
+% Some minimal TeX installations do not ship the Helvetica Bold font metric
+% (phvb.tfm). Fall back to a default sans font to avoid a hard compile error.
+\IfFileExists{phvb.tfm}{%
+  \font\iclrtenhv = phvb at 8pt%
+}{%
+  \font\iclrtenhv = cmss10 at 8pt%
+}
 
 % Specify the dimensions of each page
 

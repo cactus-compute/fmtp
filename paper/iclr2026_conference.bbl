@@ -1,0 +1,114 @@
+\begin{thebibliography}{16}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[{Apple}(2024)]{apple2024m4}
+{Apple}.
+\newblock M4 pro chip specifications.
+\newblock Apple Newsroom/Technical Specs, 2024.
+
+\bibitem[Cai et~al.(2024)Cai, Li, Geng, Peng, Lee, Chen, and
+  Dao]{cai2024medusa}
+Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason~D Lee, Deming Chen,
+  and Tri Dao.
+\newblock Medusa: Simple llm inference acceleration framework with multiple
+  decoding heads.
+\newblock In \emph{International Conference on Machine Learning}, 2024.
+
+\bibitem[Chen et~al.(2023)Chen, Borgeaud, Irving, Lespiau, Sifre, and
+  Jumper]{chen2023accelerating}
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau,
+  Laurent Sifre, and John Jumper.
+\newblock Accelerating large language model decoding with speculative sampling.
+\newblock \emph{arXiv preprint arXiv:2302.01318}, 2023.
+
+\bibitem[Chen et~al.(2021)Chen, Tworek, Jun, Yuan, Pinto, Kaplan, Edwards,
+  Burda, Joseph, Brockman, et~al.]{chen2021humaneval}
+Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de~Oliveira
+  Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg
+  Brockman, et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem[Cobbe et~al.(2021)Cobbe, Kosaraju, Bavarian, Chen, Jun, Kaiser,
+  Plappert, Tworek, Hilton, Nakano, et~al.]{cobbe2021gsm8k}
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz
+  Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano,
+  et~al.
+\newblock Training verifiers to solve math word problems.
+\newblock \emph{arXiv preprint arXiv:2110.14168}, 2021.
+
+\bibitem[Gloeckle et~al.(2024)Gloeckle, Idrissi, Roziere, Lopez-Paz, and
+  Synnaeve]{gloeckle2024better}
+Fabian Gloeckle, Badr~Youbi Idrissi, Baptiste Roziere, David Lopez-Paz, and
+  Gabriel Synnaeve.
+\newblock Better \& faster large language models via multi-token prediction.
+\newblock \emph{arXiv preprint arXiv:2404.19737}, 2024.
+
+\bibitem[{Google DeepMind}(2024)]{google2024gemma}
+{Google DeepMind}.
+\newblock Gemma 3 technical report.
+\newblock Technical report, 2024.
+
+\bibitem[Hannun et~al.(2023)]{hannun2023mlx}
+Awni Hannun et~al.
+\newblock Mlx: An array framework for apple silicon.
+\newblock GitHub Repository, 2023.
+
+\bibitem[Hu et~al.(2021)Hu, Shen, Wallis, Allen-Zhu, Li, Wang, Wang, and
+  Chen]{hu2021lora}
+Edward~J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean
+  Wang, Lu~Wang, and Weizhu Chen.
+\newblock Lora: Low-rank adaptation of large language models.
+\newblock \emph{arXiv preprint arXiv:2106.09685}, 2021.
+
+\bibitem[Leviathan et~al.(2023)Leviathan, Kalman, and
+  Matias]{leviathan2023fast}
+Yaniv Leviathan, Matan Kalman, and Yossi Matias.
+\newblock Fast inference from transformers via speculative decoding.
+\newblock In \emph{International Conference on Machine Learning}, 2023.
+
+\bibitem[Li et~al.(2024)Li, Fan, Chu, and Li]{li2024eagle}
+Yuhui Li, Fangyun Fan, Wei Chu, and Yingce Li.
+\newblock Eagle: Speculative sampling requires rethinking feature uncertainty.
+\newblock \emph{arXiv preprint arXiv:2401.15077}, 2024.
+
+\bibitem[Miao et~al.(2024)Miao, Oliaro, Zhang, Cheng, Wang, Zhang, Wong, Zhu,
+  Yang, Shi, et~al.]{miao2024specinfer}
+Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu Wang, Zhengxin
+  Zhang, Rae Ying~Yee Wong, Alan Zhu, Lijie Yang, Xiaoxiang Shi, et~al.
+\newblock Specinfer: Accelerating generative large language model serving with
+  tree-based speculative inference and verification.
+\newblock \emph{arXiv preprint arXiv:2305.09781}, 2024.
+
+\bibitem[{NVIDIA}(2020)]{nvidia2020a100}
+{NVIDIA}.
+\newblock Nvidia a100 tensor core gpu architecture.
+\newblock NVIDIA Whitepaper, 2020.
+
+\bibitem[Penedo et~al.(2024)Penedo, Kydlicek, Cappelli, Saez~de Ocariz~Borde,
+  Olocco, and Villanova~del Moral]{penedo2024fineweb}
+Guilherme Penedo, Hynek Kydlicek, Alessandro Cappelli, David Saez~de
+  Ocariz~Borde, Marco Olocco, and Daniel Villanova~del Moral.
+\newblock The fineweb datasets: Decanting the web for the finest text data at
+  scale.
+\newblock \emph{arXiv preprint arXiv:2406.17557}, 2024.
+
+\bibitem[{Teknium}(2023)]{teknium2023openhermes}
+{Teknium}.
+\newblock Openhermes 2.5: An open dataset of synthetic data for generalist
+  llms.
+\newblock HuggingFace, 2023.
+
+\bibitem[Williams et~al.(2009)Williams, Waterman, and
+  Patterson]{williams2009roofline}
+Samuel Williams, Andrew Waterman, and David Patterson.
+\newblock Roofline: An insightful visual performance model for multicore
+  architectures.
+\newblock \emph{Communications of the ACM}, 52\penalty0 (4):\penalty0 65--76,
+  2009.
+
+\end{thebibliography}
