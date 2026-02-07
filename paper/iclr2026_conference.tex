@@ -48,7 +48,8 @@
 %\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
 \begin{document}
 
-
+%\Abstract No Citations: Speculative Decoding (SD) exploits the memory-bound nature of Large Language Model (LLM) generation to hide the cost of multiple draft tokens within a single forward pass (Leviathan et al., 2023; Chen et al., 2023). Modern SD techniques such as Medusa and Eagle are designed to maximize operational intensities, so they are highly effective for GPUs, but not Edge devices (Cai et al., 2024; Li et al., 2024). Additionally, they increase the parameter count with their draft-heads, negating the benefits of the small architecture. In this work, we evaluate Medusa's independent head and Eagle's sequential feature architectures on Gemma 3 270M (Google DeepMind, 2024), comparing performance between Nvidia A100 GPUs and Apple M-Series Silicon (Apple, 2024). We identify that deep speculation trees optimized for GPUs (Miao et al., 2024) cause a bottleneck shift on edge devices: the overhead of expanded attention masks exceeds the latency savings of reduced memory access, resulting in a 3-5
+ slowdown on Apple Silicon (Williams et al., 2009). Conversely, we demonstrate that on-device inference requires a minimalist single-token single-head speculation strategy with compact dense draft heads. Our method, Lite MTP, achieves a 7-28% speedup over baseline using the optimized MLX inference engine (Hannun et al., 2023) with under 1% memory overhead.
 \maketitle
 
 \begin{abstract}

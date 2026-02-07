@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.3.8)  6 FEB 2026 19:12
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.3.8)  6 FEB 2026 20:21
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -433,58 +433,39 @@ LaTeX Font Info:    Trying to load font information for U+msb on input line 48.
 (/usr/local/texlive/2025basic/texmf-dist/tex/latex/amsfonts/umsb.fd
 File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 )
-LaTeX Font Info:    Trying to load font information for TS1+ptm on input line 5
-9.
-
-(/usr/local/texlive/2025basic/texmf-dist/tex/latex/psnfss/ts1ptm.fd
-File: ts1ptm.fd 2001/06/04 font definitions for TS1/ptm.
-)
 
 [1{/usr/local/texlive/2025basic/texmf-var/fonts/map/pdftex/updmap/pdftex.map}
 
 {/usr/local/texlive/2025basic/texmf-dist/fonts/enc/dvips/base/8r.enc}]
-
-LaTeX Warning: Reference `tab:head_recall' on page 2 undefined on input line 82
-.
-
-
 
 [2
 pdfTeX warning (ext4): destination with the same identifier (name{table.1}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.104 
-      ]
-
-LaTeX Warning: Reference `tab:gsm8k' on page 3 undefined on input line 133.
-
-
-LaTeX Warning: Reference `tab:humaneval' on page 3 undefined on input line 133.
-
-
-
-Overfull \hbox (5.21211pt too wide) in paragraph at lines 145--158
+l.124 \end{table}
+                 ]
+Overfull \hbox (5.21211pt too wide) in paragraph at lines 140--153
  [][] 
  []
 
 
-Overfull \hbox (5.21211pt too wide) in paragraph at lines 166--179
+Overfull \hbox (5.21211pt too wide) in paragraph at lines 161--174
  [][] 
  []
 
-<figure2.png, id=160, 391.9443pt x 281.853pt>
+<figure2.png, id=164, 391.9443pt x 281.853pt>
 File: figure2.png Graphic file (type png)
 <use figure2.png>
-Package pdftex.def Info: figure2.png  used on input line 184.
+Package pdftex.def Info: figure2.png  used on input line 179.
 (pdftex.def)             Requested size: 238.49341pt x 171.5043pt.
 
-Overfull \hbox (9.82921pt too wide) in paragraph at lines 199--210
+Overfull \hbox (9.82921pt too wide) in paragraph at lines 194--205
  [][] 
  []
 
 
-Overfull \hbox (9.82921pt too wide) in paragraph at lines 218--229
+Overfull \hbox (9.82921pt too wide) in paragraph at lines 213--224
  [][] 
  []
 
@@ -495,13 +476,13 @@ pdfTeX warning (ext4): destination with the same identifier (name{table.2}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.255 
+l.253 
       
 pdfTeX warning (ext4): destination with the same identifier (name{table.3}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.255 
+l.253 
       ]
 
 [4
@@ -509,20 +490,20 @@ pdfTeX warning (ext4): destination with the same identifier (name{figure.1}) ha
 s been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.264 \newpage
-              
+l.262 
+      
 pdfTeX warning (ext4): destination with the same identifier (name{table.4}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.264 \newpage
-              
+l.262 
+      
 pdfTeX warning (ext4): destination with the same identifier (name{table.5}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.264 \newpage
-               <./figure2.png>]
+l.262 
+       <./figure2.png>]
 
 [5] (./iclr2026_conference.bbl)
 
@@ -531,42 +512,31 @@ l.264 \newpage
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
  ***********
-
-
-LaTeX Warning: There were undefined references.
-
-
-LaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.
-
 Package rerunfilecheck Info: File `iclr2026_conference.out' has not changed.
-(rerunfilecheck)             Checksum: D35B7ED1CE56475550958272EB44C7C6;1348.
+(rerunfilecheck)             Checksum: A3E8424547AF189A6C08BDCDCD7EDF49;1404.
  ) 
 Here is how much of TeX's memory you used:
- 11349 strings out of 474662
- 173890 string characters out of 5751110
- 601098 words of memory out of 5000000
- 34183 multiletter control sequences out of 15000+600000
- 582389 words of font info for 80 fonts, out of 8000000 for 9000
+ 11320 strings out of 474662
+ 173419 string characters out of 5751110
+ 601735 words of memory out of 5000000
+ 34160 multiletter control sequences out of 15000+600000
+ 582075 words of font info for 79 fonts, out of 8000000 for 9000
  319 hyphenation exceptions out of 8191
- 75i,11n,79p,2459b,503s stack positions out of 10000i,1000n,20000p,200000b,200000s
-
-pdfTeX warning (dest): name{figure.2} has been referenced but does not exist, r
-eplaced by a fixed one
-
-</usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.
-pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/amsfonts/cm/cmm
-i7.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/amsfonts/cm/
-cmr10.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/amsfonts/
-cm/cmss10.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/amsfo
-nts/cm/cmsy10.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/a
-msfonts/cm/cmsy9.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/urw/t
-imes/utmb8a.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/urw/times/
-utmr8a.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/urw/times/utmri
-8a.pfb>
-Output written on iclr2026_conference.pdf (6 pages, 271089 bytes).
+ 75i,11n,79p,1641b,479s stack positions out of 10000i,1000n,20000p,200000b,200000s
+</usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi1
+0.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/amsfonts/cm/c
+mmi7.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/amsfonts/c
+m/cmr10.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/amsfont
+s/cm/cmss10.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public/ams
+fonts/cm/cmsy10.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/public
+/amsfonts/cm/cmsy9.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/urw
+/times/utmb8a.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/urw/time
+s/utmr8a.pfb></usr/local/texlive/2025basic/texmf-dist/fonts/type1/urw/times/utm
+ri8a.pfb>
+Output written on iclr2026_conference.pdf (6 pages, 271072 bytes).
 PDF statistics:
- 254 PDF objects out of 1000 (max. 8388607)
- 223 compressed objects within 3 object streams
- 46 named destinations out of 1000 (max. 500000)
+ 257 PDF objects out of 1000 (max. 8388607)
+ 226 compressed objects within 3 object streams
+ 44 named destinations out of 1000 (max. 500000)
  86 words of extra memory for PDF output out of 10000 (max. 10000000)
 
