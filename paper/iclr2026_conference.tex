@@ -9,6 +9,7 @@
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{float}
+\usepackage{titlesec}
 
 % Spacing compaction
 \setlength{\textfloatsep}{6pt plus 2pt minus 2pt}
@@ -20,6 +21,10 @@
 \setlength{\belowcaptionskip}{0pt}
 \setlength{\abovedisplayskip}{5pt plus 2pt minus 2pt}
 \setlength{\belowdisplayskip}{5pt plus 2pt minus 2pt}
+
+\titlespacing*{\section}{0pt}{6pt plus 2pt minus 2pt}{3pt plus 1pt minus 1pt}
+\titlespacing*{\subsection}{0pt}{5pt plus 2pt minus 2pt}{2pt plus 1pt minus 1pt}
+\titlespacing*{\paragraph}{0pt}{4pt plus 1pt minus 1pt}{0.5em}
 
 % Bibliography compaction (natbib defines \bibsep; guard in case the style changes)
 \makeatletter
@@ -52,7 +57,7 @@ Speculative Decoding (SD) exploits the memory-bound nature of Large Language Mod
 
 \section{Introduction}
 
-The proliferation of on-device AI has driven the adoption of Small Language Models (SLMs) such as Gemma 3 270M as alternatives or supplements to cloud-based inference for easy workloads. However, adoption is limited by high latency that breaks application interactiveness. Furthermore, faster responses expand the frontier of locally viable model sizes. While SLMs have significantly reduced parameter counts, the autoregressive nature of transformer generation is fundamentally memory-bound \citep{williams2009roofline}. To balance the memory bottleneck and increase speed, Speculative Decoding (SD) with Multi-Token Prediction (MTP) has emerged as a popular paradigm \citep{leviathan2023fast, chen2023accelerating, gloeckle2024better}. Methods like Medusa's independent heads \citep{cai2024medusa} and Eagle's sequential feature extraction \citep{li2024eagle} increase the operational intensity of the decoding process to better utilize GPUs (e.g., Nvidia A100s). They draft multiple future tokens in a single forward pass to convert a portion of the memory-bottleneck to a compute bottleneck, while being lossless. On GPUs, the cost of these deep multi-token speculation trees \citep{miao2024specinfer} is effectively hidden due to their massively parallel compute optimized nature. This is in stark contrast to mobile chips because the A100 40GB has an FP16 Machine Balance (ratio of peak FLOPs to peak memory bandwidth) of approximately 201 FLOPs/byte \citep{nvidia2020a100}, whereas the Apple M4 Pro chip's GPU only has about 62 FLOPs/byte \citep{apple2024m4}, more than 3$\times$ less. In this work, we run 3 core experiments to understand and fix the mismatch between current MTP practices and on-device inference. First, we implement and train Medusa and Eagle on Gemma 3 270M using self-generated trajectories, reproducing strong speedups for the standard GPU setting. Second, we transfer and evaluate the models' optimized decode performance on Apple Silicon \citep{hannun2023mlx}. Lastly, we identify that the on-device bottleneck stems from deep speculation trees, which inflate attention and verification compute to the point where the overhead dominates the increase in throughput. Thus, we devise a simple and hardware-aware recipe centered on single-token, single-head speculation that keeps compute small enough to accelerate inference.
+The proliferation of on-device AI has driven the adoption of Small Language Models (SLMs) such as Gemma 3 270M as alternatives or supplements to cloud-based inference for easy workloads. However, adoption is limited by high latency that breaks application interactiveness. Furthermore, faster responses expand the frontier of locally viable model sizes. While SLMs have significantly reduced parameter counts, the autoregressive nature of transformer generation is fundamentally memory-bound \citep{williams2009roofline}. To balance the memory bottleneck and increase speed, Speculative Decoding (SD) with Multi-Token Prediction (MTP) has emerged as a popular paradigm \citep{leviathan2023fast, chen2023accelerating, gloeckle2024better}. Methods like Medusa's independent heads \citep{cai2024medusa} and Eagle's sequential feature extraction \citep{li2024eagle} increase the operational intensity of the decoding process to better utilize GPUs (e.g., Nvidia A100s). They draft multiple future tokens in a single forward pass to convert a portion of the memory-bottleneck to a compute bottleneck, while being lossless. On GPUs, the cost of these deep multi-token speculation trees \citep{miao2024specinfer} is effectively hidden due to their massively parallel compute optimized nature. This is in stark contrast to mobile chips because the A100 40GB has an FP16 Machine Balance (ratio of peak FLOPs to peak memory bandwidth) of approximately 201 FLOPs/byte \citep{nvidia2020a100}, whereas the Apple M4 Pro chip's GPU only has about 62 FLOPs/byte \citep{apple2024m4}, more than 3$\times$ less. In this work, we run 3 core experiments to understand and fix the mismatch between current MTP practices and on-device inference. First, we implement and train Medusa and Eagle on Gemma 3 270M using self-generated trajectories, reproducing strong speedups for the standard GPU setting. Second, we transfer and evaluate the models' optimized decode performance on Apple Silicon \citep{hannun2023mlx}. Lastly, we identify that the on-device bottleneck stems from deep speculation trees, which inflate attention and verification compute to the point where the overhead dominates the increase in throughput. Thus, we devise a simple and hardware-aware recipe centered on single-token, single-head speculation with compact dense draft heads that keep verification overhead below small enough to accelerate inference.
 
 \section{Methodology}
 
@@ -224,31 +229,31 @@ Lite MTP-Depth2 & 201.1 & 1.43 & 1.24$\times$ \\
 
 \subsection{Edge Failure}
 
-We then port the same MTP setup to Apple Silicon using MLX, again measuring decoding throughput \citep{hannun2023mlx}. However, the configurations that excelled on GPU were dramatically slower on-edge, the tok/s were between 3--5$\times$ slower relative to the MLX baseline. Examining the profiling in depth reveals that as tree size grows, verification becomes dominated by backbone and LM-head compute, and the expanded tree attention makes the backbone pass disproportionately expensive. Concretely, increasing tree size to 80 raises backbone cost by 3.17$\times$ on M4 Pro, while it increases only 1.12$\times$ on A100 \citep{apple2024m4, nvidia2020a100}. In this regime, most time is spent in the backbone pass, so the extra verification compute overwhelms the throughput gains from drafting more candidates.
+We then port the same MTP setup to Apple Silicon using MLX, again measuring decoding throughput \citep{hannun2023mlx}. However, the configurations that excelled on GPU exhibit a  bottleneck on-edge. The tok/s were between 3--5$\times$ slower relative to the MLX baseline. Examining the profiling in depth reveals that as tree size grows, verification becomes dominated by backbone and LM-head compute, and the expanded tree attention makes the backbone pass disproportionately expensive. Concretely, increasing tree size to 80 raises verification cost by 3.53$\times$ on M4 Pro, while it increases only 1.14$\times$ on A100 \citep{apple2024m4, nvidia2020a100}. In this regime, most time is spent in the backbone pass, so the extra verification compute overwhelms the throughput gains from drafting more candidates.
 
 \begin{table}[H]
-\caption{Profiling Comparison (Context = 16). Backbone cost scales 3.17$\times$ on MLX vs 1.12$\times$ on GPU as tree size grows from 1 to 80.}
+\caption{Profiling Comparison (Context = 16). Verification cost scales 3.53$\times$ on MLX vs 1.14$\times$ on GPU as tree size grows from 1 to 80.}
 \label{tab:profiling}
 \centering
 \small
 \begin{tabular}{c|ccc|ccc}
 \toprule
 & \multicolumn{3}{c|}{\textbf{MLX (M4 Pro)}} & \multicolumn{3}{c}{\textbf{GPU (A100)}} \\
-\textbf{Tree Size} & \textbf{Backbone} & \textbf{Verify} & \textbf{Tok/s} & \textbf{Backbone} & \textbf{Verify} & \textbf{Tok/s} \\
+\textbf{Tree Size} & \textbf{Verify Total} & \textbf{Medusa (1tok)} & \textbf{Tok/s} & \textbf{Verify Total} & \textbf{Medusa (1tok)} & \textbf{Tok/s} \\
 \midrule
-1 & 3.32ms & 4.62ms & 316.1 & 31.66ms & 31.57ms & 18.5 \\
-2 & 3.56ms & 5.11ms & 299.5 & 38.49ms & 35.67ms & 19.0 \\
-4 & 3.66ms & 5.70ms & 279.2 & 35.30ms & 35.60ms & 18.8 \\
-8 & 3.69ms & 5.74ms & 331.5 & 35.56ms & 35.29ms & 21.2 \\
-16 & 7.66ms & 10.60ms & 250.2 & 35.56ms & 35.37ms & 21.4 \\
-80 & 10.53ms & 16.29ms & 223.7 & 35.71ms & 36.13ms & 22.2 \\
+1 & 4.62ms & 2.34ms & 98.8 & 31.57ms & 3.23ms & 15.6 \\
+2 & 5.11ms & 2.36ms & 93.5 & 35.67ms & 3.20ms & 15.5 \\
+4 & 5.70ms & 2.31ms & 87.3 & 35.60ms & 3.23ms & 15.3 \\
+8 & 5.74ms & 2.30ms & 82.9 & 35.29ms & 3.22ms & 15.2 \\
+16 & 10.60ms & 2.32ms & 62.5 & 35.37ms & 3.19ms & 15.4 \\
+80 & 16.29ms & 2.58ms & 48.9 & 36.13ms & 3.25ms & 15.2 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Minimalist Speculation}
 
-Given the edge failure mode, we use sweeps over tree size (and context) to find the compute-optimal regime on-device. In an idealized sweep, the best tree size for M4 Pro is around 4, but this does not fully capture practical overheads in MLX (e.g., cache behavior when re-arranging KV state and Python overhead for restructuring tree attention). Empirically, tree size 2 is the most robust, our results show that it improves throughput from 218.4 to 234.4 tps (+7.3\%) on GSM8K, while larger trees tend to degrade performance \citep{cobbe2021gsm8k}. On HumanEval, tree size 2 improves 162.1 to 208.6 tps (+28.6\%), with larger trees still positive but weaker (+24\%) \citep{chen2021humaneval}. Given the consistent advantage of minimal trees, we present Lite MTP: a hardware-aware recipe for on-device inference using single-token, single-head speculation, where we keep verification overhead small enough to realize net speedups on Apple M4 Pro \citep{apple2024m4}.
+Given the edge failure mode, we use sweeps over tree size (and context) to find the compute-optimal regime on-device. In an idealized sweep, the best tree size for M4 Pro is around 4, but this does not fully capture practical overheads in MLX (e.g., cache behavior when re-arranging KV state and Python overhead for restructuring tree attention). Empirically, tree size 2 is the most robust, our results show that it improves throughput from 218.4 to 234.4 tps (+7.3\%) on GSM8K, while larger trees tend to degrade performance \citep{cobbe2021gsm8k}. On HumanEval, tree size 2 improves 162.1 to 208.6 tps (+28.6\%), with larger trees still positive but weaker (+24\%) \citep{chen2021humaneval}. Given the consistent advantage of minimal trees, we present Lite MTP: a hardware-aware recipe for on-device inference using single-token, single-head speculation with compacted draft heads (0.3\% of parameter overhead) where we keep verification overhead small enough to realize net speedups on Apple M4 Pro \citep{apple2024m4}.
 
 \section{Conclusion}
 
