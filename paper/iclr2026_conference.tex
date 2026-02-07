@@ -9,30 +9,6 @@
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{float}
-\usepackage{titlesec}
-
-% Spacing compaction
-\setlength{\textfloatsep}{6pt plus 2pt minus 2pt}
-\setlength{\floatsep}{6pt plus 2pt minus 2pt}
-\setlength{\intextsep}{6pt plus 2pt minus 2pt}
-\setlength{\dbltextfloatsep}{6pt plus 2pt minus 2pt}
-\setlength{\dblfloatsep}{6pt plus 2pt minus 2pt}
-\setlength{\abovecaptionskip}{2pt}
-\setlength{\belowcaptionskip}{0pt}
-\setlength{\abovedisplayskip}{5pt plus 2pt minus 2pt}
-\setlength{\belowdisplayskip}{5pt plus 2pt minus 2pt}
-
-\titlespacing*{\section}{0pt}{6pt plus 2pt minus 2pt}{3pt plus 1pt minus 1pt}
-\titlespacing*{\subsection}{0pt}{5pt plus 2pt minus 2pt}{2pt plus 1pt minus 1pt}
-\titlespacing*{\paragraph}{0pt}{4pt plus 1pt minus 1pt}{0.5em}
-
-% Bibliography compaction (natbib defines \bibsep; guard in case the style changes)
-\makeatletter
-\@ifundefined{bibsep}{\newlength{\bibsep}}{}
-\makeatother
-\setlength{\bibsep}{0pt plus 0.3ex}
-\setlength{\parskip}{0pt plus 1pt}
-\raggedbottom
 
 \title{Lite MTP: Minimalist Multi-Token Prediction for Edge Architectures}
 
@@ -48,8 +24,7 @@
 %\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
 \begin{document}
 
-%\Abstract No Citations: Speculative Decoding (SD) exploits the memory-bound nature of Large Language Model (LLM) generation to hide the cost of multiple draft tokens within a single forward pass (Leviathan et al., 2023; Chen et al., 2023). Modern SD techniques such as Medusa and Eagle are designed to maximize operational intensities, so they are highly effective for GPUs, but not Edge devices (Cai et al., 2024; Li et al., 2024). Additionally, they increase the parameter count with their draft-heads, negating the benefits of the small architecture. In this work, we evaluate Medusa's independent head and Eagle's sequential feature architectures on Gemma 3 270M (Google DeepMind, 2024), comparing performance between Nvidia A100 GPUs and Apple M-Series Silicon (Apple, 2024). We identify that deep speculation trees optimized for GPUs (Miao et al., 2024) cause a bottleneck shift on edge devices: the overhead of expanded attention masks exceeds the latency savings of reduced memory access, resulting in a 3-5
- slowdown on Apple Silicon (Williams et al., 2009). Conversely, we demonstrate that on-device inference requires a minimalist single-token single-head speculation strategy with compact dense draft heads. Our method, Lite MTP, achieves a 7-28% speedup over baseline using the optimized MLX inference engine (Hannun et al., 2023) with under 1% memory overhead.
+%\Abstract No Citations: Speculative Decoding (SD) exploits the memory-bound nature of Large Language Model (LLM) generation to hide the cost of multiple draft tokens within a single forward pass (Leviathan et al., 2023; Chen et al., 2023). Modern SD techniques such as Medusa and Eagle are designed to maximize operational intensities, so they are highly effective for GPUs, but not Edge devices (Cai et al., 2024; Li et al., 2024). Additionally, they increase the parameter count with their draft-heads, negating the benefits of the small architecture. In this work, we evaluate Medusa's independent head and Eagle's sequential feature architectures on Gemma 3 270M (Google DeepMind, 2024), comparing performance between Nvidia A100 GPUs and Apple M-Series Silicon (Apple, 2024). We identify that deep speculation trees optimized for GPUs (Miao et al., 2024) cause a bottleneck shift on edge devices: the overhead of expanded attention masks exceeds the latency savings of reduced memory access, resulting in a 3-5 xx slowdown on Apple Silicon (Williams et al., 2009). Conversely, we demonstrate that on-device inference requires a minimalist single-token single-head speculation strategy with compact dense draft heads. Our method, Lite MTP, achieves a 7-28% speedup over baseline using the optimized MLX inference engine (Hannun et al., 2023) with under 1% memory overhead.
 \maketitle
 
 \begin{abstract}
@@ -58,27 +33,25 @@ Speculative Decoding (SD) exploits the memory-bound nature of Large Language Mod
 
 \section{Introduction}
 
-The proliferation of on-device AI has driven the adoption of Small Language Models (SLMs) such as Gemma 3 270M as alternatives or supplements to cloud-based inference for easy workloads. However, adoption is limited by high latency that breaks application interactiveness. Furthermore, faster responses expand the frontier of locally viable model sizes. While SLMs have significantly reduced parameter counts, the autoregressive nature of transformer generation is fundamentally memory-bound \citep{williams2009roofline}. To balance the memory bottleneck and increase speed, Speculative Decoding (SD) with Multi-Token Prediction (MTP) has emerged as a popular paradigm \citep{leviathan2023fast, chen2023accelerating, gloeckle2024better}. Methods like Medusa's independent heads \citep{cai2024medusa} and Eagle's sequential feature extraction \citep{li2024eagle} increase the operational intensity of the decoding process to better utilize GPUs (e.g., Nvidia A100s). They draft multiple future tokens in a single forward pass to convert a portion of the memory-bottleneck to a compute bottleneck, while being lossless. On GPUs, the cost of these deep multi-token speculation trees \citep{miao2024specinfer} is effectively hidden due to their massively parallel compute optimized nature. This is in stark contrast to mobile chips because the A100 40GB has an FP16 Machine Balance (ratio of peak FLOPs to peak memory bandwidth) of approximately 201 FLOPs/byte \citep{nvidia2020a100}, whereas the Apple M4 Pro chip's GPU only has about 62 FLOPs/byte \citep{apple2024m4}, more than 3$\times$ less. In this work, we run 3 core experiments to understand and fix the mismatch between current MTP practices and on-device inference. First, we implement and train Medusa and Eagle on Gemma 3 270M using self-generated trajectories, reproducing strong speedups for the standard GPU setting. Second, we transfer and evaluate the models' optimized decode performance on Apple Silicon \citep{hannun2023mlx}. Lastly, we identify that the on-device bottleneck stems from deep speculation trees, which inflate attention and verification compute to the point where the overhead dominates the increase in throughput. Thus, we devise a simple and hardware-aware recipe centered on single-token, single-head speculation with compact dense draft heads that keep verification overhead below small enough to accelerate inference.
+On-device Small Language Models (SLMs) such as Gemma 3 270M are increasingly deployed as alternatives to cloud inference, but adoption is limited by high autoregressive latency \citep{williams2009roofline}. Speculative Decoding (SD) with Multi-Token Prediction (MTP) addresses this bottleneck \citep{leviathan2023fast, chen2023accelerating, gloeckle2024better}. Methods like Medusa's independent heads \citep{cai2024medusa} and Eagle's sequential feature extraction \citep{li2024eagle} increase operational intensity by drafting multiple future tokens in a single forward pass. On GPUs, deep speculation trees \citep{miao2024specinfer} are effectively hidden by massive parallelism. This is in stark contrast to mobile chips because the A100 40GB has an FP16 Machine Balance (ratio of peak FLOPs to peak memory bandwidth) of approximately 201 FLOPs/byte \citep{nvidia2020a100}, whereas the Apple M4 Pro chip's GPU only has about 62 FLOPs/byte \citep{apple2024m4}, more than 3$\times$ less. In this work, we run 3 core experiments to understand and fix the mismatch between current MTP practices and on-device inference. First, we implement and train Medusa and Eagle on Gemma 3 270M using self-generated trajectories, reproducing strong speedups for the standard GPU setting. Second, we transfer and evaluate the models' optimized decode performance on Apple Silicon \citep{hannun2023mlx}. Lastly, we identify that the on-device bottleneck stems from deep speculation trees, which inflate attention and verification compute to the point where the overhead dominates the increase in throughput. Thus, we devise a simple and hardware-aware recipe centered on single-token, single-head speculation with compact dense draft heads that keep verification overhead below small enough to accelerate inference.
 
 \section{Methodology}
 
-We use Gemma 3 270M as our base SLM because it is a common target for on-device deployment and still has enough breadth to warrant and be capable of speculative decoding. To investigate the hardware-specific performance spectrum, we implement two foundational MTP paradigms (Medusa and Eagle), along with our minimalist Medusa variant (Lite MTP), the lightweight Medusa \citep{cai2024medusa} and the heavier Eagle \citep{li2024eagle}.
+We use Gemma 3 270M as our base SLM and implement three MTP variants: Medusa \citep{cai2024medusa}, Eagle \citep{li2024eagle}, and our Lite MTP.
 
 \subsection{Architecture Variants}
 
 \paragraph{Medusa}
-Medusa (independent heads) first introduced the MTP speculative decoding paradigm to LLMs. Medusa augments the base model with $K$ independent, lightweight draft heads. Concretely, each head consists of a single linear layer followed by a SiLU activation and an LM-head, predicting future tokens $t+1, t+2, \ldots, t+k$ conditioned on the backbone's final hidden state $h_t$. Once predicted, Medusa relies on a large tree-attention mask (up to 80 nodes) during the verification pass to maximize token acceptance on GPU \citep{cai2024medusa, miao2024specinfer}.
+Medusa augments the base model with $K$ independent, lightweight draft heads. Each head consists of a single linear layer followed by a SiLU activation and an LM-head, predicting future tokens $t+1, t+2, \ldots, t+k$ conditioned on the backbone's final hidden state $h_t$ \citep{leviathan2023fast}. Candidates form a greedy tree (up to 80 nodes) verified in a single backbone pass via tree attention \citep{cai2024medusa, miao2024specinfer}.
 
-\paragraph{Inference Verification}
-At step $t$, the backbone produces $h_t$ \citep{leviathan2023fast}. Heads use this to draft the probability distribution of candidates that we arrange into a greedy tree \citep{cai2024medusa}. We verify the tree in one backbone pass using tree-attention masks \citep{miao2024specinfer}, and accept only tokens matching the backbone's greedy choice \citep{chen2023accelerating}. We then repeat the MTP process from the last accepted state \citep{cai2024medusa}.
 
 \paragraph{Eagle}
-Eagle replaces independent heads with an autoregressive 1-layer transformer over features from early, middle, and later backbone layers, producing depth-$k$ draft trees \citep{li2024eagle}. This can improve draft coherence, but increases drafting compute, especially for smaller models. Interestingly, Eagle does not have an LM head of its own and uses the base model's. This was the inspiration for our method to also reuse it.
+Eagle replaces independent heads with an autoregressive 1-layer transformer over features from early, middle, and later backbone layers, producing depth-$k$ draft trees \citep{li2024eagle}. This can improve draft coherence, but increases drafting compute, especially for smaller models.
 
 \paragraph{Ours: Lite MTP}
 For SLMs like Gemma 3 270M, Medusa heads are memory-prohibitive because the vocabulary is large (256k). A single LM head has $\sim$170M parameters. The standard five-Medusa-head setup thus quadruples the model size (Table~\ref{tab:memory_overhead}), undermining the point of the SLM.
 
-We therefore propose \textit{Lite MTP}, a minimalist Medusa variant that drafts just a single candidate with a compact dense module (two $640\times 640$ layers) and reuses the base model's LM head for token scoring. The single candidate prediction allows standard causal attention to be used rather than tree attention. We also evaluated both a LoRA adapter on the LM head (rank 64) \citep{hu2021lora} and a no-LoRA design. We found the differences to be small (Table~\ref{tab:head_recall}), so we adopt the simpler no-LoRA configuration for edge deployment, adding only 0.3\% parameters (Table~\ref{tab:memory_overhead}).
+We therefore propose \textit{Lite MTP}, a minimalist Medusa variant that drafts just a single candidate with a compact dense module (two $640\times 640$ layers) and reuses the base model's LM head for token scoring. The single candidate prediction allows standard causal attention to be used rather than tree attention. We also evaluated both a LoRA adapter on the LM head (rank 64) \citep{hu2021lora} and a no-LoRA design (inspired by Eagle's similar reuse of base LM head). We found the differences to be small (Table~\ref{tab:head_recall}), so we adopt the simpler no-LoRA configuration for edge deployment, adding only 0.3\% parameters (Table~\ref{tab:memory_overhead}).
 
 \begin{table}[t]
 \caption{Parameter overhead on Gemma 3 270M: dense Medusa heads bloat size (256k vocab), while our draft heads add negligible overhead.}
@@ -99,11 +72,11 @@ Eagle (Ours, Depth 3) & Fusion + Layer & $\sim$6.5M & 276.5M & +2.4\% \\
 
 \subsection{Training Rigor and Loss}
 
-To ensure draft heads align with the base model's distribution, we moved beyond generic corpora like FineWeb-EDU \citep{penedo2024fineweb} and used self-generated trajectories. Specifically, we generated 100k completions by prompting Gemma 3 270M with the OpenHermes 2.5 dataset \citep{teknium2023openhermes}. This keeps training in-distribution and lets us use KL-based distillation against the backbone. While we initially used Cross-Entropy (CE) loss for simplicity (as in Medusa-1), we found Kullback-Leibler (KL) Divergence consistently improved alignment, matching the backbone's soft-target distribution (rather than hard labels) increases acceptance rates and downstream throughput.
+We used 100k self-generated completions by prompting Gemma 3 270M with the OpenHermes 2.5 dataset \citep{teknium2023openhermes}. This keeps training in-distribution and lets us use KL-based distillation against the backbone. While we initially used Cross-Entropy (CE) loss for simplicity (as in Medusa-1), we found Kullback-Leibler (KL) Divergence consistently improved alignment, matching the backbone's soft-target distribution (rather than hard labels) increases acceptance rates and downstream throughput.
 
 \subsection{Evaluation Setup}
 
-We measure decoding throughput (tokens per second at batch size 1) on an Nvidia A100 and Apple M4 Pro via MLX \citep{hannun2023mlx}, sweeping draft tree size (speculative candidates) to capture hardware regime changes. We assume that MLX's implementation is near-optimal and approximates true hardware performance on Apple Silicon, as it is the standard framework for on-device inference benchmarking. Large trees are empirically effective on GPU, while on-device inference prefers shallow speculation (Figure~\ref{fig:edge_profile}).
+We measure decoding throughput (tokens per second at batch size 1) on an Nvidia A100 and Apple M4 Pro via MLX \citep{hannun2023mlx}, sweeping draft tree size (speculative candidates) to capture hardware regime changes. We assume that MLX's implementation is near-optimal and approximates true hardware performance on Apple Silicon, as it is the standard framework for on-device inference benchmarking.
 
 \section{Experiments \& Results}
 
@@ -129,7 +102,7 @@ KL & LoRA-64 & \textbf{.419} & \textbf{.752} & \textbf{.258} & \textbf{.580} & \
 
 \subsection{GPU Baseline}
 
-We first validate that multi-token prediction (MTP) provides meaningful throughput gains for small models in the standard GPU setting. We trained Medusa and Eagle variants on our self-distilled trajectories and evaluated them under decoding throughput \citep{cai2024medusa, li2024eagle}. Across both GSM8K and HumanEval, stronger draft alignment from KL divergence loss correlates with higher acceptance and higher throughput, as switching Medusa to KL-only  training increases throughput from 35.9 to 49.5 tps on GSM8K and 33.6 to 49.2 tps on HumanEval (Tables~\ref{tab:gsm8k}--\ref{tab:humaneval}) \citep{cobbe2021gsm8k, chen2021humaneval}. Eagle shows a clear preference for depth on HumanEval (48.5, 50.5, 56.2 tps at depth 1/2/3), but at 270M scale the heavier drafting module limits how much of its higher token yield translates into end-to-end speed.
+We first validate that multi-token prediction (MTP) provides throughput gains for small models using GPU. We trained Medusa and Eagle variants on our self-distilled trajectories and evaluated them under decoding throughput \citep{cai2024medusa, li2024eagle}. Across both GSM8K and HumanEval, stronger draft alignment from KL divergence loss correlates with higher acceptance and higher throughput, as switching Medusa to KL-only  training increases throughput from 35.9 to 49.5 tps on GSM8K and 33.6 to 49.2 tps on HumanEval (Tables~\ref{tab:gsm8k}--\ref{tab:humaneval}) \citep{cobbe2021gsm8k, chen2021humaneval}. Eagle shows a clear preference for depth on HumanEval (48.5, 50.5, 56.2 tps at depth 1/2/3), but at 270M scale the heavier drafting module limits how much of its higher token yield translates into end-to-end speed.
 
 \begin{table}[t]
 \caption{GPU Decoding Throughput on GSM8K (left) and HumanEval (right). Tok/Step is the average total tokens accepted per decoding step (including the 1 token from the backbone). The baseline tok/s are 35.2 and 33.6 for GSM8K and HumanEval respectively. KL divergence training improves Medusa acceptance rates, while Eagle benefits from increased depth and accuracy.}
@@ -139,7 +112,6 @@ We first validate that multi-token prediction (MTP) provides meaningful throughp
 \centering
 \small
 \textbf{GSM8K}
-\vspace{0.2em}
 
 \begin{tabular}{llcc}
 \toprule
@@ -160,7 +132,6 @@ EAGLE & Depth 3 & 3.42 & 1.52$\times$ \\
 \centering
 \small
 \textbf{HumanEval}
-\vspace{0.2em}
 
 \begin{tabular}{llcc}
 \toprule
@@ -180,7 +151,7 @@ EAGLE & Depth 3 & 3.68 & 1.64$\times$ \\
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=0.6\linewidth]{figure2.png}
+\includegraphics[width=0.5\linewidth]{figure2.png}
 \caption{Profiling on MLX (M4 Pro) vs A100: tree size shifts backbone/verification cost.}
 \label{fig:edge_profile}
 \end{figure}
@@ -193,7 +164,6 @@ EAGLE & Depth 3 & 3.68 & 1.64$\times$ \\
 \centering
 \small
 \textbf{GSM8K}
-\vspace{0.2em}
 
 \begin{tabular}{lccc}
 \toprule
@@ -212,7 +182,6 @@ Lite MTP-Depth2 & 215.9 & 1.48 & 0.99$\times$ \\
 \centering
 \small
 \textbf{HumanEval}
-\vspace{0.2em}
 
 \begin{tabular}{lccc}
 \toprule
@@ -254,7 +223,7 @@ We then port the same MTP setup to Apple Silicon using MLX, again measuring deco
 
 \subsection{Minimalist Speculation}
 
-Given the edge failure mode, we use sweeps over tree size (and context) to find the compute-optimal regime on-device. In an idealized sweep, the best tree size for M4 Pro is around 4, but this does not fully capture practical overheads in MLX (e.g., cache behavior when re-arranging KV state and Python overhead for restructuring tree attention). Empirically, tree size 2 is the most robust, our results show that it improves throughput from 218.4 to 234.4 tps (+7.3\%) on GSM8K, while larger trees tend to degrade performance \citep{cobbe2021gsm8k}. On HumanEval, tree size 2 improves 162.1 to 208.6 tps (+28.6\%), with larger trees still positive but weaker (+24\%) \citep{chen2021humaneval}. Given the consistent advantage of minimal trees, we present Lite MTP: a hardware-aware recipe for on-device inference using single-token, single-head speculation with compacted draft heads (0.3\% of parameter overhead) where we keep verification overhead small enough to realize net speedups on Apple M4 Pro \citep{apple2024m4}.
+Given the edge failure mode, we use sweeps over tree size (and context) to find the compute-optimal regime on-device. Empirically, tree size 2 is the most robust, our results show that it improves throughput from 218.4 to 234.4 tps (+7.3\%) on GSM8K, while larger trees tend to degrade performance \citep{cobbe2021gsm8k}. On HumanEval, tree size 2 improves 162.1 to 208.6 tps (+28.6\%), with larger trees still positive but weaker (+24\%) \citep{chen2021humaneval}. Given the consistent advantage of minimal trees, we present Lite MTP: a hardware-aware recipe for on-device inference using single-token, single-head speculation with compacted draft heads (0.3\% of parameter overhead) where we keep verification overhead small enough to realize net speedups on Apple M4 Pro \citep{apple2024m4}.
 
 \section{Conclusion}
 
